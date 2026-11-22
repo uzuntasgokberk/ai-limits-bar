@@ -1169,7 +1169,9 @@ def file_state(path):
 
 def load_main():
     """main.py as a fresh module, with main.call replaced by the provider guard: a test that wants provider data
-    sets its own fake. Importing main.py replaces os.environ, so this process's environment is restored."""
+    sets its own fake. Its default CACHE and CONFIG point into the guard's temporary folder, so a run without --cache
+    or --config never touches ~/Library/Caches/ai-limits-bar or the real config.json. Importing main.py replaces
+    os.environ, so this process's environment is restored."""
     saved = dict(os.environ)
     try:
         spec = importlib.util.spec_from_file_location("ai_limits_main", os.path.join(ROOT, "ai_limits", "main.py"))
@@ -1179,6 +1181,9 @@ def load_main():
         os.environ.clear()
         os.environ.update(saved)
     module.call = provider_guard("main.call")
+    defaults = tempfile.mkdtemp(dir=_GUARD_HOME.name)
+    module.CACHE = os.path.join(defaults, "cache")
+    module.CONFIG = os.path.join(defaults, "config.json")
     return module
 
 
@@ -1205,6 +1210,8 @@ class ProviderGuard(unittest.TestCase):
             gemini.read({})  # no hub file and no Gemini CLI sign-in in the empty guard folder: nothing real is read
         self.assertTrue(gemini.HUB.startswith(_GUARD_HOME.name))
         self.assertTrue(codex.SESSIONS.startswith(_GUARD_HOME.name))
+        m = load_main()
+        self.assertTrue(m.CACHE.startswith(_GUARD_HOME.name) and m.CONFIG.startswith(_GUARD_HOME.name))
 
     def test_every_process_run_goes_through_run_launcher(self):
         with open(os.path.abspath(__file__), encoding="utf-8") as f:
@@ -1585,6 +1592,131 @@ class Toggle(unittest.TestCase):
                 os.chmod(self.dir, 0o700)
         self.assertEqual(self.read(), before)
         self.files_now()
+
+
+class KeepValues(unittest.TestCase):
+    """A "Menu bar shows" click must show the new number at once: --show leaves a short-lived marker, and the
+    --refresh run SwiftBar starts right after the click then uses the values already read."""
+
+    def setUp(self):
+        self.main = load_main()
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.dir = folder.name
+        self.cache = os.path.join(self.dir, "cache")
+        self.config = os.path.join(self.dir, "config.json")
+        self.marker = os.path.join(self.cache, self.main.KEEP_FILE)
+        self.write_config([{"name": "claude", "enabled": True, "refresh_minutes": 5}])
+        self.calls = []
+
+        def fake(name, settings, forced):
+            self.calls.append((name, settings["force"]))
+            return {"title": name.upper(), "status": "ok", "details": [], "note": None, "time": time.time(),
+                    "rows": [row("5-hour", 88.0, resets=time.time() + 3600)]}
+        self.main.call = fake
+
+    def write_config(self, providers, **extra):
+        with open(self.config, "w", encoding="utf-8") as f:
+            json.dump({"providers": providers, **extra}, f)
+
+    def cache_claude(self, age=120):
+        """Older than the 60 s refresh floor, younger than refresh_minutes (5 min - 30 s)."""
+        common.write_private_json(self.cache, "claude.json", {
+            "title": "CLAUDE", "status": "ok", "details": [], "note": None, "time": time.time() - age,
+            "rows": [row("5-hour", 31.0, resets=time.time() + 3600), row("Weekly", 57.0, resets=time.time() + 3600)]})
+
+    def run_main(self, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.main.main([*args, "--config", self.config, "--cache", self.cache])
+        return out.getvalue()
+
+    def write_marker(self, text):
+        os.makedirs(self.cache, exist_ok=True)
+        with open(self.marker, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def test_show_then_refresh_uses_the_values_already_read(self):
+        self.cache_claude()
+        self.assertEqual(self.run_main("--show", "claude:5-hour"), "")
+        with open(self.marker, encoding="utf-8") as f:
+            marker = json.load(f)
+        self.assertEqual(list(marker), ["time"])
+        self.assertAlmostEqual(marker["time"], time.time(), delta=30)
+        self.assertEqual(stat.S_IMODE(os.stat(self.marker).st_mode), 0o600)
+        text = self.run_main("--refresh")
+        self.assertEqual(self.calls, [])  # not re-read: the cached 31% is shown at once
+        self.assertTrue(menu_lines(text)[0].startswith("31% | "))
+        self.assertFalse(os.path.exists(self.marker))  # used once
+        self.run_main("--refresh")
+        self.assertEqual(self.calls, [("claude", True)])  # the next forced refresh reads again
+
+    def test_marker_is_written_when_nothing_changes_and_when_config_is_unreadable(self):
+        self.write_config([{"name": "claude", "enabled": True}], menu_bar={"provider": "claude", "limit": "5-hour"})
+        with mock.patch.object(self.main, "_write_atomic") as config_writes:
+            self.run_main("--show", "claude:5-hour")
+        config_writes.assert_not_called()
+        self.assertTrue(os.path.exists(self.marker))
+        os.remove(self.marker)
+        with open(self.config, "w") as f:
+            f.write("{not json")
+        self.run_main("--show", "claude:5-hour")
+        self.assertTrue(os.path.exists(self.marker))
+        with open(self.config) as f:
+            self.assertEqual(f.read(), "{not json")
+
+    def test_no_marker_after_a_refusal_or_a_busy_lock(self):
+        with self.assertRaises(self.main.ArgumentError):
+            self.run_main("--show", "evil:5-hour")
+        self.assertFalse(os.path.exists(self.marker))
+        lock = os.open(self.dir, os.O_RDONLY)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)  # a panel is open
+            with mock.patch.object(self.main, "LOCK_SECONDS", 0.2), self.assertRaises(self.main.Busy):
+                self.run_main("--show", "claude:5-hour")
+        finally:
+            os.close(lock)
+        self.assertFalse(os.path.exists(self.marker))
+
+    def test_bad_markers_do_not_suppress_and_are_removed(self):
+        now = time.time()
+        target = os.path.join(self.dir, "elsewhere.json")
+        with open(target, "w") as f:
+            json.dump({"time": now}, f)
+        cases = {"expired": json.dumps({"time": now - 11}), "future": json.dumps({"time": now + 5}),
+                 "garbage": "{not json", "list": "[1]", "text time": '{"time": "now"}', "bool time": '{"time": true}',
+                 "nan time": '{"time": NaN}', "empty": "", "symlink": None}
+        for case, text in cases.items():
+            self.cache_claude()
+            self.calls.clear()
+            if text is None:
+                os.makedirs(self.cache, exist_ok=True)
+                os.symlink(target, self.marker)
+            else:
+                self.write_marker(text)
+            self.run_main("--refresh")
+            self.assertEqual(self.calls, [("claude", True)], case)  # forced, as without a marker
+            self.assertFalse(os.path.lexists(self.marker), case)
+        self.assertTrue(os.path.exists(target))  # a symlinked marker is removed, not what it points to
+
+    def test_without_a_marker_or_without_refresh_nothing_changes(self):
+        self.cache_claude()
+        self.run_main("--refresh")
+        self.assertEqual(self.calls, [("claude", True)])  # plain --refresh: forced as before
+        self.cache_claude()
+        self.calls.clear()
+        self.write_marker(json.dumps({"time": time.time()}))
+        self.run_main()
+        self.assertEqual(self.calls, [])  # a normal run uses the fresh cache anyway
+        self.assertTrue(os.path.exists(self.marker))  # and leaves the marker alone (it simply expires)
+
+    def test_a_provider_without_values_is_still_read(self):
+        self.write_config([{"name": "claude", "enabled": True}, {"name": "codex", "enabled": True}])
+        self.cache_claude()
+        self.run_main("--show", "codex:5-hour")
+        text = self.run_main("--refresh")
+        self.assertEqual(self.calls, [("codex", False)])  # read, but not as a forced refresh (Foundry's force too)
+        self.assertTrue(menu_lines(text)[0].startswith("88% | "))
 
 
 class Show(unittest.TestCase):
@@ -2017,6 +2149,25 @@ class Plugin(unittest.TestCase):
         self.assertEqual(refused.returncode, 0)
         self.assertIn("AI Limits Bar could not run", refused.stdout)
         self.assertEqual(after_refusal, before_refusal)
+
+    def test_show_then_the_click_refresh_through_the_launcher(self):
+        with tempfile.TemporaryDirectory() as d:
+            config, cache = os.path.join(d, "config.json"), os.path.join(d, "cache")
+            marker = os.path.join(cache, "keep-values.json")
+            with open(config, "w") as f:
+                json.dump({"providers": [{"name": n, "enabled": True} for n in NAMES]}, f)
+            shown = self.run_plugin(["--show", "claude:5-hour"], cache, config=config)
+            written = os.path.exists(marker)
+            plain = self.run_plugin([], cache, config=config)  # a scheduled run: the marker stays
+            kept = os.path.exists(marker)
+            click_env = dict(os.environ, SWIFTBAR_PLUGIN_REFRESH_REASON="MenuAction")
+            clicked = self.run_plugin([], cache, config=config, env=click_env)  # the launcher adds --refresh
+            consumed = not os.path.exists(marker)
+        self.assertEqual((shown.returncode, shown.stdout, shown.stderr), (0, "", ""))
+        self.assertTrue(written and kept and consumed, (written, kept, consumed))
+        for p in (plain, clicked):
+            self.assertEqual((p.returncode, p.stderr), (0, ""))
+            self.assertIn("--Claude · 5-hour (not available) | checked=true", menu_lines(p.stdout))
 
     def test_hostile_environment_is_ignored(self):
         with tempfile.TemporaryDirectory() as d:

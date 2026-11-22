@@ -16,7 +16,8 @@ that this plugin's own "Providers…" and "Menu bar shows" items ask for):
   --refresh      read every provider again. "Refresh now" is a plain SwiftBar `refresh=true` item; the launcher
                  adds --refresh when SwiftBar reports that click. A cache younger than 60 seconds is still used
                  (a refresh can also be triggered by a link), the cache stays the fallback, and the menu bar keeps
-                 the previous values until the new ones are ready.
+                 the previous values until the new ones are ready. Right after a --show (see keep_values), that one
+                 run is not forced: it shows the new choice from the values already read.
   --config PATH  read this file instead of config.json (config.json is then not created from the example)
   --cache DIR    cache folder instead of ~/Library/Caches/ai-limits-bar
   --skip a,b     skip these providers for this run
@@ -30,6 +31,8 @@ that this plugin's own "Providers…" and "Menu bar shows" items ask for):
                  set what the menu bar number shows (`menu_bar` in the config file) and print nothing: the highest
                  current percentage, or one limit, e.g. `claude:5-hour`. A "Menu bar shows" click runs it; the value
                  is checked again here (a known provider; a limit from render.CHOICE_LABEL), anything else is refused.
+                 It then leaves a marker in the cache folder so the refresh SwiftBar starts after the click does not
+                 re-read the providers (choosing a number needs no new data).
                  With --choose, --toggle or --show, the other switches except --config (and --cache for --choose)
                  are ignored.
 """
@@ -70,6 +73,8 @@ LAUNCHER = os.path.join(ROOT, "plugin", "ai-limits.5m.sh")  # run by the "Provid
 LOCK_SECONDS = 3.0  # --toggle waits at most this long for another change (or an open panel) to finish
 STATE_FILE = "providers-state.json"  # in the cache folder: providers the last menu run found not set up
 STATE_MAX_AGE = 3600.0  # seconds; an older state file gives no "not set up" notes
+KEEP_FILE = "keep-values.json"  # in the cache folder: written by --show, lets the next --refresh run skip re-reading
+KEEP_SECONDS = 10.0  # an older marker counts for nothing
 CACHE = os.path.join(HOME, "Library", "Caches", "ai-limits-bar")
 VALID_NAME = re.compile(r"[a-z0-9_]{1,20}")
 REFRESH_FLOOR = 60.0  # seconds: even a forced refresh uses a cache this young
@@ -295,6 +300,37 @@ def set_menu_bar(path, value, create):
         return _change_config_locked(path, create, change)
 
 
+def mark_keep_values(cache):
+    """After --show: SwiftBar re-runs the plugin as a menu-click refresh, which the launcher turns into --refresh,
+    but a new menu bar choice needs no new data. {"time": now} in the cache folder makes that one run use the values
+    already read. An error here only means the refresh is forced, as before."""
+    with contextlib.suppress(Exception):
+        write_private_json(cache, KEEP_FILE, {"time": time.time()})
+
+
+def keep_values(cache):
+    """For a --refresh run: True if a --show just left a valid marker (a regular file holding a JSON object whose
+    time is a finite number at most KEEP_SECONDS old); this run is then not forced. Whenever a --refresh run looks,
+    the marker is removed, valid or not (a symlinked one is not followed, just removed). The marker can only skip
+    this one forced re-read; anything unexpected means False, i.e. a forced refresh."""
+    path = os.path.join(cache, KEEP_FILE)
+    valid = False
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as f:
+            if stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                data = json.loads(f.read(4096))
+                t = data.get("time") if isinstance(data, dict) else None
+                if isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(t):
+                    valid = 0 <= time.time() - t <= KEEP_SECONDS
+    except Exception:
+        valid = False  # missing, a symlink (not followed), unreadable or not JSON
+    with contextlib.suppress(OSError):
+        if os.path.lexists(path):
+            os.remove(path)
+    return valid
+
+
 def save_state(cache, not_set_up):
     """Names the menu run found not set up on this Mac, for the panel's notes (--choose reads no provider)."""
     write_private_json(cache, STATE_FILE, {"not_set_up": sorted(not_set_up), "time": time.time()})
@@ -375,10 +411,18 @@ def main(argv=None):
         toggle(config_path, args.toggle, create=not args.config)
         return
     if args.show is not None:
-        set_menu_bar(config_path, parse_choice(args.show), create=not args.config)
+        set_menu_bar(config_path, parse_choice(args.show), create=not args.config)  # may refuse or raise Busy
+        # Also when nothing changed or config.json is unreadable. SwiftBar's own runs and clicks pass no --cache, so
+        # the click and its refresh both use the default cache folder; --cache only matters for tests and terminals.
+        mark_keep_values(cache)
         return  # nothing is printed: the click's refresh=true re-runs the plugin for the new menu
     config, config_error = load_config(config_path, create=not args.config)
     force, forced, skip = args.refresh, _names(args.fail), _names(args.skip)
+    if force:
+        try:
+            force = not keep_values(cache)  # right after a --show: show the new choice from the values already read
+        except Exception:
+            force = True
     debug_shapes = config.get("debug_shapes") is True
 
     now = time.time()
