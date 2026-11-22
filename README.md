@@ -2,6 +2,8 @@
 
 See how much of your AI usage limits is left, right from the macOS menu bar: **Claude**, **Codex (ChatGPT)**, **Gemini (Antigravity)**, **GitHub Copilot** and **Microsoft Foundry** in one place.
 
+**macOS only:** it is a SwiftBar plugin and does not run on Windows or Linux (see [Requirements](#requirements)).
+
 The menu bar shows a gauge and the highest current usage (for example `57%`, orange from 75%, red from 90%). Hover for a one-line summary, click for the details. Each limit has a bar, its percentage and when it resets:
 
 ```
@@ -34,18 +36,25 @@ A provider that isn't set up on your Mac is hidden automatically, and so are lim
 
 ## Requirements
 
-- macOS with [SwiftBar](https://github.com/swiftbar/SwiftBar) (free, open source)
-- Python 3.9 or newer, at `/opt/homebrew/bin/python3`, `/usr/local/bin/python3` or `/usr/bin/python3`. The Xcode Command Line Tools (`xcode-select --install`) provide the last one; Homebrew's Python works too.
-- For each provider you want to see, its own tool, signed in:
-  - Claude: [Claude Code](https://docs.anthropic.com/claude-code) signed in with a Claude subscription
-  - Codex: the [Codex CLI](https://github.com/openai/codex) signed in with ChatGPT (`codex login`)
-  - Gemini: [Antigravity](https://antigravity.google/) (`agy` or the app) running, or Gemini CLI signed in with Google
-  - GitHub Copilot: the [GitHub CLI](https://cli.github.com/) signed in (`gh auth login`)
-  - Microsoft Foundry: the [Azure CLI](https://learn.microsoft.com/cli/azure/) signed in (`az login`)
+- **macOS only.** It does not run on Windows or Linux: it is a SwiftBar plugin (SwiftBar is a macOS app), the Claude sign-in is read from the macOS Keychain, and the **Providers…** window is a native macOS panel.
+- [SwiftBar](https://github.com/swiftbar/SwiftBar) (free, open source).
+- Python 3.9 or newer, at `/opt/homebrew/bin/python3`, `/usr/local/bin/python3` or `/usr/bin/python3`. The Xcode Command Line Tools provide the last one (see [Install](#install)); Homebrew's Python works too.
+
+Then, for each provider you want to see, install its tool and sign in. Only the providers you want are needed; the others are simply hidden. Do this before you expect a provider in the menu: the plugin never signs in for you.
+
+| Provider | Install | Sign in |
+|---|---|---|
+| **Claude** | [Claude Code](https://docs.anthropic.com/claude-code): `brew install --cask claude-code`, or the installer in its docs | Run `claude`, then `/login` with a Claude subscription (Pro, Max or Team). An API key has no subscription limits to show. The plugin reads the "Claude Code-credentials" Keychain item, so `claude` can be installed anywhere. |
+| **Codex (GPT)** | [Codex CLI](https://github.com/openai/codex): `brew install --cask codex` | `codex login` with ChatGPT |
+| **Gemini** | [Antigravity](https://antigravity.google/): `brew install --cask antigravity`; fallback: Gemini CLI, `brew install gemini-cli` | Sign in to Antigravity with Google and keep it running; for the fallback, run `gemini` once and sign in with Google |
+| **GitHub Copilot** | [GitHub CLI](https://cli.github.com/): `brew install gh` | `gh auth login`; the account needs a Copilot plan |
+| **Microsoft Foundry** | [Azure CLI](https://learn.microsoft.com/cli/azure/): `brew install azure-cli` | `az login`, then set `resource_group` in `config.json` (see [Settings](#settings)) |
 
 SwiftBar doesn't use your shell's `PATH`, so `codex`, `gh` and `az` are looked up in `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`, `/usr/bin` and `/bin`. A tool installed somewhere else (for example through nvm) shows as *not set up on this Mac*. Install it with Homebrew, or link it into `~/.local/bin` (`mkdir -p ~/.local/bin && ln -s "$(command -v gh)" ~/.local/bin/gh`); a Node-based tool such as `codex` also needs `node` in one of those folders.
 
 ## Install
+
+Before you start: install [Homebrew](https://brew.sh). It also installs the Xcode Command Line Tools, which provide `git` and `/usr/bin/python3`. Without Homebrew: run `xcode-select --install`, and download SwiftBar from its [releases page](https://github.com/swiftbar/SwiftBar/releases) instead of the `brew` line below.
 
 1. Install SwiftBar and get the code:
 
@@ -71,7 +80,7 @@ SwiftBar doesn't use your shell's `PATH`, so `codex`, `gh` and `az` are looked u
 
      SwiftBar's Preferences show the current plugin folder. Then choose *Refresh all* in SwiftBar's menu.
 
-3. On the first run, `config.json` is created next to `config.example.json`. Providers that aren't set up on your Mac are hidden; Microsoft Foundry stays off until you set it up (see [Settings](#settings)).
+3. On the first run, `config.json` is created next to `config.example.json`. Providers that aren't set up on your Mac are hidden; Microsoft Foundry stays off until you set it up (see [Settings](#settings)). If nothing is set up yet, the menu bar shows `–` and the menu says *No supported AI tool found on this Mac*: install and sign in to a provider (see [Requirements](#requirements)), and it appears on the next refresh, or at once with **Refresh now**. To check, open **Providers…**: *· not set up on this Mac* marks any provider that is on but still missing.
 
 4. For Claude, macOS may ask whether the "Claude Code-credentials" Keychain item may be used. Choose *Always Allow*, otherwise the question comes back on every read.
 
