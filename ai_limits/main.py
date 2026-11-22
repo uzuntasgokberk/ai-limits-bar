@@ -17,7 +17,8 @@ that this plugin's own "Providers…" and "Menu bar shows" items ask for):
                  adds --refresh when SwiftBar reports that click. A cache younger than 60 seconds is still used
                  (a refresh can also be triggered by a link), the cache stays the fallback, and the menu bar keeps
                  the previous values until the new ones are ready. Right after a --show (see keep_values), that one
-                 run is not forced: it shows the new choice from the values already read.
+                 run shows the new choice from the cached values, whatever their age, and reads only providers that
+                 have none (and those forced to fail with --fail).
   --config PATH  read this file instead of config.json (config.json is then not created from the example)
   --cache DIR    cache folder instead of ~/Library/Caches/ai-limits-bar
   --skip a,b     skip these providers for this run
@@ -310,9 +311,10 @@ def mark_keep_values(cache):
 
 def keep_values(cache):
     """For a --refresh run: True if a --show just left a valid marker (a regular file holding a JSON object whose
-    time is a finite number at most KEEP_SECONDS old); this run is then not forced. Whenever a --refresh run looks,
+    time is a finite number at most KEEP_SECONDS old). This run then shows every provider that has a cached result
+    from that cache, whatever its age, and reads only providers without one, not forced. Whenever a --refresh run looks,
     the marker is removed, valid or not (a symlinked one is not followed, just removed). The marker can only skip
-    this one forced re-read; anything unexpected means False, i.e. a forced refresh."""
+    this one re-read; anything unexpected means False, i.e. a forced refresh."""
     path = os.path.join(cache, KEEP_FILE)
     valid = False
     try:
@@ -418,11 +420,13 @@ def main(argv=None):
         return  # nothing is printed: the click's refresh=true re-runs the plugin for the new menu
     config, config_error = load_config(config_path, create=not args.config)
     force, forced, skip = args.refresh, _names(args.fail), _names(args.skip)
+    keep = False  # right after a --show: show the new choice from the cached values, whatever their age
     if force:
         try:
-            force = not keep_values(cache)  # right after a --show: show the new choice from the values already read
+            keep = keep_values(cache)
         except Exception:
-            force = True
+            keep = False
+        force = not keep
     debug_shapes = config.get("debug_shapes") is True
 
     now = time.time()
@@ -439,8 +443,8 @@ def main(argv=None):
         if force:
             fresh_for = REFRESH_FLOOR
         age = now - cached["time"] if cached and cached.get("time") else None
-        if age is not None and 0 <= age < fresh_for and name not in forced:
-            results[name] = cached
+        if name not in forced and cached and (keep or (age is not None and 0 <= age < fresh_for)):
+            results[name] = cached  # fresh enough, or kept for the menu bar choice (render marks stale percents)
         else:
             timeout = _number(p.get("timeout_seconds"), 15, 1, 120)
             jobs[name] = (pool.submit(call, name, settings, forced), now + timeout)

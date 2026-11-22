@@ -1710,6 +1710,21 @@ class KeepValues(unittest.TestCase):
         self.assertEqual(self.calls, [])  # a normal run uses the fresh cache anyway
         self.assertTrue(os.path.exists(self.marker))  # and leaves the marker alone (it simply expires)
 
+    def test_cached_values_of_any_age_are_kept_for_that_run(self):
+        self.cache_claude(age=20 * 60)  # older than refresh_minutes: a scheduled run would read it again
+        self.run_main("--show", "claude:5-hour")
+        text = self.run_main("--refresh")
+        self.assertEqual(self.calls, [])  # kept, whatever its age: the click is always instant
+        self.assertTrue(menu_lines(text)[0].startswith("31% | "))
+        self.run_main()  # the next scheduled run (no --refresh, no marker): the normal freshness rule again
+        self.assertEqual(self.calls, [("claude", False)])
+
+    def test_a_forced_failure_still_goes_through_call(self):
+        self.cache_claude()
+        self.run_main("--show", "claude:5-hour")
+        self.run_main("--refresh", "--fail", "claude")
+        self.assertEqual(self.calls, [("claude", False)])  # --fail wins over the kept cache
+
     def test_a_provider_without_values_is_still_read(self):
         self.write_config([{"name": "claude", "enabled": True}, {"name": "codex", "enabled": True}])
         self.cache_claude()
