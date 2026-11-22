@@ -1,6 +1,11 @@
 """Offline tests: rendering rules, safety of menu output, provider parsing and the plugin's failure paths.
 
 Run: python3 -I tests/test_ai_limits.py   (add --gui for the two tests that open the Providers… window)
+No test may reach a real provider. Two structural guards enforce it: setUpModule replaces every way a provider
+module reaches the outside (its subprocess, HTTP and tool-lookup functions, and the home-folder paths it reads) with
+a guard, and load_main() replaces main.call with one, so a test that wants provider data installs its own fake; a
+guard raises RealProviderRead, which no `except Exception` in the plugin can swallow. Every run of the plugin as a
+process goes through run_launcher(), which skips all providers except those forced to fail.
 The default run opens no window and needs no Keychain, network or ~/Library/Caches; it runs on any macOS with
 Python 3.9 or later (CI: GitHub's macOS runner, with the system Python and the latest Python). Time limits are
 generous for slow machines but always shorter than the wrong behaviour they rule out.
@@ -43,6 +48,65 @@ PLUGIN = os.path.join(ROOT, "plugin", "ai-limits.5m.sh")
 IS_ROOT = os.geteuid() == 0
 NOW = 1_800_000_000.0
 ALL = ",".join(NAMES)
+
+
+class RealProviderRead(BaseException):
+    """A test reached a real provider read. A BaseException, so the plugin's own `except Exception` (per provider in
+    main, around the Antigravity call, in the Foundry history) cannot turn it into a quiet "Couldn't read"."""
+
+
+def provider_guard(where):
+    def guard(*args, **kwargs):
+        raise RealProviderRead(f"{where} was called: a test reached a real provider read; install a fake first")
+    return guard
+
+
+# Every way a provider module reaches the outside, as bound in that module (tests that need one patch it themselves,
+# and the guard is back when their patch ends). common's own functions stay real: the loopback tests use them.
+GUARDED_CALLS = [(claude, "run"), (claude, "https_json"), (codex, "find_tool"), (copilot, "run"),
+                 (copilot, "find_tool"), (foundry, "run"), (foundry, "find_tool"), (gemini, "https_json"),
+                 (gemini, "localhost_json")]
+_GUARD_HOME = tempfile.TemporaryDirectory()
+
+
+def setUpModule():
+    """The suite-wide guard against real provider reads (see the module docstring). The home-folder paths the
+    providers read without a tool (Antigravity's hub files, the Gemini CLI and Codex session files) point into an
+    empty temporary folder."""
+    for module, name in GUARDED_CALLS:
+        mock.patch.object(module, name, provider_guard(f"{module.__name__}.{name}")).start()
+    empty = _GUARD_HOME.name
+    for module, name, path in [(gemini, "ANTIGRAVITY_DIR", os.path.join(empty, "antigravity")),
+                               (gemini, "HUB", os.path.join(empty, "antigravity", "daemon", "hub_*.json")),
+                               (gemini, "CLI_CREDENTIALS", os.path.join(empty, "oauth_creds.json")),
+                               (codex, "SESSIONS", os.path.join(empty, "sessions"))]:
+        mock.patch.object(module, name, path).start()
+
+
+def tearDownModule():
+    mock.patch.stopall()
+    _GUARD_HOME.cleanup()
+
+
+def run_launcher(args, *, config, cache, env=None, command=(PLUGIN,), allow_real_providers=False):
+    """The only way tests start the plugin as a process. --skip is added LAST, so it wins over a --skip the test
+    passed itself, and skips every provider except those the test forces to fail with --fail (main.call raises for
+    them before any provider code runs). allow_real_providers=True is the explicit opt-out; no test uses it.
+    --config and --cache must be inside the temporary folder."""
+    temp = os.path.realpath(tempfile.gettempdir())
+    for path in (config, cache):
+        assert os.path.realpath(path).startswith(temp + os.sep), f"not a temporary path: {path}"
+    argv = [*command, "--config", config, "--cache", cache, *args]
+    if not allow_real_providers:
+        failing = set()
+        for i, arg in enumerate(args):
+            if arg == "--fail" and i + 1 < len(args):
+                failing |= set(args[i + 1].split(","))
+            elif arg.startswith("--fail="):
+                failing |= set(arg.split("=", 1)[1].split(","))
+        argv += ["--skip", ",".join(n for n in NAMES if n not in failing)]
+    return subprocess.run(argv, capture_output=True, encoding="utf-8",
+                          env=env if env is not None else dict(os.environ), timeout=30)
 
 
 def res(title="X", rows=None, status="ok", **k):
@@ -1104,7 +1168,8 @@ def file_state(path):
 
 
 def load_main():
-    """main.py as a fresh module. Importing it replaces os.environ, so this process's environment is restored."""
+    """main.py as a fresh module, with main.call replaced by the provider guard: a test that wants provider data
+    sets its own fake. Importing main.py replaces os.environ, so this process's environment is restored."""
     saved = dict(os.environ)
     try:
         spec = importlib.util.spec_from_file_location("ai_limits_main", os.path.join(ROOT, "ai_limits", "main.py"))
@@ -1113,7 +1178,43 @@ def load_main():
     finally:
         os.environ.clear()
         os.environ.update(saved)
+    module.call = provider_guard("main.call")
     return module
+
+
+class ProviderGuard(unittest.TestCase):
+    """Proof that the suite-wide guard holds: without a fake, a test hits the guard, not a provider."""
+
+    def test_main_without_a_fake_hits_the_guard(self):
+        m = load_main()
+        with tempfile.TemporaryDirectory() as d:
+            config = os.path.join(d, "config.json")
+            with open(config, "w") as f:
+                json.dump({"providers": [{"name": n, "enabled": True} for n in NAMES]}, f)
+            with self.assertRaisesRegex(RealProviderRead, "main.call"), contextlib.redirect_stdout(io.StringIO()):
+                m.main(["--config", config, "--cache", os.path.join(d, "cache")])
+
+    def test_the_real_call_still_cannot_reach_a_provider(self):
+        # What the real main.call runs (each provider's read) stops at the provider modules' own guards.
+        for provider, settings, where in [(claude, {}, "claude.run"), (codex, {}, "codex.find_tool"),
+                                          (copilot, {}, "copilot.find_tool"),
+                                          (foundry, {"resource_group": "rg"}, "foundry.find_tool")]:
+            with self.assertRaisesRegex(RealProviderRead, where):
+                provider.read(settings)
+        with self.assertRaises(common.NotConfigured):
+            gemini.read({})  # no hub file and no Gemini CLI sign-in in the empty guard folder: nothing real is read
+        self.assertTrue(gemini.HUB.startswith(_GUARD_HOME.name))
+        self.assertTrue(codex.SESSIONS.startswith(_GUARD_HOME.name))
+
+    def test_every_process_run_goes_through_run_launcher(self):
+        with open(os.path.abspath(__file__), encoding="utf-8") as f:
+            source = f.read()
+        run, popen = "subprocess." + "run(", "subprocess." + "Popen("  # split, so this line doesn't count itself
+        self.assertEqual(source.count(run), 1)  # the one in run_launcher
+        self.assertEqual(source.count(popen), 0)
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(AssertionError):
+                run_launcher([], config=os.path.join(ROOT, "config.json"), cache=os.path.join(d, "c"))
 
 
 class Main(unittest.TestCase):
@@ -1500,11 +1601,7 @@ class Show(unittest.TestCase):
         os.mkdir(self.dir)
         self.cache = os.path.join(folder.name, "cache")
         self.config = os.path.join(self.dir, "config.json")
-        self.write(self.TEXT)
-        self.main.call = self.no_provider  # if --show ever fell through to a normal run, nothing real is read
-
-    def no_provider(self, *args):
-        raise AssertionError("a provider was read")
+        self.write(self.TEXT)  # load_main's guard stops any provider read if --show ever fell through
 
     def write(self, text):
         with open(self.config, "w", encoding="utf-8") as f:
@@ -1517,7 +1614,7 @@ class Show(unittest.TestCase):
     def show(self, value):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.main.main(["--show", value, "--config", self.config, "--cache", self.cache, "--skip", ALL])
+            self.main.main(["--show", value, "--config", self.config, "--cache", self.cache])
         self.assertEqual(out.getvalue(), "")  # prints nothing
         self.assertFalse([x for x in os.listdir(self.dir) if x.endswith(".tmp")])
         return self.read()
@@ -1757,15 +1854,14 @@ class Plugin(unittest.TestCase):
     """Runs the real launcher offline: every enabled provider is skipped or forced to fail."""
 
     def run_plugin(self, args, cache, enabled=(), config_text=None, env=None, config=None):
-        """`config`: an existing file to use as it is; otherwise a temporary one is written."""
+        """run_launcher with a temporary config unless `config` names an existing one."""
         with tempfile.TemporaryDirectory() as d:
             if config is None:
                 config = os.path.join(d, "config.json")
                 with open(config, "w") as f:
                     f.write(config_text if config_text is not None else
                             json.dumps({"providers": [{"name": n, "enabled": n in enabled} for n in NAMES]}))
-            return subprocess.run([PLUGIN, "--config", config, "--cache", cache, *args], capture_output=True,
-                                  encoding="utf-8", env=env if env is not None else dict(os.environ), timeout=30)
+            return run_launcher(args, config=config, cache=cache, env=env)
 
     def test_everything_skipped(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1813,10 +1909,9 @@ class Plugin(unittest.TestCase):
         main_py = os.path.join(ROOT, "ai_limits", "main.py")
         with tempfile.TemporaryDirectory() as d:
             config, cache = os.path.join(d, "config.json"), os.path.join(d, "cache")
-            base = [sys.executable, "-B", "-I", main_py, "--skip", ALL, "--config", config, "--cache", cache]
-            ok = subprocess.run(base, capture_output=True, encoding="utf-8", env={}, timeout=30)
-            bad = subprocess.run(base + ["--debug", "--config"], capture_output=True, encoding="utf-8", env={},
-                                 timeout=30)
+            command = (sys.executable, "-B", "-I", main_py)
+            ok = run_launcher([], config=config, cache=cache, env={}, command=command)
+            bad = run_launcher(["--debug", "--config"], config=config, cache=cache, env={}, command=command)
         self.assertEqual((ok.returncode, ok.stderr), (0, ""))
         self.assertIn("No supported AI tool found", ok.stdout)
         self.assertEqual(bad.returncode, 0)
@@ -1887,9 +1982,8 @@ class Plugin(unittest.TestCase):
             config, cache = os.path.join(d, "config.json"), os.path.join(d, "cache")
             with open(config, "w") as f:
                 json.dump({"providers": [{"name": n, "enabled": True} for n in NAMES]}, f)
-            base = [link, "--config", config, "--cache", cache]
-            menu = subprocess.run(base + ["--skip", ALL], capture_output=True, encoding="utf-8", timeout=30)
-            toggled = subprocess.run(base + ["--toggle", "gemini"], capture_output=True, encoding="utf-8", timeout=30)
+            menu = run_launcher([], config=config, cache=cache, command=(link,))
+            toggled = run_launcher(["--toggle", "gemini"], config=config, cache=cache, command=(link,))
             with open(config) as f:
                 after = json.load(f)
             linked_folder = sorted(os.listdir(os.path.dirname(link)))
@@ -1905,14 +1999,13 @@ class Plugin(unittest.TestCase):
             config, cache = os.path.join(d, "config.json"), os.path.join(d, "cache")
             with open(config, "w") as f:
                 json.dump({"providers": [{"name": n, "enabled": True} for n in NAMES]}, f)
-            # --skip of all five on every run: even if --show were not recognised, nothing real would be read
-            pinned = self.run_plugin(["--show", "claude:5-hour", "--skip", ALL], cache, config=config)
+            pinned = self.run_plugin(["--show", "claude:5-hour"], cache, config=config)
             with open(config) as f:
                 after = json.load(f)
             menu = self.run_plugin(["--skip", ALL], cache, config=config)
             with open(config, "rb") as f:
                 before_refusal = f.read()
-            refused = self.run_plugin(["--show", "claude:a|b", "--skip", ALL], cache, config=config)
+            refused = self.run_plugin(["--show", "claude:a|b"], cache, config=config)
             with open(config, "rb") as f:
                 after_refusal = f.read()
         self.assertEqual((pinned.returncode, pinned.stdout, pinned.stderr), (0, "", ""))
