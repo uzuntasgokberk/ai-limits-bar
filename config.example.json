@@ -1,0 +1,14 @@
+{
+  "providers": [
+    {"name": "claude", "enabled": true, "refresh_minutes": 5, "timeout_seconds": 15},
+    {"name": "codex", "enabled": true, "refresh_minutes": 5, "timeout_seconds": 15},
+    {"name": "gemini", "enabled": true, "refresh_minutes": 5, "timeout_seconds": 15},
+    {"name": "copilot", "enabled": true, "refresh_minutes": 5, "timeout_seconds": 20},
+    {"name": "foundry", "enabled": false, "refresh_minutes": 5, "timeout_seconds": 60,
+     "resource_group": "my-resource-group", "resource": "my-foundry-resource", "budget_usd": null, "invoice_refresh_hours": 6,
+     "prices_usd_per_million": {
+       "my-deployment": {"input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write_5m": 1.25, "cache_write_1h": 2.0}
+     }}
+  ],
+  "debug_shapes": false
+}

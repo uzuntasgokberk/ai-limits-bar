@@ -1,0 +1,1 @@
+Pull requests are by invitation (open an issue first, CONTRIBUTING.md); before opening one, run `python3 -I tests/test_ai_limits.py` (and `--gui` if you changed the Providers… window), and link the issue here.

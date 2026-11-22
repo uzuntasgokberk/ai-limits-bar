@@ -1,0 +1,45 @@
+# CI: the offline test suite on GitHub's macOS runner. The plugin is macOS-only (a zsh launcher, /usr/bin/env, the
+# passwd database, flock, osascript), so there is no Linux or Windows leg. The two window tests (--gui) don't run here.
+# Tests that start the launcher use the interpreter it finds first (/opt/homebrew, /usr/local, /usr/bin).
+# The job names "tests (system python)" and "tests (latest python)" are the required checks of the main ruleset.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: tests (${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["system python", "latest python"]
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        if: matrix.python == 'latest python'
+        with:
+          python-version: "3.x"
+      - name: Tests with the system Python (/usr/bin/python3, the oldest supported)
+        if: matrix.python == 'system python'
+        run: |
+          /usr/bin/python3 -I -c 'import sys; print(sys.executable, sys.version)'
+          /usr/bin/python3 -I tests/test_ai_limits.py
+      - name: Tests with the latest Python
+        if: matrix.python == 'latest python'
+        run: |
+          python3 -I -c 'import sys; print(sys.executable, sys.version)'
+          python3 -I tests/test_ai_limits.py

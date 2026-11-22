@@ -1,0 +1,7 @@
+# Normalize text to LF in the repository.
+* text=auto
+
+# The launcher and the Python modules must stay LF in every checkout: a CR at the end of "#!/bin/zsh -f" or of a shell
+# line breaks the launcher, and SwiftBar would show nothing.
+*.sh text eol=lf
+*.py text eol=lf
