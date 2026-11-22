@@ -66,9 +66,9 @@ def menu_lines(text):
 
 def swiftbar_params(line):
     """Port of SwiftBar's parameter parser. The first `|` ends the title. Key: everything up to the next `=`,
-    trimmed and lower-cased. Value: if it starts with `"` or `'`, everything up to the matching quote (a
-    backslash escapes the next character, both are kept), otherwise everything up to the next space or tab.
-    A later duplicate key overwrites an earlier one."""
+    trimmed and lower-cased; spaces after `=` are skipped. Value: if it starts with `"` or `'`, everything up to
+    the matching quote (a backslash escapes the next character, both are kept), otherwise everything up to the
+    next space or tab. A later duplicate key overwrites an earlier one."""
     if "|" not in line:
         return {}
     text, params, i = line.split("|", 1)[1], {}, 0
@@ -79,6 +79,8 @@ def swiftbar_params(line):
         if i >= len(text) or eq < 0:
             return params
         key, i = text[i:eq].strip().lower(), eq + 1
+        while i < len(text) and text[i] in " \t":
+            i += 1
         if i < len(text) and text[i] in "\"'":
             quote, start = text[i], i + 1
             i = start
@@ -122,6 +124,9 @@ class SwiftBarParser(unittest.TestCase):
         self.assertEqual(swiftbar_params("no parameters"), {})
         self.assertEqual(menu_lines("a\u2028b\x85c\rd"), ["a", "b", "c", "d"])
 
+    def test_port_skips_spaces_after_the_equals_sign(self):
+        self.assertEqual(swiftbar_params('T | a= "x y" b=  z'), {"a": "x y", "b": "z"})
+
     def test_port_sees_the_old_settings_injection(self):
         # What the old code printed for a crafted path: the command is replaced. The tests below rely on this.
         old = 'Open settings | bash=/usr/bin/open param1="x" bash=/bin/sh param1=-c x="" terminal=false'
@@ -160,7 +165,7 @@ class Render(unittest.TestCase):
         first = text.splitlines()[0]
         self.assertTrue(first.startswith("94%"))
         self.assertIn(f"color={render.RED}", first)
-        self.assertIn('tooltip="Claude 94% · Copilot 57%"', first)
+        self.assertIn('tooltip="Highest: Claude Weekly 94% · Claude 94% · Copilot 57%"', first)
 
     def test_long_label_does_not_touch_bar(self):
         text = render.menu([("claude", res("CLAUDE", [row("5-hour", 81.0), row("Weekly Opus", 83.0)]))], NOW)
@@ -280,7 +285,8 @@ class ProvidersMenu(unittest.TestCase):
         self.assertLess(lines.index(line), next(i for i, x in enumerate(lines) if x.startswith("Open settings")))
         self.assertEqual(swiftbar_params(line), {"bash": self.LAUNCHER, "param1": "--choose", "terminal": "false",
                                                  "refresh": "true"})
-        self.assertFalse(any(x.startswith("--") and x != "---" for x in lines))  # no submenu any more
+        submenus = [x for x in lines if x.startswith("--") and x != "---"]
+        self.assertEqual([x.split(" | ")[0] for x in submenus], ["--Highest of all"])  # only the menu bar chooser
         for name in render.HEADERS.values():
             self.assertNotIn(name, text)  # the provider list lives in the panel
 
@@ -318,6 +324,200 @@ class ProvidersMenu(unittest.TestCase):
         self.assertIn("No supported AI tool found on this Mac", some_on)
         self.assertNotIn("All providers are off", some_on)
         self.assertNotIn(render.PROVIDERS_ITEM, render.menu([], NOW, True, "/Users/demo/config.json"))  # no data
+
+
+class MenuBarChoice(unittest.TestCase):
+    """Which limit the menu bar number shows: "highest" (default) or one pinned provider row."""
+
+    LAUNCHER = "/Users/demo/ai-limits-bar/plugin/ai-limits.5m.sh"
+    STATE = [(n, True) for n in NAMES]
+    FUTURE = NOW + 3600
+
+    def results(self, claude=None, codex=None):
+        claude = [row("5-hour", 31.0, resets=self.FUTURE), row("Weekly", 57.0, resets=self.FUTURE),
+                  row("Weekly Opus", 44.0, resets=self.FUTURE)] if claude is None else claude
+        if codex is None:
+            codex = [row("5-hour", 12.0, resets=self.FUTURE), row("Weekly", 62.0, resets=self.FUTURE)]
+        return [("claude", res("CLAUDE", claude)), ("codex", res("CODEX", codex))]
+
+    def menu(self, menu_bar=None, results=None, launcher=LAUNCHER, toggle_config=None, config_error=False):
+        return render.menu(self.results() if results is None else results, NOW, True, "/Users/demo/config.json",
+                           config_error, self.STATE, launcher, toggle_config, menu_bar)
+
+    @staticmethod
+    def title(text):
+        first = menu_lines(text)[0]
+        return first.split(" | ")[0], swiftbar_params(first)
+
+    @staticmethod
+    def chooser(text):
+        lines = menu_lines(text)
+        start = end = lines.index(render.CHOOSER_ITEM) + 1
+        while end < len(lines) and lines[end].startswith("--") and lines[end] != "---":
+            end += 1
+        return lines[start:end]
+
+    def action(self, value, checked=False, config=None):
+        params = {"bash": self.LAUNCHER, "param1": "--show", "param2": value, "terminal": "false", "refresh": "true"}
+        if config:
+            params.update(param3="--config", param4=config)
+        if checked:
+            params["checked"] = "true"
+        return params
+
+    def assert_no_action(self, line):
+        params = swiftbar_params(line)
+        self.assertFalse([k for k in params if k.startswith("param") or k in ("bash", "shell", "refresh", "href")],
+                         line)
+
+    def test_highest_is_the_default_and_says_what_it_is(self):
+        for menu_bar in (None, "highest"):
+            text = self.menu(menu_bar)
+            title, params = self.title(text)
+            self.assertEqual(title, "62%")
+            self.assertEqual(params, {"sfimage": render.icon(62.0),
+                                      "tooltip": "Highest: Codex Weekly 62% · Claude 57% · Codex 62%"})
+            entries = self.chooser(text)
+            self.assertEqual([x.split(" | ")[0] for x in entries],
+                             ["--Highest of all", "--Claude · 5-hour", "--Claude · Weekly", "--Claude · Weekly Opus",
+                              "--Codex · 5-hour", "--Codex · Weekly"])
+            self.assertEqual(swiftbar_params(entries[0]), self.action("highest", checked=True))
+            self.assertEqual(swiftbar_params(entries[1]), self.action("claude:5-hour"))
+            self.assertEqual(swiftbar_params(entries[3]), self.action("claude:Weekly Opus"))
+            self.assertEqual(swiftbar_params(entries[5]), self.action("codex:Weekly"))
+
+    def test_chooser_sits_next_to_providers(self):
+        lines = menu_lines(self.menu())
+        providers = lines.index(providers_line(self.menu()))
+        self.assertEqual(lines[providers + 1], render.CHOOSER_ITEM)
+        self.assertEqual(swiftbar_params(render.CHOOSER_ITEM), {})  # the submenu header does nothing
+        self.assertTrue(lines[providers + 8].startswith("Open settings"))
+        self.assertNotIn(render.CHOOSER_ITEM, render.menu(self.results(), NOW, True, "/Users/demo/config.json"))
+
+    def test_pinned_row_drives_title_icon_colour_and_tooltip(self):
+        text = self.menu({"provider": "claude", "limit": "5-hour"})
+        title, params = self.title(text)
+        self.assertEqual(title, "31%")  # not the highest (62%)
+        self.assertEqual(params, {"sfimage": render.icon(31.0),
+                                  "tooltip": "Showing Claude 5-hour 31% · Claude 57% · Codex 62%"})
+        entries = self.chooser(text)
+        self.assertEqual(swiftbar_params(entries[0]), self.action("highest"))
+        self.assertEqual(swiftbar_params(entries[1]), self.action("claude:5-hour", checked=True))
+        self.assertEqual(sum("checked" in swiftbar_params(x) for x in entries), 1)
+        hot = self.results(codex=[row("Weekly", 95.0, resets=self.FUTURE)])
+        self.assertEqual(self.title(self.menu(None, hot))[1].get("color"), render.RED)  # highest: red
+        pinned = self.title(self.menu({"provider": "claude", "limit": "5-hour"}, hot))
+        self.assertEqual(pinned[0], "31%")
+        self.assertNotIn("color", pinned[1])  # the colour follows the shown limit, not the 95% one
+        for percent, colour in ((92.0, render.RED), (80.0, render.ORANGE)):
+            mine = self.results(claude=[row("5-hour", percent, resets=self.FUTURE)])
+            self.assertEqual(self.title(self.menu({"provider": "claude", "limit": "5-hour"}, mine))[1]["color"], colour)
+        spaced = self.menu({"provider": "claude", "limit": "Weekly Opus"})
+        self.assertEqual(self.title(spaced)[0], "44%")
+        self.assertEqual(swiftbar_params(self.chooser(spaced)[3]), self.action("claude:Weekly Opus", checked=True))
+
+    def test_first_matching_row_wins_and_each_row_is_listed_once(self):
+        twice = self.results(claude=[row("5-hour", value="n/a"), row("5-hour", 31.0, resets=self.FUTURE),
+                                     row("5-hour", 50.0, resets=self.FUTURE)])
+        text = self.menu({"provider": "claude", "limit": "5-hour"}, twice)
+        self.assertEqual(self.title(text)[0], "31%")  # rows without a percentage don't count
+        self.assertEqual([x.split(" | ")[0] for x in self.chooser(text)].count("--Claude · 5-hour"), 1)
+
+    def test_pinned_but_unavailable_shows_a_dash(self):
+        pin = {"provider": "claude", "limit": "5-hour"}
+        cases = {
+            "provider off, hidden or not set up": [("codex", res("CODEX", [row("Weekly", 62.0, resets=self.FUTURE)]))],
+            "row gone": self.results(claude=[row("Weekly", 57.0, resets=self.FUTURE)]),
+            "no percentage": self.results(claude=[row("5-hour", value="unlimited")]),
+            "reset time passed": self.results(claude=[row("5-hour", 31.0, resets=NOW - 60)]),
+            "nothing at all": [],
+        }
+        for cause, results in cases.items():
+            text = self.menu(pin, results)
+            title, params = self.title(text)
+            self.assertEqual(title, "–", cause)  # never the highest in its place
+            self.assertEqual(params["sfimage"], render.icon(None), cause)
+            self.assertNotIn("color", params, cause)
+            self.assertTrue(params["tooltip"].startswith("Claude 5-hour not available"), (cause, params["tooltip"]))
+            entries = self.chooser(text)
+            checked = [x for x in entries if "checked" in swiftbar_params(x)]
+            self.assertEqual(len(checked), 1, cause)
+            if cause == "reset time passed":  # the row is still listed: its own entry is the checked one
+                self.assertEqual(swiftbar_params(checked[0]), self.action("claude:5-hour", checked=True))
+            else:
+                self.assertEqual(checked[0], "--Claude · 5-hour (not available) | checked=true", cause)
+                self.assert_no_action(checked[0])
+        self.assertEqual(self.title(self.menu(pin, []))[1]["tooltip"], "Claude 5-hour not available")
+
+    def test_invalid_values_mean_highest(self):
+        for value in (5, [], {}, "lowest", "", None, True, {"provider": "evil", "limit": "5-hour"},
+                      {"provider": "claude"}, {"provider": "claude", "limit": 5}, {"provider": "claude", "limit": ""},
+                      {"provider": "claude", "limit": "x" * 31}, {"provider": "claude", "limit": "a\nb"},
+                      {"provider": "claude", "limit": "a\u200eb"}, {"provider": ["claude"], "limit": "5-hour"},
+                      {"provider": "Claude", "limit": "5-hour"}):
+            text = self.menu(value)
+            title, params = self.title(text)
+            self.assertEqual(title, "62%", value)
+            self.assertTrue(params["tooltip"].startswith("Highest: Codex Weekly 62%"), value)
+            entries = self.chooser(text)
+            self.assertEqual(swiftbar_params(entries[0]), self.action("highest", checked=True), value)
+            self.assertFalse(any("(not available)" in x for x in entries), value)
+
+    def test_hand_pinned_label_outside_the_allow_list_matches_but_is_not_clickable(self):
+        results = [("gemini", res("GEMINI", [row("Demo (High)", 47.0, resets=self.FUTURE)]))]
+        text = self.menu({"provider": "gemini", "limit": "Demo (High)"}, results)
+        self.assertEqual(self.title(text)[0], "47%")
+        entry = self.chooser(text)[1]
+        self.assertTrue(entry.startswith("--Gemini · Demo (High) | checked=true"))
+        self.assert_no_action(entry)
+
+    def test_hostile_labels_add_no_action_and_no_line(self):
+        labels = ["a|b", "a'b", 'a"b', "a\\b", "a\nb", "a\u2028b", "-lead", "x bash=/bin/sh", "x param1=-c",
+                  "x refresh=true", "a:b", "Demo (High)", "x$(touch y)", "a\tb", "é-umlaut", "x" * 31]
+        for label in labels:
+            results = self.results(claude=[row(label, 99.0, resets=self.FUTURE),
+                                           row("5-hour", 31.0, resets=self.FUTURE)])
+            for menu_bar in (None, {"provider": "claude", "limit": label}):
+                text = self.menu(menu_bar, results)
+                lines = menu_lines(text)
+                self.assertLessEqual(set(swiftbar_params(lines[0])), {"sfimage", "color", "tooltip"}, (label, lines[0]))
+                for line in lines:
+                    params = swiftbar_params(line)
+                    if "bash" in params:
+                        self.assertIn(params["bash"], (self.LAUNCHER, "/usr/bin/open"), line)
+                    self.assertNotIn("/bin/sh", params.get("bash", ""), line)
+                entries = self.chooser(text)
+                self.assertEqual(len(entries), 1 + 2 + 2, (label, entries))  # highest + 2 Claude + 2 Codex rows
+                self.assert_no_action(entries[1])
+                self.assertEqual(swiftbar_params(entries[2])["param2"], "claude:5-hour")  # the next item is intact
+
+    def test_refused_paths_or_unreadable_config_leave_entries_without_action(self):
+        launchers = ['/x/a" bash=/bin/sh x="', "/x/a\nb", "plugin/x.sh", None, "/Users/demo/ai;limits/x.sh",
+                     "/Users/demo/my ai$x/x.sh"]
+        cases = [dict(launcher=x) for x in launchers] + [dict(toggle_config='/tmp/c" bash=/bin/sh x="'),
+                                                         dict(config_error=True)]
+        for case in cases:
+            entries = self.chooser(self.menu(**case))
+            self.assertEqual(len(entries), 6, case)
+            for line in entries:
+                self.assert_no_action(line)
+            self.assertIn("checked", swiftbar_params(entries[0]), case)  # the current choice is still shown
+        launcher = "/Users/demo/My Tools (2031)/Çalışma ai-limits/plugin/ai-limits.5m.sh"
+        self.assertEqual(swiftbar_params(self.chooser(self.menu(launcher=launcher))[1])["bash"], launcher)
+        config = "/Users/demo/My Folder/it's (a) $test.json"
+        entries = self.chooser(self.menu(toggle_config=config))
+        self.assertEqual(swiftbar_params(entries[0]), self.action("highest", checked=True, config=config))
+        self.assertEqual(swiftbar_params(entries[1]), self.action("claude:5-hour", config=config))
+
+    def test_choice_param_and_allow_list(self):
+        self.assertEqual(render.choice_param("claude", "Weekly Opus 4.5"), '"claude:Weekly Opus 4.5"')
+        for label in ("5-hour", "Weekly", "All models", "2 models", "AI credits", "This month", "2.5-pro input",
+                      "Weekly claude-opus_4", "x" * 30):
+            self.assertIsNotNone(render.choice_param("claude", label), label)
+        for label in ("", "x" * 31, " lead", "-lead", ".lead", "a:b", "a'b", 'a"b', "a\\b", "a|b", "a$b", "a(b)",
+                      "a\nb", "a\tb", "é", "a\u200eb", 5, None):
+            self.assertIsNone(render.choice_param("claude", label), repr(label))
+        self.assertIsNone(render.choice_param("evil", "5-hour"))
 
 
 class Panel(unittest.TestCase):
@@ -1286,6 +1486,112 @@ class Toggle(unittest.TestCase):
         self.files_now()
 
 
+class Show(unittest.TestCase):
+    """--show on temporary config files only: every call passes --config."""
+
+    TEXT = ('{"providers": [{"name": "claude", "enabled": true}, {"name": "codex", "enabled": false}], '
+            '"debug_shapes": false, "custom": [1, "x"]}')
+
+    def setUp(self):
+        self.main = load_main()
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.dir = os.path.join(folder.name, "settings")
+        os.mkdir(self.dir)
+        self.cache = os.path.join(folder.name, "cache")
+        self.config = os.path.join(self.dir, "config.json")
+        self.write(self.TEXT)
+        self.main.call = self.no_provider  # if --show ever fell through to a normal run, nothing real is read
+
+    def no_provider(self, *args):
+        raise AssertionError("a provider was read")
+
+    def write(self, text):
+        with open(self.config, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def read(self):
+        with open(self.config, encoding="utf-8") as f:
+            return f.read()
+
+    def show(self, value):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.main.main(["--show", value, "--config", self.config, "--cache", self.cache, "--skip", ALL])
+        self.assertEqual(out.getvalue(), "")  # prints nothing
+        self.assertFalse([x for x in os.listdir(self.dir) if x.endswith(".tmp")])
+        return self.read()
+
+    def test_pin_and_back(self):
+        text = self.show("claude:5-hour")
+        data = json.loads(text)
+        self.assertEqual(data["menu_bar"], {"provider": "claude", "limit": "5-hour"})
+        self.assertEqual(list(data), ["providers", "debug_shapes", "custom", "menu_bar"])
+        self.assertEqual(data["custom"], [1, "x"])
+        lines = text.splitlines()
+        self.assertIn('    {"name": "claude", "enabled": true},', lines)  # still one provider per line
+        self.assertIn('  "menu_bar": {"provider": "claude", "limit": "5-hour"}', lines)
+        self.assertEqual(json.loads(self.show("claude:Weekly Opus"))["menu_bar"],
+                         {"provider": "claude", "limit": "Weekly Opus"})
+        data = json.loads(self.show("highest"))
+        self.assertEqual(data["menu_bar"], "highest")
+        self.assertEqual(list(data), ["providers", "debug_shapes", "custom", "menu_bar"])  # stays in place
+
+    def test_no_change_no_write(self):
+        self.write(self.TEXT)
+        with mock.patch.object(self.main, "_write_atomic") as writes:
+            self.show("highest")  # missing means highest already
+            self.write('{"providers": [], "menu_bar": {"provider": "codex", "limit": "Weekly"}}')
+            self.show("codex:Weekly")
+        writes.assert_not_called()
+
+    def test_refusals_write_nothing(self):
+        for bad in ("evil:5-hour", "claude", "claude:", ":5-hour", "CLAUDE:5-hour", "claude:a|b", "claude:Demo (High)",
+                    "claude:-x", "claude:" + "x" * 31, "claude:a\nb", "claude:a:b", "claude:a'b", "Highest", "",
+                    "claude:é"):
+            with self.assertRaises(self.main.ArgumentError, msg=bad):
+                self.show(bad)
+            self.assertEqual(self.read(), self.TEXT, bad)
+
+    def test_unreadable_config_is_left_alone(self):
+        for text in ("{not json", "[1]"):
+            self.write(text)
+            self.assertEqual(self.show("claude:5-hour"), text)
+
+    def test_set_enabled_keeps_menu_bar(self):
+        self.write('{"providers": [{"name": "claude", "enabled": true}], '
+                   '"menu_bar": {"provider": "claude", "limit": "5-hour"}, "debug_shapes": false}')
+        self.assertTrue(self.main.set_enabled(self.config, {"claude": False, "codex": True}, False))
+        lines = self.read().splitlines()
+        self.assertEqual(lines[:6], ["{", '  "providers": [', '    {"name": "claude", "enabled": false},',
+                                     '    {"name": "codex", "enabled": true}', "  ],",
+                                     '  "menu_bar": {"provider": "claude", "limit": "5-hour"},'])
+
+    def test_round_trip_with_the_menu(self):
+        def run_menu():
+            out = io.StringIO()
+            self.main.call = lambda name, settings, forced: {
+                "title": "CLAUDE", "status": "ok", "details": [], "note": None, "time": time.time(),
+                "rows": [row("5-hour", 31.0, resets=time.time() + 3600),
+                         row("Weekly", 57.0, resets=time.time() + 3600)]}
+            with contextlib.redirect_stdout(out):
+                self.main.main(["--config", self.config, "--cache", self.cache, "--refresh"])
+            return out.getvalue()
+        self.show("claude:5-hour")
+        text = run_menu()
+        first = menu_lines(text)[0]
+        self.assertTrue(first.startswith("31% | "))
+        self.assertTrue(swiftbar_params(first)["tooltip"].startswith("Showing Claude 5-hour 31%"))
+        entry = next(x for x in menu_lines(text) if x.startswith("--Claude · 5-hour"))
+        self.assertEqual(swiftbar_params(entry), {"checked": "true", "bash": self.main.LAUNCHER, "param1": "--show",
+                                                  "param2": "claude:5-hour", "param3": "--config",
+                                                  "param4": self.config, "terminal": "false", "refresh": "true"})
+        self.show("highest")
+        text = run_menu()
+        self.assertTrue(menu_lines(text)[0].startswith("57% | "))
+        self.assertIn("checked", swiftbar_params(next(x for x in menu_lines(text) if x.startswith("--Highest of all"))))
+
+
 class Choose(unittest.TestCase):
     """--choose with the panel replaced by a fake: no window is opened. Always a temp --config and --cache."""
 
@@ -1593,6 +1899,31 @@ class Plugin(unittest.TestCase):
         self.assertEqual((toggled.returncode, toggled.stdout, toggled.stderr), (0, "", ""))
         self.assertEqual([p["enabled"] for p in after["providers"]], [n != "gemini" for n in NAMES])
         self.assertEqual(linked_folder, ["ai-limits.5m.sh"])
+
+    def test_show_end_to_end(self):
+        with tempfile.TemporaryDirectory() as d:
+            config, cache = os.path.join(d, "config.json"), os.path.join(d, "cache")
+            with open(config, "w") as f:
+                json.dump({"providers": [{"name": n, "enabled": True} for n in NAMES]}, f)
+            # --skip of all five on every run: even if --show were not recognised, nothing real would be read
+            pinned = self.run_plugin(["--show", "claude:5-hour", "--skip", ALL], cache, config=config)
+            with open(config) as f:
+                after = json.load(f)
+            menu = self.run_plugin(["--skip", ALL], cache, config=config)
+            with open(config, "rb") as f:
+                before_refusal = f.read()
+            refused = self.run_plugin(["--show", "claude:a|b", "--skip", ALL], cache, config=config)
+            with open(config, "rb") as f:
+                after_refusal = f.read()
+        self.assertEqual((pinned.returncode, pinned.stdout, pinned.stderr), (0, "", ""))
+        self.assertEqual(after["menu_bar"], {"provider": "claude", "limit": "5-hour"})
+        lines = menu_lines(menu.stdout)
+        self.assertTrue(lines[0].startswith("– | "))  # nothing was read: the pinned limit is not available
+        self.assertEqual(swiftbar_params(lines[0])["tooltip"], "Claude 5-hour not available")
+        self.assertIn("--Claude · 5-hour (not available) | checked=true", lines)
+        self.assertEqual(refused.returncode, 0)
+        self.assertIn("AI Limits Bar could not run", refused.stdout)
+        self.assertEqual(after_refusal, before_refusal)
 
     def test_hostile_environment_is_ignored(self):
         with tempfile.TemporaryDirectory() as d:

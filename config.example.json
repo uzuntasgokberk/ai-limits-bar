@@ -10,5 +10,6 @@
        "my-deployment": {"input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write_5m": 1.25, "cache_write_1h": 2.0}
      }}
   ],
+  "menu_bar": "highest",
   "debug_shapes": false
 }

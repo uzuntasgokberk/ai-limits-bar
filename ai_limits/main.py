@@ -11,8 +11,8 @@ in its own thread with its own timeout -> cache successful reads -> render.menu(
 
 Nothing is taken from the environment: SwiftBar copies the query parameters of a refresh link, which any web page
 or app can open, into it. It is replaced by a fixed one (common.ENV) before anything else runs, and every switch
-is a command-line argument, which a link can't set (SwiftBar passes none, except the --choose and --config that
-this plugin's own "Providers…" item asks for):
+is a command-line argument, which a link can't set (SwiftBar passes none, except the --choose, --show and --config
+that this plugin's own "Providers…" and "Menu bar shows" items ask for):
   --refresh      read every provider again. "Refresh now" is a plain SwiftBar `refresh=true` item; the launcher
                  adds --refresh when SwiftBar reports that click. A cache younger than 60 seconds is still used
                  (a refresh can also be triggered by a link), the cache stays the fallback, and the menu bar keeps
@@ -26,7 +26,12 @@ this plugin's own "Providers…" item asks for):
                  waits for it, then re-runs the plugin, but only after exit code 0, which safe_main guarantees.
                  A second --choose while a panel is open exits at once.
   --toggle NAME  turn one provider on or off in the config file and print nothing (for the terminal).
-                 With --choose or --toggle, the other switches except --config (and --cache for --choose) are ignored.
+  --show highest|PROVIDER:LIMIT
+                 set what the menu bar number shows (`menu_bar` in the config file) and print nothing: the highest
+                 current percentage, or one limit, e.g. `claude:5-hour`. A "Menu bar shows" click runs it; the value
+                 is checked again here (a known provider; a limit from render.CHOICE_LABEL), anything else is refused.
+                 With --choose, --toggle or --show, the other switches except --config (and --cache for --choose)
+                 are ignored.
 """
 import argparse
 import contextlib
@@ -90,9 +95,12 @@ def parse_args(argv):
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--toggle")
     parser.add_argument("--choose", action="store_true")
+    parser.add_argument("--show")
     args, _ = parser.parse_known_args(argv)
     if args.config == "" or args.cache == "":
         parser.error("empty path")
+    if args.show == "":
+        parser.error("--show takes highest or PROVIDER:LIMIT")
     return args
 
 
@@ -198,31 +206,12 @@ def _write_atomic(target, payload, mode):
         raise
 
 
-def _set_enabled_locked(path, changes, create):
-    """set_enabled without taking the lock (the caller holds it). Returns whether the file was written."""
+def _change_config_locked(path, create, change):
+    """Loads the config (load_config), lets change(data) edit it in place and say whether anything changed, then
+    writes it in one atomic write. The caller holds the lock. An unreadable file or no change: nothing is written.
+    Returns whether the file was written."""
     data, unreadable = load_config(path, create)
-    if unreadable:
-        return False
-    if not isinstance(data.get("providers"), list):
-        data["providers"] = []
-    entries = provider_entries(data)
-    changed = False
-    for name, on in changes.items():
-        if not valid_name(name):
-            continue
-        entry = entries.get(name)
-        current = entry is not None and entry.get("enabled") is True
-        on = (not current) if on is None else on is True
-        if on == current:
-            continue
-        if entry is None:
-            entry = {"name": name, "enabled": True}
-            data["providers"].append(entry)
-            entries[name] = entry
-        else:
-            entry["enabled"] = on
-        changed = True
-    if not changed:
+    if unreadable or not change(data):
         return False
     try:
         payload = config_text(data).encode("utf-8")
@@ -235,6 +224,32 @@ def _set_enabled_locked(path, changes, create):
         mode = 0o600
     _write_atomic(target, payload, mode)
     return True
+
+
+def _set_enabled_locked(path, changes, create):
+    """set_enabled without taking the lock (the caller holds it). Returns whether the file was written."""
+    def change(data):
+        if not isinstance(data.get("providers"), list):
+            data["providers"] = []
+        entries = provider_entries(data)
+        changed = False
+        for name, on in changes.items():
+            if not valid_name(name):
+                continue
+            entry = entries.get(name)
+            current = entry is not None and entry.get("enabled") is True
+            on = (not current) if on is None else on is True
+            if on == current:
+                continue
+            if entry is None:
+                entry = {"name": name, "enabled": True}
+                data["providers"].append(entry)
+                entries[name] = entry
+            else:
+                entry["enabled"] = on
+            changed = True
+        return changed
+    return _change_config_locked(path, create, change)
 
 
 def set_enabled(path, changes, create, lock_seconds=None):
@@ -253,6 +268,31 @@ def set_enabled(path, changes, create, lock_seconds=None):
 def toggle(path, name, create):
     """--toggle NAME: flips one provider (true -> false, anything else -> true). See set_enabled."""
     return valid_name(name) and set_enabled(path, {name: None}, create)
+
+
+def parse_choice(value):
+    """--show value -> "highest" or {"provider", "limit"}. The provider must be a known name and the limit must pass
+    render.CHOICE_LABEL (the same allow-list the menu uses before it puts a label into a click); anything else is
+    refused with ArgumentError, before the config file is opened."""
+    if value == "highest":
+        return "highest"
+    provider, colon, limit = value.partition(":")
+    if not colon or not valid_name(provider) or not render.CHOICE_LABEL.fullmatch(limit):
+        raise ArgumentError("--show takes highest or PROVIDER:LIMIT")
+    return {"provider": provider, "limit": limit}
+
+
+def set_menu_bar(path, value, create):
+    """--show: writes `menu_bar` with the same lock and writer as set_enabled (unreadable file: no write). A missing
+    key already means highest, so setting highest then writes nothing."""
+    def change(data):
+        if data.get("menu_bar") == value or (value == "highest" and "menu_bar" not in data):
+            return False
+        data["menu_bar"] = value
+        return True
+    target = os.path.realpath(path)
+    with _folder_lock(os.path.dirname(target), LOCK_SECONDS):
+        return _change_config_locked(path, create, change)
 
 
 def save_state(cache, not_set_up):
@@ -334,6 +374,9 @@ def main(argv=None):
     if args.toggle is not None:
         toggle(config_path, args.toggle, create=not args.config)
         return
+    if args.show is not None:
+        set_menu_bar(config_path, parse_choice(args.show), create=not args.config)
+        return  # nothing is printed: the click's refresh=true re-runs the plugin for the new menu
     config, config_error = load_config(config_path, create=not args.config)
     force, forced, skip = args.refresh, _names(args.fail), _names(args.skip)
     debug_shapes = config.get("debug_shapes") is True
@@ -390,7 +433,7 @@ def main(argv=None):
     shown = [(n, results[n]) for n in order if results.get(n)]
     providers = [(n, entries.get(n, {}).get("enabled") is True) for n in NAMES]
     print(render.menu(shown, time.time(), True, config_path, config_error, providers, LAUNCHER,
-                      config_path if args.config else None))
+                      config_path if args.config else None, config.get("menu_bar")))
 
 
 def safe_main():

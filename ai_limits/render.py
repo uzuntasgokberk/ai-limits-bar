@@ -4,7 +4,8 @@ SwiftBar syntax: one menu item per line; everything after ` | ` is parameters (h
 `---` is a separator and a line starting with `--` is a submenu item. Therefore every external string goes
 through `clean()`, parameter values with spaces through `quoted()`, and file paths through `param_path()`.
 Click targets are `LINKS`, `open` on the settings file, and this plugin's own launcher with `--choose` (the
-"Providers…" panel).
+"Providers…" panel) or `--show` (the "Menu bar shows" choice). A row label from a provider reaches a `--show`
+parameter only through `choice_param()`, which accepts nothing but a strict allow-list.
 """
 import math
 import re
@@ -37,6 +38,11 @@ HEADERS = {"claude": "Claude", "codex": "Codex (GPT)", "gemini": "Gemini", "copi
            "foundry": "Microsoft Foundry"}
 HEADER_STYLE = "font=HelveticaNeue-Bold size=14"
 NOT_SET_UP = " · not set up on this Mac"
+CHOOSER_ITEM = "Menu bar shows"
+HIGHEST_ITEM = "Highest of all"
+# Row labels that may go into a click parameter: ASCII letters and digits first, then also space . _ - (no quote,
+# backslash, colon, pipe, `$`, parentheses, control or format characters), at most 30 characters (normalize's limit).
+CHOICE_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,29}")
 
 
 def header(key, href=None, suffix=""):
@@ -210,6 +216,49 @@ def section(key, r, now, width=DEFAULT_WIDTH):
     return out
 
 
+def menu_bar_choice(value):
+    """The `menu_bar` setting as (provider, limit) for one pinned row, or None for the highest of all. Anything else
+    (wrong type, unknown provider, an empty or over-long limit, a control or format character) means highest. The
+    limit only has to be safe to display and to compare: it never goes into a click parameter."""
+    if not isinstance(value, dict):
+        return None
+    provider, limit = value.get("provider"), value.get("limit")
+    if not isinstance(provider, str) or provider not in NAMES or not isinstance(limit, str):
+        return None
+    if not 1 <= len(limit) <= 30 or any(unicodedata.category(c) in UNSAFE_CATEGORIES for c in limit):
+        return None
+    return provider, limit
+
+
+def headline(results, now, choice):
+    """(percent or None, tooltip prefix or None): the number in the menu bar and what it is. Pinned: the first row of
+    that provider with this label and a percentage; if it is missing or its percentage is not current, None, so the
+    title shows a dash instead of another limit the user would mistake for it. Highest: the largest current
+    percentage (the first one on a tie)."""
+    if choice:
+        key, limit = choice
+        for k, r in results:
+            if k != key:
+                continue
+            for x in r.get("rows", []):
+                if x.get("percent") is not None and x.get("label") == limit:
+                    p = current_percent(x, now)
+                    if p is not None:
+                        return p, f"Showing {NAMES[key]} {limit} {p:.0f}%"
+                    break
+            break
+        return None, f"{NAMES[key]} {limit} not available"
+    best = None
+    for k, r in results:
+        for x in r.get("rows", []):
+            p = current_percent(x, now)
+            if p is not None and (best is None or p > best[0]):
+                best = (p, k, x.get("label"))
+    if best is None:
+        return None, None
+    return best[0], f"Highest: {NAMES.get(best[1], best[1])} {best[2]} {best[0]:.0f}%"
+
+
 def summary(r, now):
     """Short value for the hover tooltip: highest current percentage, else first value, else '?'."""
     percents = [p for p in (current_percent(x, now) for x in r.get("rows", [])) if p is not None]
@@ -279,18 +328,67 @@ def providers_item(launcher_path, toggle_config=None):
     return f"{PROVIDERS_ITEM}{_params(*action)}"
 
 
+def choice_param(provider, label):
+    """`param2=` value that pins one row, or None (the entry then has no action). The label comes from a provider's
+    answer, so it must pass `CHOICE_LABEL`; then the value is written in double quotes and SwiftBar's parser returns
+    exactly `provider:label` (a quoted value runs to the matching quote; this text has neither quote nor backslash).
+    SwiftBar passes it to the launcher as one argument; its shell wrapper, if ever used, quotes it as one word."""
+    if provider not in NAMES or not isinstance(label, str) or not CHOICE_LABEL.fullmatch(label):
+        return None
+    return f'"{provider}:{label}"'
+
+
+def choice_rows(results):
+    """[(key, label)] for every row that has a percentage, in display order, each pair once (the first wins)."""
+    seen = []
+    for key, r in results:
+        for x in r.get("rows", []):
+            pair = (key, x.get("label"))
+            if x.get("percent") is not None and isinstance(pair[1], str) and pair not in seen:
+                seen.append(pair)
+    return seen
+
+
+def chooser_lines(results, choice, launcher_path, toggle_config=None, config_error=False):
+    """The "Menu bar shows" submenu: "Highest of all", then one entry per row with a percentage, the current choice
+    checked. A pinned choice that matches no row is listed too, checked and marked "(not available)", so it can be
+    changed. A click runs the launcher with `--show highest|provider:label` and re-runs the plugin, like
+    `providers_item`; while config.json is unreadable, or a path is refused, the entries have no action."""
+    launcher = command_path(launcher_path)
+    config = []
+    if toggle_config is not None:
+        path = param_path(toggle_config)
+        config = ["param3=--config", f"param4={path}"] if path else None
+    clickable = launcher is not None and config is not None and not config_error
+
+    def entry(title, value, checked):
+        action = [f"bash={launcher}", "param1=--show", f"param2={value}", *config, "terminal=false",
+                  "refresh=true"] if clickable and value else []
+        return f"--{clean(title, 70)}{_params('checked=true' if checked else None, *action)}"
+
+    lines = [CHOOSER_ITEM, entry(HIGHEST_ITEM, "highest", choice is None)]
+    listed = False
+    for key, label in choice_rows(results):
+        checked = choice == (key, label)
+        listed = listed or checked
+        lines.append(entry(f"{NAMES.get(key, key)} · {label}", choice_param(key, label), checked))
+    if choice and not listed:
+        lines.append(entry(f"{NAMES[choice[0]]} · {choice[1]} (not available)", None, True))
+    return lines
+
+
 def menu(results, now=None, refresh=False, settings_path=None, config_error=False, providers=None,
-         launcher_path=None, toggle_config=None):
+         launcher_path=None, toggle_config=None, menu_bar=None):
     """results: [(key, result)] in display order (hidden providers are simply not in the list).
     settings_path: the config file (absolute); config_error: it exists but could not be read.
-    providers: [(key, enabled)] -> the "Providers…" item (see `providers_item`) and the all-off text;
-    None -> neither."""
+    providers: [(key, enabled)] -> the "Providers…" item (see `providers_item`), the "Menu bar shows" submenu and
+    the all-off text; None -> none of them. menu_bar: the `menu_bar` setting (see `menu_bar_choice`)."""
     now = now or time.time()
+    choice = menu_bar_choice(menu_bar)
     try:
-        values = [current_percent(x, now) for _, r in results for x in r.get("rows", [])]
-        values = [v for v in values if v is not None]
-        top = max(values) if values else None
-        tooltip = " · ".join(f"{NAMES.get(k, k)} {summary(r, now)}" for k, r in results) or "No providers found"
+        top, prefix = headline(results, now, choice)
+        parts = ([prefix] if prefix else []) + [f"{NAMES.get(k, k)} {summary(r, now)}" for k, r in results]
+        tooltip = " · ".join(parts) or "No providers found"
     except Exception:
         top, tooltip = None, "unreadable"
     c = color(top)
@@ -318,6 +416,10 @@ def menu(results, now=None, refresh=False, settings_path=None, config_error=Fals
         lines.append(f"Refresh now{_params('refresh=true')}")
     if providers is not None:
         lines.append(providers_item(launcher_path, toggle_config))
+        try:
+            lines.extend(chooser_lines(results, choice, launcher_path, toggle_config, config_error))
+        except Exception:
+            pass  # the menu stays usable without the chooser
     if config_error:
         lines.append(f"config.json could not be read: using defaults{_params('size=12', f'color={ORANGE}')}")
     path = param_path(settings_path)
