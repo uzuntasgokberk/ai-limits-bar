@@ -4,7 +4,7 @@ See how much of your AI usage limits is left, right from the macOS menu bar: **C
 
 **macOS only:** it is a SwiftBar plugin and does not run on Windows or Linux (see [Requirements](#requirements)).
 
-The menu bar shows a gauge and the highest current usage (for example `57%`, orange from 75%, red from 90%). Hover for a one-line summary, click for the details. Each limit has a bar, its percentage and when it resets:
+The menu bar shows a gauge and a percentage: by default the highest current usage of all limits, or one limit you choose under **Menu bar shows** (for example `57%`, orange from 75%, red from 90%). Hover for a one-line summary that starts with what the number is, click for the details. Each limit has a bar, its percentage and when it resets:
 
 ```
 Claude
@@ -32,7 +32,7 @@ A provider that isn't set up on your Mac is hidden automatically, and so are lim
 | **GitHub Copilot** | Monthly AI-credit (or premium-request) budget, used / total, reset date | `gh api copilot_internal/user` (the GitHub CLI owns the token) |
 | **Microsoft Foundry** | Spend today, this week, this month and all time. Details: every model and invoice item for the same four periods | Azure CLI: Azure Monitor metrics and Cost Management. Off by default |
 
-**Read-only.** This tool never changes anything in your accounts. For example, it can't use a limit reset: Codex messages are restricted to an allow-list of two read-only requests and one notification, and Claude's reset endpoint is never called. Do that in the official app or website. The only thing it ever changes is its own settings file, `config.json`, when you turn a provider on or off.
+**Read-only.** This tool never changes anything in your accounts. For example, it can't use a limit reset: Codex messages are restricted to an allow-list of two read-only requests and one notification, and Claude's reset endpoint is never called. Do that in the official app or website. The only thing it ever changes is its own settings file, `config.json`, when you turn a provider on or off or choose what the menu bar shows.
 
 ## Requirements
 
@@ -100,6 +100,7 @@ On first run `config.json` is created from `config.example.json` (it is git-igno
   - `budget_usd`: optional monthly budget. With a budget, the month line gets a percentage bar.
   - `invoice_refresh_hours`: how often the invoice history is fetched (default 6; at most every 15 minutes on *Refresh now*). Cost Management throttles frequent queries, and past months don't change.
   - `prices_usd_per_million`: per deployment name: `input`, `output`, `cache_read`, `cache_write_5m`, `cache_write_1h`. A deployment without a price is marked `≥` and named in Details.
+- `menu_bar`: what the number in the menu bar shows. `"highest"` (the default) is the highest current percentage of all limits; `{"provider": "claude", "limit": "5-hour"}` is that one limit, named exactly as listed under **Menu bar shows** (see [The menu](#the-menu)), which sets it for you. A name the menu can't offer as a click can still be written here by hand. An invalid value means highest.
 - `debug_shapes`: stores the *structure* of the Claude response (field names and value types only, no values) in the cache, to help when an endpoint changes.
 
 The plugin ignores environment variables, because a SwiftBar link can set them. Switches for testing and troubleshooting are command-line arguments (see [Troubleshooting](#troubleshooting)), which a link cannot set.
@@ -128,6 +129,7 @@ Choose **Providers…** in the menu. A small window opens with one checkbox per 
 
 - **Refresh now**: reads everything again (values read less than a minute ago are kept); the menu bar keeps the current values until the new ones are ready.
 - **Providers…**: turns providers on and off in a small window (see above).
+- **Menu bar shows**: chooses what the number in the menu bar is: *Highest of all*, or one limit such as *Claude · 5-hour*. The new number shows at once, from the values already read, whatever their age; only a provider with no values yet is read. With one limit, the number, gauge and colour follow that limit only, so another limit reaching 90% no longer turns the menu bar red; the tooltip says which limit is shown. If it can't be read (provider off or not set up, the limit gone, or its reset time passed), the menu bar shows `–`; a limit that is no longer listed stays in the submenu, checked and marked *(not available)*, so you can change it. Gemini lines can regroup as usage changes, so a chosen Gemini line can become not available. A limit whose name has characters other than letters, digits, spaces, `.`, `_` and `-` is listed but can't be chosen with a click (set it in `config.json` instead, see [Settings](#settings)). The path rule of **Providers…** applies here too.
 - **Open settings**: opens `config.json` in your default editor. It is left out if the folder's path contains a `"` or a backslash.
 - **Updated**: when the menu was last built.
 - **SwiftBar**: SwiftBar's own menu (preferences, plugin folder, launch at login, quit). SwiftBar's *About*, *Run in Terminal*, *Last updated* and *Disable plugin* items are hidden.
@@ -140,7 +142,7 @@ In short:
 - Credentials are never refreshed, stored, logged or printed.
 - Where possible the provider's own tool does the talking (Codex app-server, GitHub CLI, Azure CLI, the Antigravity server).
 - The menu never shows your email, username, tenant or subscription id. Foundry's *Details* submenu does list the model deployment names you chose in Azure and the invoice meter names; keep it closed on a screen recording if those are private.
-- No log files are written. Besides `config.json` (created on the first run, rewritten when you turn a provider on or off), the only files are a few small cache files in `~/Library/Caches/ai-limits-bar/` (folder 0700, files 0600). They hold numbers, times and labels (including those Foundry deployment and meter names), and are overwritten on every read. Foundry's monthly invoice and token totals are kept there as well (`foundry-history.json`).
+- No log files are written. Besides `config.json` (created on the first run, rewritten when you turn a provider on or off or choose what the menu bar shows), the only files are a few small cache files in `~/Library/Caches/ai-limits-bar/` (folder 0700, files 0600). They hold numbers, times and labels (including those Foundry deployment and meter names), and are overwritten on every read. Foundry's monthly invoice and token totals are kept there as well (`foundry-history.json`).
 
 See [SECURITY.md](SECURITY.md) for the full model and how to report a problem.
 
@@ -155,6 +157,7 @@ The plugin ignores environment variables; these switches are command-line argume
 - See the raw menu output: `~/ai-limits-bar/plugin/ai-limits.5m.sh`
 - A provider has no section: open **Providers…**. Unticked means it is off; *· not set up on this Mac* means its tool was not found or is not signed in (see [Requirements](#requirements)).
 - Turn a provider on or off: `--toggle gemini`; open the window: `--choose`
+- Choose what the menu bar shows: `--show claude:5-hour` (provider, a colon, then the limit's name as listed under **Menu bar shows**); back to the highest: `--show highest`
 - *AI Limits Bar could not run*: `~/ai-limits-bar/plugin/ai-limits.5m.sh --debug` prints the error to the terminal. Add `>/dev/null` to see only the error, without the menu and your numbers (for example for an issue).
 - Read every provider again instead of using the cache (values read less than a minute ago are still used): `--refresh`
 - Force one provider to fail and check that only its section shows a note: `~/ai-limits-bar/plugin/ai-limits.5m.sh --fail claude`
@@ -179,7 +182,7 @@ CI runs the offline suite on GitHub's macOS runner with the system Python (3.9) 
 
 | Path | Contents |
 |---|---|
-| `ai_limits/main.py` | Order, cache, timeouts, `--choose` and `--toggle` |
+| `ai_limits/main.py` | Order, cache, timeouts, `--choose`, `--toggle` and `--show` |
 | `ai_limits/panel.py` | The **Providers…** window (a fixed script run by `osascript`) |
 | `ai_limits/render.py` | Menu text and output safety |
 | `ai_limits/common.py` | HTTP and subprocess helpers |

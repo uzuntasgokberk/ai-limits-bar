@@ -20,7 +20,8 @@ Thank you for helping. This repository is maintained by one person, so the proce
   (loopback only), no real provider, no Keychain, no window unless the test is one of the opt-in `--gui` tests.
 - Standard library only, and Python 3.9 compatible (`/usr/bin/python3` on macOS is 3.9).
 - Anything that reaches the menu goes through `render.clean`, `render.quoted` or `render.param_path` (and
-  `render.command_path` for a command); click targets are fixed in `render.py`.
+  `render.command_path` for a command); click targets are fixed in `render.py`, and a provider's text goes into a
+  click parameter only through `render.choice_param` and its allow-list.
 - Nothing is read from the environment: SwiftBar links can set it. Switches are command-line arguments.
 - The tool stays read-only towards the accounts: no new write endpoint or method, no credential refresh, no credential
   on disk, in a log, in the cache or in a process argument.

@@ -1,6 +1,11 @@
 """Offline tests: rendering rules, safety of menu output, provider parsing and the plugin's failure paths.
 
 Run: python3 -I tests/test_ai_limits.py   (add --gui for the two tests that open the Providers… window)
+No test may reach a real provider. Two structural guards enforce it: setUpModule replaces every way a provider
+module reaches the outside (its subprocess, HTTP and tool-lookup functions, and the home-folder paths it reads) with
+a guard, and load_main() replaces main.call with one, so a test that wants provider data installs its own fake; a
+guard raises RealProviderRead, which no `except Exception` in the plugin can swallow. Every run of the plugin as a
+process goes through run_launcher(), which skips all providers except those forced to fail.
 The default run opens no window and needs no Keychain, network or ~/Library/Caches; it runs on any macOS with
 Python 3.9 or later (CI: GitHub's macOS runner, with the system Python and the latest Python). Time limits are
 generous for slow machines but always shorter than the wrong behaviour they rule out.
@@ -45,6 +50,65 @@ NOW = 1_800_000_000.0
 ALL = ",".join(NAMES)
 
 
+class RealProviderRead(BaseException):
+    """A test reached a real provider read. A BaseException, so the plugin's own `except Exception` (per provider in
+    main, around the Antigravity call, in the Foundry history) cannot turn it into a quiet "Couldn't read"."""
+
+
+def provider_guard(where):
+    def guard(*args, **kwargs):
+        raise RealProviderRead(f"{where} was called: a test reached a real provider read; install a fake first")
+    return guard
+
+
+# Every way a provider module reaches the outside, as bound in that module (tests that need one patch it themselves,
+# and the guard is back when their patch ends). common's own functions stay real: the loopback tests use them.
+GUARDED_CALLS = [(claude, "run"), (claude, "https_json"), (codex, "find_tool"), (copilot, "run"),
+                 (copilot, "find_tool"), (foundry, "run"), (foundry, "find_tool"), (gemini, "https_json"),
+                 (gemini, "localhost_json")]
+_GUARD_HOME = tempfile.TemporaryDirectory()
+
+
+def setUpModule():
+    """The suite-wide guard against real provider reads (see the module docstring). The home-folder paths the
+    providers read without a tool (Antigravity's hub files, the Gemini CLI and Codex session files) point into an
+    empty temporary folder."""
+    for module, name in GUARDED_CALLS:
+        mock.patch.object(module, name, provider_guard(f"{module.__name__}.{name}")).start()
+    empty = _GUARD_HOME.name
+    for module, name, path in [(gemini, "ANTIGRAVITY_DIR", os.path.join(empty, "antigravity")),
+                               (gemini, "HUB", os.path.join(empty, "antigravity", "daemon", "hub_*.json")),
+                               (gemini, "CLI_CREDENTIALS", os.path.join(empty, "oauth_creds.json")),
+                               (codex, "SESSIONS", os.path.join(empty, "sessions"))]:
+        mock.patch.object(module, name, path).start()
+
+
+def tearDownModule():
+    mock.patch.stopall()
+    _GUARD_HOME.cleanup()
+
+
+def run_launcher(args, *, config, cache, env=None, command=(PLUGIN,), allow_real_providers=False):
+    """The only way tests start the plugin as a process. --skip is added LAST, so it wins over a --skip the test
+    passed itself, and skips every provider except those the test forces to fail with --fail (main.call raises for
+    them before any provider code runs). allow_real_providers=True is the explicit opt-out; no test uses it.
+    --config and --cache must be inside the temporary folder."""
+    temp = os.path.realpath(tempfile.gettempdir())
+    for path in (config, cache):
+        assert os.path.realpath(path).startswith(temp + os.sep), f"not a temporary path: {path}"
+    argv = [*command, "--config", config, "--cache", cache, *args]
+    if not allow_real_providers:
+        failing = set()
+        for i, arg in enumerate(args):
+            if arg == "--fail" and i + 1 < len(args):
+                failing |= set(args[i + 1].split(","))
+            elif arg.startswith("--fail="):
+                failing |= set(arg.split("=", 1)[1].split(","))
+        argv += ["--skip", ",".join(n for n in NAMES if n not in failing)]
+    return subprocess.run(argv, capture_output=True, encoding="utf-8",
+                          env=env if env is not None else dict(os.environ), timeout=30)
+
+
 def res(title="X", rows=None, status="ok", **k):
     return {"title": title, "status": status, "rows": rows or [], "details": k.get("details", []),
             "note": k.get("note"), "time": NOW - 60}
@@ -66,9 +130,9 @@ def menu_lines(text):
 
 def swiftbar_params(line):
     """Port of SwiftBar's parameter parser. The first `|` ends the title. Key: everything up to the next `=`,
-    trimmed and lower-cased. Value: if it starts with `"` or `'`, everything up to the matching quote (a
-    backslash escapes the next character, both are kept), otherwise everything up to the next space or tab.
-    A later duplicate key overwrites an earlier one."""
+    trimmed and lower-cased; spaces after `=` are skipped. Value: if it starts with `"` or `'`, everything up to
+    the matching quote (a backslash escapes the next character, both are kept), otherwise everything up to the
+    next space or tab. A later duplicate key overwrites an earlier one."""
     if "|" not in line:
         return {}
     text, params, i = line.split("|", 1)[1], {}, 0
@@ -79,6 +143,8 @@ def swiftbar_params(line):
         if i >= len(text) or eq < 0:
             return params
         key, i = text[i:eq].strip().lower(), eq + 1
+        while i < len(text) and text[i] in " \t":
+            i += 1
         if i < len(text) and text[i] in "\"'":
             quote, start = text[i], i + 1
             i = start
@@ -122,6 +188,9 @@ class SwiftBarParser(unittest.TestCase):
         self.assertEqual(swiftbar_params("no parameters"), {})
         self.assertEqual(menu_lines("a\u2028b\x85c\rd"), ["a", "b", "c", "d"])
 
+    def test_port_skips_spaces_after_the_equals_sign(self):
+        self.assertEqual(swiftbar_params('T | a= "x y" b=  z'), {"a": "x y", "b": "z"})
+
     def test_port_sees_the_old_settings_injection(self):
         # What the old code printed for a crafted path: the command is replaced. The tests below rely on this.
         old = 'Open settings | bash=/usr/bin/open param1="x" bash=/bin/sh param1=-c x="" terminal=false'
@@ -160,7 +229,7 @@ class Render(unittest.TestCase):
         first = text.splitlines()[0]
         self.assertTrue(first.startswith("94%"))
         self.assertIn(f"color={render.RED}", first)
-        self.assertIn('tooltip="Claude 94% · Copilot 57%"', first)
+        self.assertIn('tooltip="Highest: Claude Weekly 94% · Claude 94% · Copilot 57%"', first)
 
     def test_long_label_does_not_touch_bar(self):
         text = render.menu([("claude", res("CLAUDE", [row("5-hour", 81.0), row("Weekly Opus", 83.0)]))], NOW)
@@ -280,7 +349,8 @@ class ProvidersMenu(unittest.TestCase):
         self.assertLess(lines.index(line), next(i for i, x in enumerate(lines) if x.startswith("Open settings")))
         self.assertEqual(swiftbar_params(line), {"bash": self.LAUNCHER, "param1": "--choose", "terminal": "false",
                                                  "refresh": "true"})
-        self.assertFalse(any(x.startswith("--") and x != "---" for x in lines))  # no submenu any more
+        submenus = [x for x in lines if x.startswith("--") and x != "---"]
+        self.assertEqual([x.split(" | ")[0] for x in submenus], ["--Highest of all"])  # only the menu bar chooser
         for name in render.HEADERS.values():
             self.assertNotIn(name, text)  # the provider list lives in the panel
 
@@ -318,6 +388,200 @@ class ProvidersMenu(unittest.TestCase):
         self.assertIn("No supported AI tool found on this Mac", some_on)
         self.assertNotIn("All providers are off", some_on)
         self.assertNotIn(render.PROVIDERS_ITEM, render.menu([], NOW, True, "/Users/demo/config.json"))  # no data
+
+
+class MenuBarChoice(unittest.TestCase):
+    """Which limit the menu bar number shows: "highest" (default) or one pinned provider row."""
+
+    LAUNCHER = "/Users/demo/ai-limits-bar/plugin/ai-limits.5m.sh"
+    STATE = [(n, True) for n in NAMES]
+    FUTURE = NOW + 3600
+
+    def results(self, claude=None, codex=None):
+        claude = [row("5-hour", 31.0, resets=self.FUTURE), row("Weekly", 57.0, resets=self.FUTURE),
+                  row("Weekly Opus", 44.0, resets=self.FUTURE)] if claude is None else claude
+        if codex is None:
+            codex = [row("5-hour", 12.0, resets=self.FUTURE), row("Weekly", 62.0, resets=self.FUTURE)]
+        return [("claude", res("CLAUDE", claude)), ("codex", res("CODEX", codex))]
+
+    def menu(self, menu_bar=None, results=None, launcher=LAUNCHER, toggle_config=None, config_error=False):
+        return render.menu(self.results() if results is None else results, NOW, True, "/Users/demo/config.json",
+                           config_error, self.STATE, launcher, toggle_config, menu_bar)
+
+    @staticmethod
+    def title(text):
+        first = menu_lines(text)[0]
+        return first.split(" | ")[0], swiftbar_params(first)
+
+    @staticmethod
+    def chooser(text):
+        lines = menu_lines(text)
+        start = end = lines.index(render.CHOOSER_ITEM) + 1
+        while end < len(lines) and lines[end].startswith("--") and lines[end] != "---":
+            end += 1
+        return lines[start:end]
+
+    def action(self, value, checked=False, config=None):
+        params = {"bash": self.LAUNCHER, "param1": "--show", "param2": value, "terminal": "false", "refresh": "true"}
+        if config:
+            params.update(param3="--config", param4=config)
+        if checked:
+            params["checked"] = "true"
+        return params
+
+    def assert_no_action(self, line):
+        params = swiftbar_params(line)
+        self.assertFalse([k for k in params if k.startswith("param") or k in ("bash", "shell", "refresh", "href")],
+                         line)
+
+    def test_highest_is_the_default_and_says_what_it_is(self):
+        for menu_bar in (None, "highest"):
+            text = self.menu(menu_bar)
+            title, params = self.title(text)
+            self.assertEqual(title, "62%")
+            self.assertEqual(params, {"sfimage": render.icon(62.0),
+                                      "tooltip": "Highest: Codex Weekly 62% · Claude 57% · Codex 62%"})
+            entries = self.chooser(text)
+            self.assertEqual([x.split(" | ")[0] for x in entries],
+                             ["--Highest of all", "--Claude · 5-hour", "--Claude · Weekly", "--Claude · Weekly Opus",
+                              "--Codex · 5-hour", "--Codex · Weekly"])
+            self.assertEqual(swiftbar_params(entries[0]), self.action("highest", checked=True))
+            self.assertEqual(swiftbar_params(entries[1]), self.action("claude:5-hour"))
+            self.assertEqual(swiftbar_params(entries[3]), self.action("claude:Weekly Opus"))
+            self.assertEqual(swiftbar_params(entries[5]), self.action("codex:Weekly"))
+
+    def test_chooser_sits_next_to_providers(self):
+        lines = menu_lines(self.menu())
+        providers = lines.index(providers_line(self.menu()))
+        self.assertEqual(lines[providers + 1], render.CHOOSER_ITEM)
+        self.assertEqual(swiftbar_params(render.CHOOSER_ITEM), {})  # the submenu header does nothing
+        self.assertTrue(lines[providers + 8].startswith("Open settings"))
+        self.assertNotIn(render.CHOOSER_ITEM, render.menu(self.results(), NOW, True, "/Users/demo/config.json"))
+
+    def test_pinned_row_drives_title_icon_colour_and_tooltip(self):
+        text = self.menu({"provider": "claude", "limit": "5-hour"})
+        title, params = self.title(text)
+        self.assertEqual(title, "31%")  # not the highest (62%)
+        self.assertEqual(params, {"sfimage": render.icon(31.0),
+                                  "tooltip": "Showing Claude 5-hour 31% · Claude 57% · Codex 62%"})
+        entries = self.chooser(text)
+        self.assertEqual(swiftbar_params(entries[0]), self.action("highest"))
+        self.assertEqual(swiftbar_params(entries[1]), self.action("claude:5-hour", checked=True))
+        self.assertEqual(sum("checked" in swiftbar_params(x) for x in entries), 1)
+        hot = self.results(codex=[row("Weekly", 95.0, resets=self.FUTURE)])
+        self.assertEqual(self.title(self.menu(None, hot))[1].get("color"), render.RED)  # highest: red
+        pinned = self.title(self.menu({"provider": "claude", "limit": "5-hour"}, hot))
+        self.assertEqual(pinned[0], "31%")
+        self.assertNotIn("color", pinned[1])  # the colour follows the shown limit, not the 95% one
+        for percent, colour in ((92.0, render.RED), (80.0, render.ORANGE)):
+            mine = self.results(claude=[row("5-hour", percent, resets=self.FUTURE)])
+            self.assertEqual(self.title(self.menu({"provider": "claude", "limit": "5-hour"}, mine))[1]["color"], colour)
+        spaced = self.menu({"provider": "claude", "limit": "Weekly Opus"})
+        self.assertEqual(self.title(spaced)[0], "44%")
+        self.assertEqual(swiftbar_params(self.chooser(spaced)[3]), self.action("claude:Weekly Opus", checked=True))
+
+    def test_first_matching_row_wins_and_each_row_is_listed_once(self):
+        twice = self.results(claude=[row("5-hour", value="n/a"), row("5-hour", 31.0, resets=self.FUTURE),
+                                     row("5-hour", 50.0, resets=self.FUTURE)])
+        text = self.menu({"provider": "claude", "limit": "5-hour"}, twice)
+        self.assertEqual(self.title(text)[0], "31%")  # rows without a percentage don't count
+        self.assertEqual([x.split(" | ")[0] for x in self.chooser(text)].count("--Claude · 5-hour"), 1)
+
+    def test_pinned_but_unavailable_shows_a_dash(self):
+        pin = {"provider": "claude", "limit": "5-hour"}
+        cases = {
+            "provider off, hidden or not set up": [("codex", res("CODEX", [row("Weekly", 62.0, resets=self.FUTURE)]))],
+            "row gone": self.results(claude=[row("Weekly", 57.0, resets=self.FUTURE)]),
+            "no percentage": self.results(claude=[row("5-hour", value="unlimited")]),
+            "reset time passed": self.results(claude=[row("5-hour", 31.0, resets=NOW - 60)]),
+            "nothing at all": [],
+        }
+        for cause, results in cases.items():
+            text = self.menu(pin, results)
+            title, params = self.title(text)
+            self.assertEqual(title, "–", cause)  # never the highest in its place
+            self.assertEqual(params["sfimage"], render.icon(None), cause)
+            self.assertNotIn("color", params, cause)
+            self.assertTrue(params["tooltip"].startswith("Claude 5-hour not available"), (cause, params["tooltip"]))
+            entries = self.chooser(text)
+            checked = [x for x in entries if "checked" in swiftbar_params(x)]
+            self.assertEqual(len(checked), 1, cause)
+            if cause == "reset time passed":  # the row is still listed: its own entry is the checked one
+                self.assertEqual(swiftbar_params(checked[0]), self.action("claude:5-hour", checked=True))
+            else:
+                self.assertEqual(checked[0], "--Claude · 5-hour (not available) | checked=true", cause)
+                self.assert_no_action(checked[0])
+        self.assertEqual(self.title(self.menu(pin, []))[1]["tooltip"], "Claude 5-hour not available")
+
+    def test_invalid_values_mean_highest(self):
+        for value in (5, [], {}, "lowest", "", None, True, {"provider": "evil", "limit": "5-hour"},
+                      {"provider": "claude"}, {"provider": "claude", "limit": 5}, {"provider": "claude", "limit": ""},
+                      {"provider": "claude", "limit": "x" * 31}, {"provider": "claude", "limit": "a\nb"},
+                      {"provider": "claude", "limit": "a\u200eb"}, {"provider": ["claude"], "limit": "5-hour"},
+                      {"provider": "Claude", "limit": "5-hour"}):
+            text = self.menu(value)
+            title, params = self.title(text)
+            self.assertEqual(title, "62%", value)
+            self.assertTrue(params["tooltip"].startswith("Highest: Codex Weekly 62%"), value)
+            entries = self.chooser(text)
+            self.assertEqual(swiftbar_params(entries[0]), self.action("highest", checked=True), value)
+            self.assertFalse(any("(not available)" in x for x in entries), value)
+
+    def test_hand_pinned_label_outside_the_allow_list_matches_but_is_not_clickable(self):
+        results = [("gemini", res("GEMINI", [row("Demo (High)", 47.0, resets=self.FUTURE)]))]
+        text = self.menu({"provider": "gemini", "limit": "Demo (High)"}, results)
+        self.assertEqual(self.title(text)[0], "47%")
+        entry = self.chooser(text)[1]
+        self.assertTrue(entry.startswith("--Gemini · Demo (High) | checked=true"))
+        self.assert_no_action(entry)
+
+    def test_hostile_labels_add_no_action_and_no_line(self):
+        labels = ["a|b", "a'b", 'a"b', "a\\b", "a\nb", "a\u2028b", "-lead", "x bash=/bin/sh", "x param1=-c",
+                  "x refresh=true", "a:b", "Demo (High)", "x$(touch y)", "a\tb", "é-umlaut", "x" * 31]
+        for label in labels:
+            results = self.results(claude=[row(label, 99.0, resets=self.FUTURE),
+                                           row("5-hour", 31.0, resets=self.FUTURE)])
+            for menu_bar in (None, {"provider": "claude", "limit": label}):
+                text = self.menu(menu_bar, results)
+                lines = menu_lines(text)
+                self.assertLessEqual(set(swiftbar_params(lines[0])), {"sfimage", "color", "tooltip"}, (label, lines[0]))
+                for line in lines:
+                    params = swiftbar_params(line)
+                    if "bash" in params:
+                        self.assertIn(params["bash"], (self.LAUNCHER, "/usr/bin/open"), line)
+                    self.assertNotIn("/bin/sh", params.get("bash", ""), line)
+                entries = self.chooser(text)
+                self.assertEqual(len(entries), 1 + 2 + 2, (label, entries))  # highest + 2 Claude + 2 Codex rows
+                self.assert_no_action(entries[1])
+                self.assertEqual(swiftbar_params(entries[2])["param2"], "claude:5-hour")  # the next item is intact
+
+    def test_refused_paths_or_unreadable_config_leave_entries_without_action(self):
+        launchers = ['/x/a" bash=/bin/sh x="', "/x/a\nb", "plugin/x.sh", None, "/Users/demo/ai;limits/x.sh",
+                     "/Users/demo/my ai$x/x.sh"]
+        cases = [dict(launcher=x) for x in launchers] + [dict(toggle_config='/tmp/c" bash=/bin/sh x="'),
+                                                         dict(config_error=True)]
+        for case in cases:
+            entries = self.chooser(self.menu(**case))
+            self.assertEqual(len(entries), 6, case)
+            for line in entries:
+                self.assert_no_action(line)
+            self.assertIn("checked", swiftbar_params(entries[0]), case)  # the current choice is still shown
+        launcher = "/Users/demo/My Tools (2031)/Çalışma ai-limits/plugin/ai-limits.5m.sh"
+        self.assertEqual(swiftbar_params(self.chooser(self.menu(launcher=launcher))[1])["bash"], launcher)
+        config = "/Users/demo/My Folder/it's (a) $test.json"
+        entries = self.chooser(self.menu(toggle_config=config))
+        self.assertEqual(swiftbar_params(entries[0]), self.action("highest", checked=True, config=config))
+        self.assertEqual(swiftbar_params(entries[1]), self.action("claude:5-hour", config=config))
+
+    def test_choice_param_and_allow_list(self):
+        self.assertEqual(render.choice_param("claude", "Weekly Opus 4.5"), '"claude:Weekly Opus 4.5"')
+        for label in ("5-hour", "Weekly", "All models", "2 models", "AI credits", "This month", "2.5-pro input",
+                      "Weekly claude-opus_4", "x" * 30):
+            self.assertIsNotNone(render.choice_param("claude", label), label)
+        for label in ("", "x" * 31, " lead", "-lead", ".lead", "a:b", "a'b", 'a"b', "a\\b", "a|b", "a$b", "a(b)",
+                      "a\nb", "a\tb", "é", "a\u200eb", 5, None):
+            self.assertIsNone(render.choice_param("claude", label), repr(label))
+        self.assertIsNone(render.choice_param("evil", "5-hour"))
 
 
 class Panel(unittest.TestCase):
@@ -904,7 +1168,10 @@ def file_state(path):
 
 
 def load_main():
-    """main.py as a fresh module. Importing it replaces os.environ, so this process's environment is restored."""
+    """main.py as a fresh module, with main.call replaced by the provider guard: a test that wants provider data
+    sets its own fake. Its default CACHE and CONFIG point into the guard's temporary folder, so a run without --cache
+    or --config never touches ~/Library/Caches/ai-limits-bar or the real config.json. Importing main.py replaces
+    os.environ, so this process's environment is restored."""
     saved = dict(os.environ)
     try:
         spec = importlib.util.spec_from_file_location("ai_limits_main", os.path.join(ROOT, "ai_limits", "main.py"))
@@ -913,7 +1180,48 @@ def load_main():
     finally:
         os.environ.clear()
         os.environ.update(saved)
+    module.call = provider_guard("main.call")
+    defaults = tempfile.mkdtemp(dir=_GUARD_HOME.name)
+    module.CACHE = os.path.join(defaults, "cache")
+    module.CONFIG = os.path.join(defaults, "config.json")
     return module
+
+
+class ProviderGuard(unittest.TestCase):
+    """Proof that the suite-wide guard holds: without a fake, a test hits the guard, not a provider."""
+
+    def test_main_without_a_fake_hits_the_guard(self):
+        m = load_main()
+        with tempfile.TemporaryDirectory() as d:
+            config = os.path.join(d, "config.json")
+            with open(config, "w") as f:
+                json.dump({"providers": [{"name": n, "enabled": True} for n in NAMES]}, f)
+            with self.assertRaisesRegex(RealProviderRead, "main.call"), contextlib.redirect_stdout(io.StringIO()):
+                m.main(["--config", config, "--cache", os.path.join(d, "cache")])
+
+    def test_the_real_call_still_cannot_reach_a_provider(self):
+        # What the real main.call runs (each provider's read) stops at the provider modules' own guards.
+        for provider, settings, where in [(claude, {}, "claude.run"), (codex, {}, "codex.find_tool"),
+                                          (copilot, {}, "copilot.find_tool"),
+                                          (foundry, {"resource_group": "rg"}, "foundry.find_tool")]:
+            with self.assertRaisesRegex(RealProviderRead, where):
+                provider.read(settings)
+        with self.assertRaises(common.NotConfigured):
+            gemini.read({})  # no hub file and no Gemini CLI sign-in in the empty guard folder: nothing real is read
+        self.assertTrue(gemini.HUB.startswith(_GUARD_HOME.name))
+        self.assertTrue(codex.SESSIONS.startswith(_GUARD_HOME.name))
+        m = load_main()
+        self.assertTrue(m.CACHE.startswith(_GUARD_HOME.name) and m.CONFIG.startswith(_GUARD_HOME.name))
+
+    def test_every_process_run_goes_through_run_launcher(self):
+        with open(os.path.abspath(__file__), encoding="utf-8") as f:
+            source = f.read()
+        run, popen = "subprocess." + "run(", "subprocess." + "Popen("  # split, so this line doesn't count itself
+        self.assertEqual(source.count(run), 1)  # the one in run_launcher
+        self.assertEqual(source.count(popen), 0)
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(AssertionError):
+                run_launcher([], config=os.path.join(ROOT, "config.json"), cache=os.path.join(d, "c"))
 
 
 class Main(unittest.TestCase):
@@ -1286,6 +1594,248 @@ class Toggle(unittest.TestCase):
         self.files_now()
 
 
+class KeepValues(unittest.TestCase):
+    """A "Menu bar shows" click must show the new number at once: --show leaves a short-lived marker, and the
+    --refresh run SwiftBar starts right after the click then uses the values already read."""
+
+    def setUp(self):
+        self.main = load_main()
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.dir = folder.name
+        self.cache = os.path.join(self.dir, "cache")
+        self.config = os.path.join(self.dir, "config.json")
+        self.marker = os.path.join(self.cache, self.main.KEEP_FILE)
+        self.write_config([{"name": "claude", "enabled": True, "refresh_minutes": 5}])
+        self.calls = []
+
+        def fake(name, settings, forced):
+            self.calls.append((name, settings["force"]))
+            return {"title": name.upper(), "status": "ok", "details": [], "note": None, "time": time.time(),
+                    "rows": [row("5-hour", 88.0, resets=time.time() + 3600)]}
+        self.main.call = fake
+
+    def write_config(self, providers, **extra):
+        with open(self.config, "w", encoding="utf-8") as f:
+            json.dump({"providers": providers, **extra}, f)
+
+    def cache_claude(self, age=120):
+        """Older than the 60 s refresh floor, younger than refresh_minutes (5 min - 30 s)."""
+        common.write_private_json(self.cache, "claude.json", {
+            "title": "CLAUDE", "status": "ok", "details": [], "note": None, "time": time.time() - age,
+            "rows": [row("5-hour", 31.0, resets=time.time() + 3600), row("Weekly", 57.0, resets=time.time() + 3600)]})
+
+    def run_main(self, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.main.main([*args, "--config", self.config, "--cache", self.cache])
+        return out.getvalue()
+
+    def write_marker(self, text):
+        os.makedirs(self.cache, exist_ok=True)
+        with open(self.marker, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def test_show_then_refresh_uses_the_values_already_read(self):
+        self.cache_claude()
+        self.assertEqual(self.run_main("--show", "claude:5-hour"), "")
+        with open(self.marker, encoding="utf-8") as f:
+            marker = json.load(f)
+        self.assertEqual(list(marker), ["time"])
+        self.assertAlmostEqual(marker["time"], time.time(), delta=30)
+        self.assertEqual(stat.S_IMODE(os.stat(self.marker).st_mode), 0o600)
+        text = self.run_main("--refresh")
+        self.assertEqual(self.calls, [])  # not re-read: the cached 31% is shown at once
+        self.assertTrue(menu_lines(text)[0].startswith("31% | "))
+        self.assertFalse(os.path.exists(self.marker))  # used once
+        self.run_main("--refresh")
+        self.assertEqual(self.calls, [("claude", True)])  # the next forced refresh reads again
+
+    def test_marker_is_written_when_nothing_changes_and_when_config_is_unreadable(self):
+        self.write_config([{"name": "claude", "enabled": True}], menu_bar={"provider": "claude", "limit": "5-hour"})
+        with mock.patch.object(self.main, "_write_atomic") as config_writes:
+            self.run_main("--show", "claude:5-hour")
+        config_writes.assert_not_called()
+        self.assertTrue(os.path.exists(self.marker))
+        os.remove(self.marker)
+        with open(self.config, "w") as f:
+            f.write("{not json")
+        self.run_main("--show", "claude:5-hour")
+        self.assertTrue(os.path.exists(self.marker))
+        with open(self.config) as f:
+            self.assertEqual(f.read(), "{not json")
+
+    def test_no_marker_after_a_refusal_or_a_busy_lock(self):
+        with self.assertRaises(self.main.ArgumentError):
+            self.run_main("--show", "evil:5-hour")
+        self.assertFalse(os.path.exists(self.marker))
+        lock = os.open(self.dir, os.O_RDONLY)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)  # a panel is open
+            with mock.patch.object(self.main, "LOCK_SECONDS", 0.2), self.assertRaises(self.main.Busy):
+                self.run_main("--show", "claude:5-hour")
+        finally:
+            os.close(lock)
+        self.assertFalse(os.path.exists(self.marker))
+
+    def test_bad_markers_do_not_suppress_and_are_removed(self):
+        now = time.time()
+        target = os.path.join(self.dir, "elsewhere.json")
+        with open(target, "w") as f:
+            json.dump({"time": now}, f)
+        cases = {"expired": json.dumps({"time": now - 11}), "future": json.dumps({"time": now + 5}),
+                 "garbage": "{not json", "list": "[1]", "text time": '{"time": "now"}', "bool time": '{"time": true}',
+                 "nan time": '{"time": NaN}', "empty": "", "symlink": None}
+        for case, text in cases.items():
+            self.cache_claude()
+            self.calls.clear()
+            if text is None:
+                os.makedirs(self.cache, exist_ok=True)
+                os.symlink(target, self.marker)
+            else:
+                self.write_marker(text)
+            self.run_main("--refresh")
+            self.assertEqual(self.calls, [("claude", True)], case)  # forced, as without a marker
+            self.assertFalse(os.path.lexists(self.marker), case)
+        self.assertTrue(os.path.exists(target))  # a symlinked marker is removed, not what it points to
+
+    def test_without_a_marker_or_without_refresh_nothing_changes(self):
+        self.cache_claude()
+        self.run_main("--refresh")
+        self.assertEqual(self.calls, [("claude", True)])  # plain --refresh: forced as before
+        self.cache_claude()
+        self.calls.clear()
+        self.write_marker(json.dumps({"time": time.time()}))
+        self.run_main()
+        self.assertEqual(self.calls, [])  # a normal run uses the fresh cache anyway
+        self.assertTrue(os.path.exists(self.marker))  # and leaves the marker alone (it simply expires)
+
+    def test_cached_values_of_any_age_are_kept_for_that_run(self):
+        self.cache_claude(age=20 * 60)  # older than refresh_minutes: a scheduled run would read it again
+        self.run_main("--show", "claude:5-hour")
+        text = self.run_main("--refresh")
+        self.assertEqual(self.calls, [])  # kept, whatever its age: the click is always instant
+        self.assertTrue(menu_lines(text)[0].startswith("31% | "))
+        self.run_main()  # the next scheduled run (no --refresh, no marker): the normal freshness rule again
+        self.assertEqual(self.calls, [("claude", False)])
+
+    def test_a_forced_failure_still_goes_through_call(self):
+        self.cache_claude()
+        self.run_main("--show", "claude:5-hour")
+        self.run_main("--refresh", "--fail", "claude")
+        self.assertEqual(self.calls, [("claude", False)])  # --fail wins over the kept cache
+
+    def test_a_provider_without_values_is_still_read(self):
+        self.write_config([{"name": "claude", "enabled": True}, {"name": "codex", "enabled": True}])
+        self.cache_claude()
+        self.run_main("--show", "codex:5-hour")
+        text = self.run_main("--refresh")
+        self.assertEqual(self.calls, [("codex", False)])  # read, but not as a forced refresh (Foundry's force too)
+        self.assertTrue(menu_lines(text)[0].startswith("88% | "))
+
+
+class Show(unittest.TestCase):
+    """--show on temporary config files only: every call passes --config."""
+
+    TEXT = ('{"providers": [{"name": "claude", "enabled": true}, {"name": "codex", "enabled": false}], '
+            '"debug_shapes": false, "custom": [1, "x"]}')
+
+    def setUp(self):
+        self.main = load_main()
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.dir = os.path.join(folder.name, "settings")
+        os.mkdir(self.dir)
+        self.cache = os.path.join(folder.name, "cache")
+        self.config = os.path.join(self.dir, "config.json")
+        self.write(self.TEXT)  # load_main's guard stops any provider read if --show ever fell through
+
+    def write(self, text):
+        with open(self.config, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def read(self):
+        with open(self.config, encoding="utf-8") as f:
+            return f.read()
+
+    def show(self, value):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.main.main(["--show", value, "--config", self.config, "--cache", self.cache])
+        self.assertEqual(out.getvalue(), "")  # prints nothing
+        self.assertFalse([x for x in os.listdir(self.dir) if x.endswith(".tmp")])
+        return self.read()
+
+    def test_pin_and_back(self):
+        text = self.show("claude:5-hour")
+        data = json.loads(text)
+        self.assertEqual(data["menu_bar"], {"provider": "claude", "limit": "5-hour"})
+        self.assertEqual(list(data), ["providers", "debug_shapes", "custom", "menu_bar"])
+        self.assertEqual(data["custom"], [1, "x"])
+        lines = text.splitlines()
+        self.assertIn('    {"name": "claude", "enabled": true},', lines)  # still one provider per line
+        self.assertIn('  "menu_bar": {"provider": "claude", "limit": "5-hour"}', lines)
+        self.assertEqual(json.loads(self.show("claude:Weekly Opus"))["menu_bar"],
+                         {"provider": "claude", "limit": "Weekly Opus"})
+        data = json.loads(self.show("highest"))
+        self.assertEqual(data["menu_bar"], "highest")
+        self.assertEqual(list(data), ["providers", "debug_shapes", "custom", "menu_bar"])  # stays in place
+
+    def test_no_change_no_write(self):
+        self.write(self.TEXT)
+        with mock.patch.object(self.main, "_write_atomic") as writes:
+            self.show("highest")  # missing means highest already
+            self.write('{"providers": [], "menu_bar": {"provider": "codex", "limit": "Weekly"}}')
+            self.show("codex:Weekly")
+        writes.assert_not_called()
+
+    def test_refusals_write_nothing(self):
+        for bad in ("evil:5-hour", "claude", "claude:", ":5-hour", "CLAUDE:5-hour", "claude:a|b", "claude:Demo (High)",
+                    "claude:-x", "claude:" + "x" * 31, "claude:a\nb", "claude:a:b", "claude:a'b", "Highest", "",
+                    "claude:é"):
+            with self.assertRaises(self.main.ArgumentError, msg=bad):
+                self.show(bad)
+            self.assertEqual(self.read(), self.TEXT, bad)
+
+    def test_unreadable_config_is_left_alone(self):
+        for text in ("{not json", "[1]"):
+            self.write(text)
+            self.assertEqual(self.show("claude:5-hour"), text)
+
+    def test_set_enabled_keeps_menu_bar(self):
+        self.write('{"providers": [{"name": "claude", "enabled": true}], '
+                   '"menu_bar": {"provider": "claude", "limit": "5-hour"}, "debug_shapes": false}')
+        self.assertTrue(self.main.set_enabled(self.config, {"claude": False, "codex": True}, False))
+        lines = self.read().splitlines()
+        self.assertEqual(lines[:6], ["{", '  "providers": [', '    {"name": "claude", "enabled": false},',
+                                     '    {"name": "codex", "enabled": true}', "  ],",
+                                     '  "menu_bar": {"provider": "claude", "limit": "5-hour"},'])
+
+    def test_round_trip_with_the_menu(self):
+        def run_menu():
+            out = io.StringIO()
+            self.main.call = lambda name, settings, forced: {
+                "title": "CLAUDE", "status": "ok", "details": [], "note": None, "time": time.time(),
+                "rows": [row("5-hour", 31.0, resets=time.time() + 3600),
+                         row("Weekly", 57.0, resets=time.time() + 3600)]}
+            with contextlib.redirect_stdout(out):
+                self.main.main(["--config", self.config, "--cache", self.cache, "--refresh"])
+            return out.getvalue()
+        self.show("claude:5-hour")
+        text = run_menu()
+        first = menu_lines(text)[0]
+        self.assertTrue(first.startswith("31% | "))
+        self.assertTrue(swiftbar_params(first)["tooltip"].startswith("Showing Claude 5-hour 31%"))
+        entry = next(x for x in menu_lines(text) if x.startswith("--Claude · 5-hour"))
+        self.assertEqual(swiftbar_params(entry), {"checked": "true", "bash": self.main.LAUNCHER, "param1": "--show",
+                                                  "param2": "claude:5-hour", "param3": "--config",
+                                                  "param4": self.config, "terminal": "false", "refresh": "true"})
+        self.show("highest")
+        text = run_menu()
+        self.assertTrue(menu_lines(text)[0].startswith("57% | "))
+        self.assertIn("checked", swiftbar_params(next(x for x in menu_lines(text) if x.startswith("--Highest of all"))))
+
+
 class Choose(unittest.TestCase):
     """--choose with the panel replaced by a fake: no window is opened. Always a temp --config and --cache."""
 
@@ -1451,15 +2001,14 @@ class Plugin(unittest.TestCase):
     """Runs the real launcher offline: every enabled provider is skipped or forced to fail."""
 
     def run_plugin(self, args, cache, enabled=(), config_text=None, env=None, config=None):
-        """`config`: an existing file to use as it is; otherwise a temporary one is written."""
+        """run_launcher with a temporary config unless `config` names an existing one."""
         with tempfile.TemporaryDirectory() as d:
             if config is None:
                 config = os.path.join(d, "config.json")
                 with open(config, "w") as f:
                     f.write(config_text if config_text is not None else
                             json.dumps({"providers": [{"name": n, "enabled": n in enabled} for n in NAMES]}))
-            return subprocess.run([PLUGIN, "--config", config, "--cache", cache, *args], capture_output=True,
-                                  encoding="utf-8", env=env if env is not None else dict(os.environ), timeout=30)
+            return run_launcher(args, config=config, cache=cache, env=env)
 
     def test_everything_skipped(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1507,10 +2056,9 @@ class Plugin(unittest.TestCase):
         main_py = os.path.join(ROOT, "ai_limits", "main.py")
         with tempfile.TemporaryDirectory() as d:
             config, cache = os.path.join(d, "config.json"), os.path.join(d, "cache")
-            base = [sys.executable, "-B", "-I", main_py, "--skip", ALL, "--config", config, "--cache", cache]
-            ok = subprocess.run(base, capture_output=True, encoding="utf-8", env={}, timeout=30)
-            bad = subprocess.run(base + ["--debug", "--config"], capture_output=True, encoding="utf-8", env={},
-                                 timeout=30)
+            command = (sys.executable, "-B", "-I", main_py)
+            ok = run_launcher([], config=config, cache=cache, env={}, command=command)
+            bad = run_launcher(["--debug", "--config"], config=config, cache=cache, env={}, command=command)
         self.assertEqual((ok.returncode, ok.stderr), (0, ""))
         self.assertIn("No supported AI tool found", ok.stdout)
         self.assertEqual(bad.returncode, 0)
@@ -1581,9 +2129,8 @@ class Plugin(unittest.TestCase):
             config, cache = os.path.join(d, "config.json"), os.path.join(d, "cache")
             with open(config, "w") as f:
                 json.dump({"providers": [{"name": n, "enabled": True} for n in NAMES]}, f)
-            base = [link, "--config", config, "--cache", cache]
-            menu = subprocess.run(base + ["--skip", ALL], capture_output=True, encoding="utf-8", timeout=30)
-            toggled = subprocess.run(base + ["--toggle", "gemini"], capture_output=True, encoding="utf-8", timeout=30)
+            menu = run_launcher([], config=config, cache=cache, command=(link,))
+            toggled = run_launcher(["--toggle", "gemini"], config=config, cache=cache, command=(link,))
             with open(config) as f:
                 after = json.load(f)
             linked_folder = sorted(os.listdir(os.path.dirname(link)))
@@ -1593,6 +2140,49 @@ class Plugin(unittest.TestCase):
         self.assertEqual((toggled.returncode, toggled.stdout, toggled.stderr), (0, "", ""))
         self.assertEqual([p["enabled"] for p in after["providers"]], [n != "gemini" for n in NAMES])
         self.assertEqual(linked_folder, ["ai-limits.5m.sh"])
+
+    def test_show_end_to_end(self):
+        with tempfile.TemporaryDirectory() as d:
+            config, cache = os.path.join(d, "config.json"), os.path.join(d, "cache")
+            with open(config, "w") as f:
+                json.dump({"providers": [{"name": n, "enabled": True} for n in NAMES]}, f)
+            pinned = self.run_plugin(["--show", "claude:5-hour"], cache, config=config)
+            with open(config) as f:
+                after = json.load(f)
+            menu = self.run_plugin(["--skip", ALL], cache, config=config)
+            with open(config, "rb") as f:
+                before_refusal = f.read()
+            refused = self.run_plugin(["--show", "claude:a|b"], cache, config=config)
+            with open(config, "rb") as f:
+                after_refusal = f.read()
+        self.assertEqual((pinned.returncode, pinned.stdout, pinned.stderr), (0, "", ""))
+        self.assertEqual(after["menu_bar"], {"provider": "claude", "limit": "5-hour"})
+        lines = menu_lines(menu.stdout)
+        self.assertTrue(lines[0].startswith("– | "))  # nothing was read: the pinned limit is not available
+        self.assertEqual(swiftbar_params(lines[0])["tooltip"], "Claude 5-hour not available")
+        self.assertIn("--Claude · 5-hour (not available) | checked=true", lines)
+        self.assertEqual(refused.returncode, 0)
+        self.assertIn("AI Limits Bar could not run", refused.stdout)
+        self.assertEqual(after_refusal, before_refusal)
+
+    def test_show_then_the_click_refresh_through_the_launcher(self):
+        with tempfile.TemporaryDirectory() as d:
+            config, cache = os.path.join(d, "config.json"), os.path.join(d, "cache")
+            marker = os.path.join(cache, "keep-values.json")
+            with open(config, "w") as f:
+                json.dump({"providers": [{"name": n, "enabled": True} for n in NAMES]}, f)
+            shown = self.run_plugin(["--show", "claude:5-hour"], cache, config=config)
+            written = os.path.exists(marker)
+            plain = self.run_plugin([], cache, config=config)  # a scheduled run: the marker stays
+            kept = os.path.exists(marker)
+            click_env = dict(os.environ, SWIFTBAR_PLUGIN_REFRESH_REASON="MenuAction")
+            clicked = self.run_plugin([], cache, config=config, env=click_env)  # the launcher adds --refresh
+            consumed = not os.path.exists(marker)
+        self.assertEqual((shown.returncode, shown.stdout, shown.stderr), (0, "", ""))
+        self.assertTrue(written and kept and consumed, (written, kept, consumed))
+        for p in (plain, clicked):
+            self.assertEqual((p.returncode, p.stderr), (0, ""))
+            self.assertIn("--Claude · 5-hour (not available) | checked=true", menu_lines(p.stdout))
 
     def test_hostile_environment_is_ignored(self):
         with tempfile.TemporaryDirectory() as d:

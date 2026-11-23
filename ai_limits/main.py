@@ -11,12 +11,14 @@ in its own thread with its own timeout -> cache successful reads -> render.menu(
 
 Nothing is taken from the environment: SwiftBar copies the query parameters of a refresh link, which any web page
 or app can open, into it. It is replaced by a fixed one (common.ENV) before anything else runs, and every switch
-is a command-line argument, which a link can't set (SwiftBar passes none, except the --choose and --config that
-this plugin's own "Providers…" item asks for):
+is a command-line argument, which a link can't set (SwiftBar passes none, except the --choose, --show and --config
+that this plugin's own "Providers…" and "Menu bar shows" items ask for):
   --refresh      read every provider again. "Refresh now" is a plain SwiftBar `refresh=true` item; the launcher
                  adds --refresh when SwiftBar reports that click. A cache younger than 60 seconds is still used
                  (a refresh can also be triggered by a link), the cache stays the fallback, and the menu bar keeps
-                 the previous values until the new ones are ready.
+                 the previous values until the new ones are ready. Right after a --show (see keep_values), that one
+                 run shows the new choice from the cached values, whatever their age, and reads only providers that
+                 have none (and those forced to fail with --fail).
   --config PATH  read this file instead of config.json (config.json is then not created from the example)
   --cache DIR    cache folder instead of ~/Library/Caches/ai-limits-bar
   --skip a,b     skip these providers for this run
@@ -26,7 +28,14 @@ this plugin's own "Providers…" item asks for):
                  waits for it, then re-runs the plugin, but only after exit code 0, which safe_main guarantees.
                  A second --choose while a panel is open exits at once.
   --toggle NAME  turn one provider on or off in the config file and print nothing (for the terminal).
-                 With --choose or --toggle, the other switches except --config (and --cache for --choose) are ignored.
+  --show highest|PROVIDER:LIMIT
+                 set what the menu bar number shows (`menu_bar` in the config file) and print nothing: the highest
+                 current percentage, or one limit, e.g. `claude:5-hour`. A "Menu bar shows" click runs it; the value
+                 is checked again here (a known provider; a limit from render.CHOICE_LABEL), anything else is refused.
+                 It then leaves a marker in the cache folder so the refresh SwiftBar starts after the click does not
+                 re-read the providers (choosing a number needs no new data).
+                 With --choose, --toggle or --show, the other switches except --config (and --cache for --choose)
+                 are ignored.
 """
 import argparse
 import contextlib
@@ -65,6 +74,8 @@ LAUNCHER = os.path.join(ROOT, "plugin", "ai-limits.5m.sh")  # run by the "Provid
 LOCK_SECONDS = 3.0  # --toggle waits at most this long for another change (or an open panel) to finish
 STATE_FILE = "providers-state.json"  # in the cache folder: providers the last menu run found not set up
 STATE_MAX_AGE = 3600.0  # seconds; an older state file gives no "not set up" notes
+KEEP_FILE = "keep-values.json"  # in the cache folder: written by --show, lets the next --refresh run skip re-reading
+KEEP_SECONDS = 10.0  # an older marker counts for nothing
 CACHE = os.path.join(HOME, "Library", "Caches", "ai-limits-bar")
 VALID_NAME = re.compile(r"[a-z0-9_]{1,20}")
 REFRESH_FLOOR = 60.0  # seconds: even a forced refresh uses a cache this young
@@ -90,9 +101,12 @@ def parse_args(argv):
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--toggle")
     parser.add_argument("--choose", action="store_true")
+    parser.add_argument("--show")
     args, _ = parser.parse_known_args(argv)
     if args.config == "" or args.cache == "":
         parser.error("empty path")
+    if args.show == "":
+        parser.error("--show takes highest or PROVIDER:LIMIT")
     return args
 
 
@@ -198,31 +212,12 @@ def _write_atomic(target, payload, mode):
         raise
 
 
-def _set_enabled_locked(path, changes, create):
-    """set_enabled without taking the lock (the caller holds it). Returns whether the file was written."""
+def _change_config_locked(path, create, change):
+    """Loads the config (load_config), lets change(data) edit it in place and say whether anything changed, then
+    writes it in one atomic write. The caller holds the lock. An unreadable file or no change: nothing is written.
+    Returns whether the file was written."""
     data, unreadable = load_config(path, create)
-    if unreadable:
-        return False
-    if not isinstance(data.get("providers"), list):
-        data["providers"] = []
-    entries = provider_entries(data)
-    changed = False
-    for name, on in changes.items():
-        if not valid_name(name):
-            continue
-        entry = entries.get(name)
-        current = entry is not None and entry.get("enabled") is True
-        on = (not current) if on is None else on is True
-        if on == current:
-            continue
-        if entry is None:
-            entry = {"name": name, "enabled": True}
-            data["providers"].append(entry)
-            entries[name] = entry
-        else:
-            entry["enabled"] = on
-        changed = True
-    if not changed:
+    if unreadable or not change(data):
         return False
     try:
         payload = config_text(data).encode("utf-8")
@@ -235,6 +230,32 @@ def _set_enabled_locked(path, changes, create):
         mode = 0o600
     _write_atomic(target, payload, mode)
     return True
+
+
+def _set_enabled_locked(path, changes, create):
+    """set_enabled without taking the lock (the caller holds it). Returns whether the file was written."""
+    def change(data):
+        if not isinstance(data.get("providers"), list):
+            data["providers"] = []
+        entries = provider_entries(data)
+        changed = False
+        for name, on in changes.items():
+            if not valid_name(name):
+                continue
+            entry = entries.get(name)
+            current = entry is not None and entry.get("enabled") is True
+            on = (not current) if on is None else on is True
+            if on == current:
+                continue
+            if entry is None:
+                entry = {"name": name, "enabled": True}
+                data["providers"].append(entry)
+                entries[name] = entry
+            else:
+                entry["enabled"] = on
+            changed = True
+        return changed
+    return _change_config_locked(path, create, change)
 
 
 def set_enabled(path, changes, create, lock_seconds=None):
@@ -253,6 +274,63 @@ def set_enabled(path, changes, create, lock_seconds=None):
 def toggle(path, name, create):
     """--toggle NAME: flips one provider (true -> false, anything else -> true). See set_enabled."""
     return valid_name(name) and set_enabled(path, {name: None}, create)
+
+
+def parse_choice(value):
+    """--show value -> "highest" or {"provider", "limit"}. The provider must be a known name and the limit must pass
+    render.CHOICE_LABEL (the same allow-list the menu uses before it puts a label into a click); anything else is
+    refused with ArgumentError, before the config file is opened."""
+    if value == "highest":
+        return "highest"
+    provider, colon, limit = value.partition(":")
+    if not colon or not valid_name(provider) or not render.CHOICE_LABEL.fullmatch(limit):
+        raise ArgumentError("--show takes highest or PROVIDER:LIMIT")
+    return {"provider": provider, "limit": limit}
+
+
+def set_menu_bar(path, value, create):
+    """--show: writes `menu_bar` with the same lock and writer as set_enabled (unreadable file: no write). A missing
+    key already means highest, so setting highest then writes nothing."""
+    def change(data):
+        if data.get("menu_bar") == value or (value == "highest" and "menu_bar" not in data):
+            return False
+        data["menu_bar"] = value
+        return True
+    target = os.path.realpath(path)
+    with _folder_lock(os.path.dirname(target), LOCK_SECONDS):
+        return _change_config_locked(path, create, change)
+
+
+def mark_keep_values(cache):
+    """After --show: SwiftBar re-runs the plugin as a menu-click refresh, which the launcher turns into --refresh,
+    but a new menu bar choice needs no new data. {"time": now} in the cache folder makes that one run use the values
+    already read. An error here only means the refresh is forced, as before."""
+    with contextlib.suppress(Exception):
+        write_private_json(cache, KEEP_FILE, {"time": time.time()})
+
+
+def keep_values(cache):
+    """For a --refresh run: True if a --show just left a valid marker (a regular file holding a JSON object whose
+    time is a finite number at most KEEP_SECONDS old). This run then shows every provider that has a cached result
+    from that cache, whatever its age, and reads only providers without one, not forced. Whenever a --refresh run looks,
+    the marker is removed, valid or not (a symlinked one is not followed, just removed). The marker can only skip
+    this one re-read; anything unexpected means False, i.e. a forced refresh."""
+    path = os.path.join(cache, KEEP_FILE)
+    valid = False
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as f:
+            if stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                data = json.loads(f.read(4096))
+                t = data.get("time") if isinstance(data, dict) else None
+                if isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(t):
+                    valid = 0 <= time.time() - t <= KEEP_SECONDS
+    except Exception:
+        valid = False  # missing, a symlink (not followed), unreadable or not JSON
+    with contextlib.suppress(OSError):
+        if os.path.lexists(path):
+            os.remove(path)
+    return valid
 
 
 def save_state(cache, not_set_up):
@@ -334,8 +412,21 @@ def main(argv=None):
     if args.toggle is not None:
         toggle(config_path, args.toggle, create=not args.config)
         return
+    if args.show is not None:
+        set_menu_bar(config_path, parse_choice(args.show), create=not args.config)  # may refuse or raise Busy
+        # Also when nothing changed or config.json is unreadable. SwiftBar's own runs and clicks pass no --cache, so
+        # the click and its refresh both use the default cache folder; --cache only matters for tests and terminals.
+        mark_keep_values(cache)
+        return  # nothing is printed: the click's refresh=true re-runs the plugin for the new menu
     config, config_error = load_config(config_path, create=not args.config)
     force, forced, skip = args.refresh, _names(args.fail), _names(args.skip)
+    keep = False  # right after a --show: show the new choice from the cached values, whatever their age
+    if force:
+        try:
+            keep = keep_values(cache)
+        except Exception:
+            keep = False
+        force = not keep
     debug_shapes = config.get("debug_shapes") is True
 
     now = time.time()
@@ -352,8 +443,8 @@ def main(argv=None):
         if force:
             fresh_for = REFRESH_FLOOR
         age = now - cached["time"] if cached and cached.get("time") else None
-        if age is not None and 0 <= age < fresh_for and name not in forced:
-            results[name] = cached
+        if name not in forced and cached and (keep or (age is not None and 0 <= age < fresh_for)):
+            results[name] = cached  # fresh enough, or kept for the menu bar choice (render marks stale percents)
         else:
             timeout = _number(p.get("timeout_seconds"), 15, 1, 120)
             jobs[name] = (pool.submit(call, name, settings, forced), now + timeout)
@@ -390,7 +481,7 @@ def main(argv=None):
     shown = [(n, results[n]) for n in order if results.get(n)]
     providers = [(n, entries.get(n, {}).get("enabled") is True) for n in NAMES]
     print(render.menu(shown, time.time(), True, config_path, config_error, providers, LAUNCHER,
-                      config_path if args.config else None))
+                      config_path if args.config else None, config.get("menu_bar")))
 
 
 def safe_main():
