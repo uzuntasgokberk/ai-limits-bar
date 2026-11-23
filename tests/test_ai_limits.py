@@ -2607,7 +2607,8 @@ class PanelOnScreen(unittest.TestCase):
         self.assertLess(time.monotonic() - start, 10)
         self.assertEqual((code, err), (0, ""))
         lines = out.splitlines()
-        self.assertEqual([x for x in lines if x.startswith("#")], ["#active=true", "#key=true", "#visible=true"])
+        self.assertEqual([x for x in lines if x.startswith("#")],  # #edit: the hidden Edit menu for Cmd+V etc.
+                         ["#active=true", "#key=true", "#visible=true", "#edit=5"])
         typed = panel.parse_prices(0, "\n".join(x for x in lines if not x.startswith("#")), 2)
         # the self-test types "1,5" into the first field and clicks Save; the other fields come back as shown
         self.assertEqual(typed, [["1,5", "", "", "", ""], ["1.25", "10", "0.125", "", ""]])

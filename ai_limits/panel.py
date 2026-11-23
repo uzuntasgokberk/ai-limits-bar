@@ -150,6 +150,20 @@ function run(argv) {
   }
   var app = $.NSApplication.sharedApplication;
   app.setActivationPolicy(1);  // accessory: no Dock icon, no menu bar of its own
+  var editItems = 0;
+  try {  // Cmd+X/C/V/A/Z reach a text field only through a main menu: an Edit menu that is never shown
+    var edit = $.NSMenu.alloc.initWithTitle('Edit');
+    [['Undo', 'undo:', 'z'], ['Cut', 'cut:', 'x'], ['Copy', 'copy:', 'c'], ['Paste', 'paste:', 'v'],
+     ['Select All', 'selectAll:', 'a']].forEach(function (e) {
+      edit.addItem($.NSMenuItem.alloc.initWithTitleActionKeyEquivalent(e[0], e[1], e[2]));
+    });
+    var holder = $.NSMenuItem.alloc.init;
+    holder.submenu = edit;
+    var menu = $.NSMenu.alloc.init;
+    menu.addItem(holder);
+    app.mainMenu = menu;
+    editItems = Number(edit.numberOfItems);
+  } catch (e) {}
 
   var alert = $.NSAlert.alloc.init;
   alert.messageText = 'Foundry prices';
@@ -212,7 +226,8 @@ function run(argv) {
   var seen = [];
   if (mode === 'selftest-save' || mode === 'selftest-cancel') {
     var timer = $.NSTimer.timerWithTimeIntervalRepeatsBlock(1.0, false, function () {
-      seen.push('#active=' + app.isActive, '#key=' + alert.window.isKeyWindow, '#visible=' + alert.window.isVisible);
+      seen.push('#active=' + app.isActive, '#key=' + alert.window.isKeyWindow, '#visible=' + alert.window.isVisible,
+                '#edit=' + editItems);
       if (flat.length > 0) flat[0].stringValue = '1,5';
       alert.buttons.objectAtIndex(mode === 'selftest-save' || rows.length === 0 ? 0 : 1).performClick(null);
     });

@@ -139,8 +139,7 @@ Foundry spend is estimated from tokens × your price per model (see [How Foundry
 - Type a number such as `2.5`, `2,5` or `0.075` (at most 10,000), or leave the field empty for no price. Something else shows the window again with a note.
 - Cache fields apply to Claude models: Azure reports no cache tokens for other models, so all of their input is priced as **Input** (see the prompt caching note above).
 - **Save** writes only the fields you changed to `prices_usd_per_million` in `config.json`, in one write; your other values and their order are kept, and a deployment left without any price is removed. The menu is rebuilt right after the window closes: Foundry is read again with the new prices (its invoice history is kept), every other provider keeps the values already read.
-- The list comes from the last Foundry read, so a deployment shows up once it has tokens and Foundry has been read since. At most 15 are listed; set the others from a terminal.
-- The window closes by itself, without changes, after 10 minutes. Choosing it again while it is open does nothing, and neither **Providers…** nor `--toggle` can change `config.json` meanwhile. The path rule of **Providers…** applies here too.
+- The list comes from the last Foundry read, so a deployment shows up once it has tokens and Foundry has been read since. At most 15 are listed; set the others from a terminal. A deployment whose name has characters other than letters, digits, `.`, `_`, `-` and parentheses is not listed: set its price in `config.json`.- The window closes by itself, without changes, after 10 minutes. Choosing it again while it is open does nothing, and neither **Providers…** nor `--toggle` can change `config.json` meanwhile. The path rule of **Providers…** applies here too.
 - From a terminal: `~/ai-limits-bar/plugin/ai-limits.5m.sh --set-price demo-model input=1.25 output=10 cache_read=0.125` sets those fields of one deployment (fields: `input`, `output`, `cache_read`, `cache_write_5m`, `cache_write_1h`); `input=` with nothing after it removes one. It prints nothing; the menu changes on its next refresh. The window itself: `--prices`.
 
 ## The menu
@@ -153,7 +152,7 @@ Foundry spend is estimated from tokens × your price per model (see [How Foundry
 - **Updated**: when the menu was last built.
 - **SwiftBar**: SwiftBar's own menu (preferences, plugin folder, launch at login, quit). SwiftBar's *About*, *Run in Terminal*, *Last updated* and *Disable plugin* items are hidden.
 - Each section's header opens the provider's usage page; **Details** has extra information and the last read time.
-- Microsoft Foundry's totals are marked `≈` or `≥` (see [How Foundry spend is computed](#settings)); an orange *2 models have no price: set prices…* line says why a total is `≥`, and a click on it opens **Foundry prices…**.
+- Microsoft Foundry's totals are marked `≈` or `≥` (see [How Foundry spend is computed](#settings)); an orange *2 models have no price: set prices…* line counts the models with tokens (this month or earlier) that have no price, which make the totals of the periods with their tokens `≥`; a click on it opens **Foundry prices…**.
 
 ## Privacy and security
 
