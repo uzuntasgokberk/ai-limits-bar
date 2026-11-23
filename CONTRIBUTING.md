@@ -21,7 +21,9 @@ Thank you for helping. This repository is maintained by one person, so the proce
 - Standard library only, and Python 3.9 compatible (`/usr/bin/python3` on macOS is 3.9).
 - Anything that reaches the menu goes through `render.clean`, `render.quoted` or `render.param_path` (and
   `render.command_path` for a command); click targets are fixed in `render.py`, and a provider's text goes into a
-  click parameter only through `render.choice_param` and its allow-list.
+  click parameter only through `render.choice_param` and its allow-list. A window (`panel.py`) is a fixed script
+  that gets its data as arguments and whose answer is parsed strictly; tests never open one unless they are `--gui`
+  tests.
 - Nothing is read from the environment: SwiftBar links can set it. Switches are command-line arguments.
 - The tool stays read-only towards the accounts: no new write endpoint or method, no credential refresh, no credential
   on disk, in a log, in the cache or in a process argument.
@@ -34,7 +36,7 @@ Python 3.9 or later on macOS. From the repository root:
 
 ```bash
 python3 -I tests/test_ai_limits.py          # the offline suite (no window, no network, no Keychain)
-python3 -I tests/test_ai_limits.py --gui    # also the two tests that open the Providers… window for a second
+python3 -I tests/test_ai_limits.py --gui    # also the tests that open the Providers… and Foundry prices windows for a second
 ```
 
 Run it with `/usr/bin/python3` as well when you touch the Python code, so 3.9 compatibility is checked. CI

@@ -10,7 +10,9 @@ Identity: the Azure CLI session (`az login`); no keys. Two sources:
 Cost Management throttles frequent queries (HTTP 429) and past months don't change, so the invoice and token
 history is refreshed at most every `invoice_refresh_hours` (15 minutes on "Refresh now"), not again within 15
 minutes of a failed attempt, and kept in `foundry-history.json` in the cache folder (0600; per-item and
-per-deployment amounts and token totals only).
+per-deployment amounts and token totals only). After each successful token read, the deployments with tokens and
+the token types they used (no amounts) are saved in `foundry-deployments.json` for the "Foundry prices…" window,
+which reads no provider. Prices are set there or with --set-price (main.py), or by hand in config.json.
 
 Totals: each period = max(token estimate, invoiced amount). All time = invoiced months before this one + this
 month's total. A total is marked `≈` only if it can be complete, otherwise `≥` (at least): see spend_rows. The
@@ -36,8 +38,15 @@ PRICE_FIELD = {"InputTokens": "input", "OutputTokens": "output", "cacheReadInput
                "ephemeral5mInputTokens": "cache_write_5m", "ephemeral1hInputTokens": "cache_write_1h"}
 # Documented by Azure Monitor for Anthropic model deployments only.
 CACHE_METRICS = ("cacheReadInputTokens", "ephemeral5mInputTokens", "ephemeral1hInputTokens")
+PRICE_KEYS = tuple(PRICE_FIELD.values())  # the order of the "Foundry prices" window's columns
+MAX_PRICE = 10000.0  # USD per million tokens; the most expensive list price is far below it
+# A typed price: ASCII digits only (float() would also take 'nan', 'inf', '1e3', '1_0' and non-ASCII digits), with
+# '.' or ',' before the decimals, so '2,5' typed with a decimal comma is 2.5.
+PRICE_TEXT = re.compile(r"[0-9]{1,5}(?:[.,][0-9]{1,6})?|[.,][0-9]{1,6}")
 AZURE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._()-]{0,89}")
 HISTORY_FILE = "foundry-history.json"
+DEPLOYMENTS_FILE = "foundry-deployments.json"  # in the cache folder: deployments with tokens, for the prices window
+MAX_DEPLOYMENTS = 50
 PERIOD_KEY = re.compile(r"\d{4}-\d{2}(-\d{2})?")
 METER_STOP = {"inp", "outp", "opt", "cd", "wr", "shortco", "glbl", "gl", "std", "1m", "tokens", "unit", "cached",
               "batch", "regnl", "dz", "rgnl"}
@@ -59,6 +68,60 @@ def valid_budget(x):
     if isinstance(x, bool) or not isinstance(x, (int, float)):
         return None
     return float(x) if math.isfinite(x) and x > 0 else None
+
+
+def valid_price(x):
+    """A price from config.json: a finite number from 0 to MAX_PRICE (USD per million tokens); otherwise None."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return None
+    return float(x) if math.isfinite(x) and 0 <= x <= MAX_PRICE else None
+
+
+def parse_price(text):
+    """A typed price (the prices window, --set-price): '2', '2.5', '2,5' or '.5', spaces around it ignored, at most
+    MAX_PRICE. Empty means no price (None). Anything else raises ValueError. Whole numbers stay int."""
+    if not isinstance(text, str):
+        raise ValueError("not text")
+    s = text.strip(" \t")
+    if not s:
+        return None
+    if not PRICE_TEXT.fullmatch(s):
+        raise ValueError("not a price")
+    s = s.replace(",", ".")
+    value = float(s)  # only ASCII digits and at most one dot get here
+    if value > MAX_PRICE:
+        raise ValueError("too large")
+    return value if "." in s else int(s)
+
+
+def price_text(x):
+    """A price as the prices window shows it: '2', '2.5', '0.075'; '' if it is not a valid price."""
+    x = valid_price(x)
+    if x is None:
+        return ""
+    return f"{x:.6f}".rstrip("0").rstrip(".") or "0"
+
+
+def save_deployments(cache_dir, used):
+    """foundry-deployments.json: the deployments with tokens and the token types each used, for the prices window
+    (which reads no provider). Only names that pass valid_name, at most MAX_DEPLOYMENTS; no amounts."""
+    names = sorted(n for n in used if valid_name(n))[:MAX_DEPLOYMENTS]
+    data = {"time": time.time(), "deployments": {n: [m for m in PRICE_FIELD if m in used[n]] for n in names}}
+    if cache_dir:
+        with contextlib.suppress(OSError):
+            write_private_json(cache_dir, DEPLOYMENTS_FILE, data)
+
+
+def load_deployments(cache_dir):
+    """{deployment: [token types it used]} from foundry-deployments.json, checked strictly: names must pass
+    valid_name, token types must be known metrics, at most MAX_DEPLOYMENTS; anything else is left out."""
+    saved = read_json(os.path.join(cache_dir, DEPLOYMENTS_FILE)) if cache_dir else None
+    found = saved.get("deployments") if isinstance(saved, dict) else None
+    out = {}
+    for name, used in (found.items() if isinstance(found, dict) else []):
+        if valid_name(name) and isinstance(used, list) and len(out) < MAX_DEPLOYMENTS:
+            out[name] = [m for m in PRICE_FIELD if m in used]
+    return out
 
 
 def _az(az, argv, timeout=40):
@@ -285,10 +348,10 @@ def estimate(tokens, prices):
         n = tokens.get(metric, 0)
         if not n:
             continue
-        price = prices.get(field) if isinstance(prices, dict) else None
-        if isinstance(price, bool) or not isinstance(price, (int, float)) or not math.isfinite(price) or price < 0:
+        price = valid_price(prices.get(field) if isinstance(prices, dict) else None)
+        if price is None:
             return None
-        total += n * float(price) / 1e6
+        total += n * price / 1e6
     return total
 
 
@@ -299,14 +362,15 @@ def money(x, currency="USD"):
 def model_lines(live, saved_tokens, prices, now):
     """Per deployment: today · this week · this month · all time (estimated $, or output tokens without a price),
     the estimated totals {'today','week','month'} -> (amount, every deployment with tokens in it priced?), and
-    deployment names: 'unpriced' (tokens, but a used token type has no valid price) and 'uncached_input' (priced,
-    with input tokens but no cache tokens at all). Azure Monitor reports cache reads and writes for Anthropic
-    deployments only; for the others (e.g. Azure OpenAI) cached input is most likely inside InputTokens, so their
-    input is priced as uncached and the estimate can be too high (the Details footnote says so)."""
+    deployment names: 'unpriced' (tokens, but a used token type has no valid price), 'uncached_input' (priced,
+    with input tokens but no cache tokens at all) and 'used' ({deployment: token types with tokens}). Azure Monitor
+    reports cache reads and writes for Anthropic deployments only; for the others (e.g. Azure OpenAI) cached input
+    is most likely inside InputTokens, so their input is priced as uncached and the estimate can be too high (the
+    Details footnote says so)."""
     starts = period_starts(now)
     this_month = now.strftime("%Y-%m")
     totals = {p: [0.0, True] for p in starts}
-    lines, names = [], {"unpriced": [], "uncached_input": []}
+    lines, names = [], {"unpriced": [], "uncached_input": [], "used": {}}
     for deployment in sorted(set(live) | set(saved_tokens)):
         days = live.get(deployment, {})
         per = {p: sum_days(days, first) for p, first in starts.items()}
@@ -319,6 +383,7 @@ def model_lines(live, saved_tokens, prices, now):
             all_time[k] = all_time.get(k, 0) + v
         if not any(all_time.values()):
             continue
+        names["used"][deployment] = [m for m in PRICE_FIELD if all_time.get(m)]
         price = prices.get(deployment, {})
         cells = []
         for p, t in list(per.items()) + [("all", all_time)]:
@@ -440,12 +505,15 @@ def read(settings):
 
     models, est, names = model_lines(live or {}, (hist or {}).get("tokens") or {}, prices, now)
     unpriced = names["unpriced"]
+    tokens_read = resource_id is not None and live is not None
+    if tokens_read:  # a failed token read keeps the last list, so today's new deployments stay in the window
+        save_deployments(settings.get("cache_dir"), names["used"])
     if hist:
         items, invoiced, first_month = invoice_lines(hist, now)
     else:
         items, invoiced, first_month = [], None, None
     currency = (hist or {}).get("currency") or "USD"
-    rows = spend_rows(est, invoiced, resource_id is not None and live is not None, budget, currency)
+    rows = spend_rows(est, invoiced, tokens_read, budget, currency)
 
     details = ["Columns: today · this week · this month · all time"]
     if models:
@@ -458,7 +526,7 @@ def read(settings):
         details.append(f"All time since {first_month}; invoices checked "
                        f"{time.strftime('%b %d %H:%M', time.localtime(_epoch_seconds(hist.get('fetched'))))}")
     if unpriced:
-        details.append("Models shown in tokens have no price in config.json (≥ = at least)")
+        details.append("Models shown in tokens have no price (≥ = at least): set them under Foundry prices…")
     if names["uncached_input"]:
         details.append("Input without cache reads is priced as uncached: Azure reports cache reads for Claude models "
                        "only (may be too high)")

@@ -32,11 +32,11 @@ A provider that isn't set up on your Mac is hidden automatically, and so are lim
 | **GitHub Copilot** | Monthly AI-credit (or premium-request) budget, used / total, reset date | `gh api copilot_internal/user` (the GitHub CLI owns the token) |
 | **Microsoft Foundry** | Spend today, this week, this month and all time. Details: every model and invoice item for the same four periods | Azure CLI: Azure Monitor metrics and Cost Management. Off by default |
 
-**Read-only.** This tool never changes anything in your accounts. For example, it can't use a limit reset: Codex messages are restricted to an allow-list of two read-only requests and one notification, and Claude's reset endpoint is never called. Do that in the official app or website. The only thing it ever changes is its own settings file, `config.json`, when you turn a provider on or off or choose what the menu bar shows.
+**Read-only.** This tool never changes anything in your accounts. For example, it can't use a limit reset: Codex messages are restricted to an allow-list of two read-only requests and one notification, and Claude's reset endpoint is never called. Do that in the official app or website. The only thing it ever changes is its own settings file, `config.json`, when you turn a provider on or off, choose what the menu bar shows or set Foundry prices.
 
 ## Requirements
 
-- **macOS only.** It does not run on Windows or Linux: it is a SwiftBar plugin (SwiftBar is a macOS app), the Claude sign-in is read from the macOS Keychain, and the **Providers…** window is a native macOS panel.
+- **macOS only.** It does not run on Windows or Linux: it is a SwiftBar plugin (SwiftBar is a macOS app), the Claude sign-in is read from the macOS Keychain, and the **Providers…** and **Foundry prices…** windows are native macOS panels.
 - [SwiftBar](https://github.com/swiftbar/SwiftBar) (free, open source).
 - Python 3.9 or newer, at `/opt/homebrew/bin/python3`, `/usr/local/bin/python3` or `/usr/bin/python3`. The Xcode Command Line Tools provide the last one (see [Install](#install)); Homebrew's Python works too.
 
@@ -99,7 +99,7 @@ On first run `config.json` is created from `config.example.json` (it is git-igno
   - `resource`: the Foundry resource whose token metrics are read.
   - `budget_usd`: optional monthly budget. With a budget, the month line gets a percentage bar.
   - `invoice_refresh_hours`: how often the invoice history is fetched (default 6; at most every 15 minutes on *Refresh now*). Cost Management throttles frequent queries, and past months don't change.
-  - `prices_usd_per_million`: per deployment name: `input`, `output`, `cache_read`, `cache_write_5m`, `cache_write_1h`. A deployment with tokens but no price (or no price for a token type it used) is counted in tokens only: the totals of the periods with its tokens are marked `≥`, the section says how many models have no price, and Details names them.
+  - `prices_usd_per_million`: per deployment name: `input`, `output`, `cache_read`, `cache_write_5m`, `cache_write_1h`, in US dollars per million tokens (at most 10,000). **Foundry prices…** in the menu sets them for you (see [Foundry prices](#foundry-prices)). A deployment with tokens but no price (or no price for a token type it used) is counted in tokens only: the totals of the periods with its tokens are marked `≥`, the section says how many models have no price, and Details names them.
 - `menu_bar`: what the number in the menu bar shows. `"highest"` (the default) is the highest current percentage of all limits; `{"provider": "claude", "limit": "5-hour"}` is that one limit, named exactly as listed under **Menu bar shows** (see [The menu](#the-menu)), which sets it for you. A name the menu can't offer as a click can still be written here by hand. An invalid value means highest.
 - `debug_shapes`: stores the *structure* of the Claude response (field names and value types only, no values) in the cache, to help when an endpoint changes.
 
@@ -132,16 +132,28 @@ Choose **Providers…** in the menu. A small window opens with one checkbox per 
 - If the repository's path contains a `"` or a backslash, **Providers…** can't be clicked (and **Open settings** is left out). The same goes for **Providers…** if it contains `'`, `$`, `;`, `&`, `|`, `<`, `>` or a backtick. Use the terminal command below then.
 - From a terminal, one provider at a time: `~/ai-limits-bar/plugin/ai-limits.5m.sh --toggle gemini` turns Gemini on or off (it prints nothing; the menu changes on its next refresh). The window itself: `--choose`.
 
+## Foundry prices
+
+Foundry spend is estimated from tokens × your price per model (see [How Foundry spend is computed](#settings)). Choose **Foundry prices…** in the menu, or click the orange *N models have no price* line in the Foundry section. A small window lists the model deployments that have tokens, those without a price first (marked *no price*, or *missing Output* when only some token types used have one), with fields for **Input**, **Output**, **Cache read**, **Write 5m** and **Write 1h**, in US dollars per million tokens as on the model's pricing page.
+
+- Type a number such as `2.5`, `2,5` or `0.075` (at most 10,000), or leave the field empty for no price. Something else shows the window again with a note.
+- Cache fields apply to Claude models: Azure reports no cache tokens for other models, so all of their input is priced as **Input** (see the prompt caching note above).
+- **Save** writes only the fields you changed to `prices_usd_per_million` in `config.json`, in one write; your other values and their order are kept, and a deployment left without any price is removed. The menu is rebuilt right after the window closes: Foundry is read again with the new prices (its invoice history is kept), every other provider keeps the values already read.
+- The list comes from the last Foundry read, so a deployment shows up once it has tokens and Foundry has been read since. At most 15 are listed; set the others from a terminal.
+- The window closes by itself, without changes, after 10 minutes. Choosing it again while it is open does nothing, and neither **Providers…** nor `--toggle` can change `config.json` meanwhile. The path rule of **Providers…** applies here too.
+- From a terminal: `~/ai-limits-bar/plugin/ai-limits.5m.sh --set-price demo-model input=1.25 output=10 cache_read=0.125` sets those fields of one deployment (fields: `input`, `output`, `cache_read`, `cache_write_5m`, `cache_write_1h`); `input=` with nothing after it removes one. It prints nothing; the menu changes on its next refresh. The window itself: `--prices`.
+
 ## The menu
 
 - **Refresh now**: reads everything again (values read less than a minute ago are kept); the menu bar keeps the current values until the new ones are ready.
 - **Providers…**: turns providers on and off in a small window (see above).
 - **Menu bar shows**: chooses what the number in the menu bar is: *Highest of all*, or one limit such as *Claude · 5-hour*. The new number shows at once, from the values already read, whatever their age; only a provider with no values yet is read. With one limit, the number, gauge and colour follow that limit only, so another limit reaching 90% no longer turns the menu bar red; the tooltip says which limit is shown. If it can't be read (provider off or not set up, the limit gone, or its reset time passed), the menu bar shows `–`; a limit that is no longer listed stays in the submenu, checked and marked *(not available)*, so you can change it. Gemini lines can regroup as usage changes, so a chosen Gemini line can become not available. A limit whose name has characters other than letters, digits, spaces, `.`, `_` and `-` is listed but can't be chosen with a click (set it in `config.json` instead, see [Settings](#settings)). The path rule of **Providers…** applies here too.
+- **Foundry prices…** (only with a Foundry section): sets the price of each model in a small window (see [Foundry prices](#foundry-prices)).
 - **Open settings**: opens `config.json` in your default editor. It is left out if the folder's path contains a `"` or a backslash.
 - **Updated**: when the menu was last built.
 - **SwiftBar**: SwiftBar's own menu (preferences, plugin folder, launch at login, quit). SwiftBar's *About*, *Run in Terminal*, *Last updated* and *Disable plugin* items are hidden.
 - Each section's header opens the provider's usage page; **Details** has extra information and the last read time.
-- Microsoft Foundry's totals are marked `≈` or `≥` (see [How Foundry spend is computed](#settings)); an orange *2 models have no price* line says why a total is `≥`.
+- Microsoft Foundry's totals are marked `≈` or `≥` (see [How Foundry spend is computed](#settings)); an orange *2 models have no price: set prices…* line says why a total is `≥`, and a click on it opens **Foundry prices…**.
 
 ## Privacy and security
 
@@ -150,7 +162,7 @@ In short:
 - Credentials are never refreshed, stored, logged or printed.
 - Where possible the provider's own tool does the talking (Codex app-server, GitHub CLI, Azure CLI, the Antigravity server).
 - The menu never shows your email, username, tenant or subscription id. Foundry's *Details* submenu does list the model deployment names you chose in Azure and the invoice meter names; keep it closed on a screen recording if those are private.
-- No log files are written. Besides `config.json` (created on the first run, rewritten when you turn a provider on or off or choose what the menu bar shows), the only files are a few small cache files in `~/Library/Caches/ai-limits-bar/` (folder 0700, files 0600). They hold numbers, times and labels (including those Foundry deployment and meter names), and are overwritten on every read. Foundry's monthly invoice and token totals are kept there as well (`foundry-history.json`).
+- No log files are written. Besides `config.json` (created on the first run, rewritten when you turn a provider on or off, choose what the menu bar shows or set Foundry prices), the only files are a few small cache files in `~/Library/Caches/ai-limits-bar/` (folder 0700, files 0600). They hold numbers, times and labels (including those Foundry deployment and meter names), and are overwritten on every read. Foundry's monthly invoice and token totals are kept there as well (`foundry-history.json`), and the names of the deployments with tokens, for the prices window (`foundry-deployments.json`, no amounts).
 
 See [SECURITY.md](SECURITY.md) for the full model and how to report a problem.
 
@@ -166,12 +178,13 @@ The plugin ignores environment variables; these switches are command-line argume
 - A provider has no section: open **Providers…**. Unticked means it is off; *· not set up on this Mac* means its tool was not found or is not signed in (see [Requirements](#requirements)).
 - Turn a provider on or off: `--toggle gemini`; open the window: `--choose`
 - Choose what the menu bar shows: `--show claude:5-hour` (provider, a colon, then the limit's name as listed under **Menu bar shows**); back to the highest: `--show highest`
+- Set Foundry prices: `--set-price demo-model input=1.25 output=10 cache_read=0.125` (see [Foundry prices](#foundry-prices)); open the window: `--prices`
 - *AI Limits Bar could not run*: `~/ai-limits-bar/plugin/ai-limits.5m.sh --debug` prints the error to the terminal. Add `>/dev/null` to see only the error, without the menu and your numbers (for example for an issue).
 - Read every provider again instead of using the cache (values read less than a minute ago are still used): `--refresh`
 - Force one provider to fail and check that only its section shows a note: `~/ai-limits-bar/plugin/ai-limits.5m.sh --fail claude`
 - Skip a provider for one run: `--skip foundry` (several: `--skip claude,codex`)
 - Use another settings file or cache folder: `--config PATH`, `--cache DIR`. With `--config`, `config.json` is not created.
-- *config.json could not be read: using defaults*: the file is not valid JSON. Fix it with **Open settings**; until then **Providers…** opens no window.
+- *config.json could not be read: using defaults*: the file is not valid JSON. Fix it with **Open settings**; until then **Providers…** and **Foundry prices…** open no window.
 - *Session expired: open Claude Code once*: Claude Code renews its sign-in when it runs; this tool never does.
 - *Not signed in: run codex login*: the Codex CLI has no ChatGPT sign-in yet.
 - *Antigravity not running*: start `agy` (or the Antigravity app); the last values stay visible meanwhile.
@@ -183,15 +196,15 @@ The plugin ignores environment variables; these switches are command-line argume
 
 ```sh
 python3 -I tests/test_ai_limits.py          # offline: no network, no Keychain, no window
-python3 -I tests/test_ai_limits.py --gui    # also the two tests that open the Providers… window for a second
+python3 -I tests/test_ai_limits.py --gui    # also the tests that open the Providers… and Foundry prices windows for a second
 ```
 
 CI runs the offline suite on GitHub's macOS runner with the system Python (3.9) and the latest Python. Code layout:
 
 | Path | Contents |
 |---|---|
-| `ai_limits/main.py` | Order, cache, timeouts, `--choose`, `--toggle` and `--show` |
-| `ai_limits/panel.py` | The **Providers…** window (a fixed script run by `osascript`) |
+| `ai_limits/main.py` | Order, cache, timeouts, `--choose`, `--toggle`, `--show`, `--prices` and `--set-price` |
+| `ai_limits/panel.py` | The **Providers…** and **Foundry prices…** windows (fixed scripts run by `osascript`) |
 | `ai_limits/render.py` | Menu text and output safety |
 | `ai_limits/common.py` | HTTP and subprocess helpers |
 | `ai_limits/providers/` | One module per provider |

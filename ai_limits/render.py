@@ -4,8 +4,9 @@ SwiftBar syntax: one menu item per line; everything after ` | ` is parameters (h
 `---` is a separator and a line starting with `--` is a submenu item. Therefore every external string goes
 through `clean()`, parameter values with spaces through `quoted()`, and file paths through `param_path()`.
 Click targets are `LINKS`, `open` on the settings file, and this plugin's own launcher with `--choose` (the
-"Providers…" panel) or `--show` (the "Menu bar shows" choice). A row label from a provider reaches a `--show`
-parameter only through `choice_param()`, which accepts nothing but a strict allow-list.
+"Providers…" panel), `--prices` (the "Foundry prices…" window) or `--show` (the "Menu bar shows" choice). A row
+label from a provider reaches a `--show` parameter only through `choice_param()`, which accepts nothing but a strict
+allow-list; no provider text reaches a `--choose` or `--prices` click (the windows get their data from files).
 """
 import math
 import re
@@ -190,13 +191,15 @@ def label_width(results):
     return max(10, min(18, max(lengths, default=8) + 2))
 
 
-def unpriced_text(count):
-    """Fixed text with a number: why the Foundry totals are marked `≥`."""
-    return f"{count} model has no price (see Details)" if count == 1 else f"{count} models have no price (see Details)"
+def unpriced_text(count, clickable=False):
+    """Fixed text with a number: why the Foundry totals are marked `≥`, and what a click on it does."""
+    text = f"{count} model has no price" if count == 1 else f"{count} models have no price"
+    return f"{text}: set prices…" if clickable else f"{text} (see Details)"
 
 
-def section(key, r, now, width=DEFAULT_WIDTH):
-    """Menu lines of one provider. Foundry also gets a line saying how many models have no price, if any."""
+def section(key, r, now, width=DEFAULT_WIDTH, prices_action=None):
+    """Menu lines of one provider. Foundry also gets a line saying how many models have no price, if any; with
+    `prices_action` (from `window_action`) a click on it opens the prices window."""
     href = f"href={LINKS[key]}" if key in LINKS else None
     out = [header(key, href)]
     if r.get("note"):
@@ -220,7 +223,8 @@ def section(key, r, now, width=DEFAULT_WIDTH):
     if not r.get("rows") and not r.get("note"):
         out.append(f"unknown{_params('size=12', f'color={GREY}', href)}")
     if key == "foundry" and r.get("unpriced"):
-        out.append(f"{unpriced_text(r['unpriced'])}{_params('size=12', f'color={ORANGE}', href)}")
+        text = unpriced_text(r["unpriced"], clickable=bool(prices_action))
+        out.append(f"{text}{_params('size=12', f'color={ORANGE}', *(prices_action or [href]))}")
     details = [clean(d, 140) for d in r.get("details", [])]
     if r.get("time"):
         details.append(f"Last read {day_month(r['time'])} {clock(r['time'])}")
@@ -322,23 +326,35 @@ def command_path(path):
 
 
 PROVIDERS_ITEM = "Providers…"
+PRICES_ITEM = "Foundry prices…"
 
 
-def providers_item(launcher_path, toggle_config=None):
-    """The "Providers…" line: a click runs this plugin's launcher with `--choose`, which opens a panel of checkboxes
-    (a menu closes on every click, so several providers can't be ticked in the menu itself), and SwiftBar re-runs
-    the plugin once the panel is closed (`refresh=true`). toggle_config: the --config file this run uses, passed on
-    so the panel edits the same file. If the launcher is refused by `command_path` or the config path by
-    `param_path`, the line has no action."""
+def window_action(switch, launcher_path, toggle_config=None):
+    """The parameters of a click that opens one of this plugin's windows: this plugin's launcher with `switch`
+    (`--choose` or `--prices`, fixed here), the --config file this run uses if any (so the window edits the same
+    file), and `refresh=true`, so SwiftBar re-runs the plugin once the window is closed. None if the launcher is
+    refused by `command_path` or the config path by `param_path`: the line then has no action."""
     launcher = command_path(launcher_path)
     config = []
     if toggle_config is not None:
         path = param_path(toggle_config)
         config = ["param2=--config", f"param3={path}"] if path else None
-    if launcher is None or config is None:
-        return PROVIDERS_ITEM
-    action = [f"bash={launcher}", "param1=--choose", *config, "terminal=false", "refresh=true"]
-    return f"{PROVIDERS_ITEM}{_params(*action)}"
+    if launcher is None or config is None or switch not in ("--choose", "--prices"):
+        return None
+    return [f"bash={launcher}", f"param1={switch}", *config, "terminal=false", "refresh=true"]
+
+
+def providers_item(launcher_path, toggle_config=None):
+    """The "Providers…" line: a click runs this plugin's launcher with `--choose`, which opens a panel of checkboxes
+    (a menu closes on every click, so several providers can't be ticked in the menu itself); see `window_action`."""
+    action = window_action("--choose", launcher_path, toggle_config)
+    return f"{PROVIDERS_ITEM}{_params(*action)}" if action else PROVIDERS_ITEM
+
+
+def prices_item(action):
+    """The "Foundry prices…" line: a click opens the prices window (`--prices`); `action` from `window_action`, or
+    None for a line without action."""
+    return f"{PRICES_ITEM}{_params(*action)}" if action else PRICES_ITEM
 
 
 def choice_param(provider, label):
@@ -412,6 +428,15 @@ def menu(results, now=None, refresh=False, settings_path=None, config_error=Fals
     lines = [f"{f'{top:.0f}%' if top is not None else '–'}"
              f"{_params(f'sfimage={icon(top)}', f'color={c}' if c else None, f'tooltip={quoted(tooltip)}')}",
              "---"]
+    # "Foundry prices…" (and the click on the section's "no price" line): only with a Foundry section, the
+    # Providers… item's data, and a readable config.json.
+    has_foundry = any(k == "foundry" for k, _ in results)
+    prices_action = None
+    if has_foundry and providers is not None and not config_error:
+        try:
+            prices_action = window_action("--prices", launcher_path, toggle_config)
+        except Exception:
+            prices_action = None
     if not results:
         all_off = providers is not None and not any(p[1] for p in providers)
         text = ("All providers are off: turn one on under Providers…" if all_off
@@ -421,7 +446,7 @@ def menu(results, now=None, refresh=False, settings_path=None, config_error=Fals
         if i:
             lines.append("---")
         try:
-            lines.extend(section(key, r, now, width))
+            lines.extend(section(key, r, now, width, prices_action if key == "foundry" else None))
         except Exception:
             lines.append(header(key, suffix=" · could not be displayed"))
     lines.append("---")
@@ -433,6 +458,8 @@ def menu(results, now=None, refresh=False, settings_path=None, config_error=Fals
             lines.extend(chooser_lines(results, choice, launcher_path, toggle_config, config_error))
         except Exception:
             pass  # the menu stays usable without the chooser
+        if has_foundry:
+            lines.append(prices_item(prices_action))
     if config_error:
         lines.append(f"config.json could not be read: using defaults{_params('size=12', f'color={ORANGE}')}")
     path = param_path(settings_path)

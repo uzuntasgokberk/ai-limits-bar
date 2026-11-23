@@ -1,11 +1,13 @@
 """Offline tests: rendering rules, safety of menu output, provider parsing and the plugin's failure paths.
 
-Run: python3 -I tests/test_ai_limits.py   (add --gui for the two tests that open the Providers… window)
+Run: python3 -I tests/test_ai_limits.py   (add --gui for the tests that open the Providers… and prices windows)
 No test may reach a real provider. Two structural guards enforce it: setUpModule replaces every way a provider
 module reaches the outside (its subprocess, HTTP and tool-lookup functions, and the home-folder paths it reads) with
 a guard, and load_main() replaces main.call with one, so a test that wants provider data installs its own fake; a
-guard raises RealProviderRead, which no `except Exception` in the plugin can swallow. Every run of the plugin as a
-process goes through run_launcher(), which skips all providers except those forced to fail.
+guard raises RealProviderRead, which no `except Exception` in the plugin can swallow. The windows' osascript call
+(panel.run) is guarded the same way; only the opt-in --gui tests put the real one back. Every run of the plugin as a
+process goes through run_launcher(), which skips all providers except those forced to fail and refuses the window
+switches.
 The default run opens no window and needs no Keychain, network or ~/Library/Caches; it runs on any macOS with
 Python 3.9 or later (CI: GitHub's macOS runner, with the system Python and the latest Python). Time limits are
 generous for slow machines but always shorter than the wrong behaviour they rule out.
@@ -65,7 +67,7 @@ def provider_guard(where):
 # and the guard is back when their patch ends). common's own functions stay real: the loopback tests use them.
 GUARDED_CALLS = [(claude, "run"), (claude, "https_json"), (codex, "find_tool"), (copilot, "run"),
                  (copilot, "find_tool"), (foundry, "run"), (foundry, "find_tool"), (gemini, "https_json"),
-                 (gemini, "localhost_json")]
+                 (gemini, "localhost_json"), (panel, "run")]  # panel.run: a real window
 _GUARD_HOME = tempfile.TemporaryDirectory()
 
 
@@ -92,10 +94,12 @@ def run_launcher(args, *, config, cache, env=None, command=(PLUGIN,), allow_real
     """The only way tests start the plugin as a process. --skip is added LAST, so it wins over a --skip the test
     passed itself, and skips every provider except those the test forces to fail with --fail (main.call raises for
     them before any provider code runs). allow_real_providers=True is the explicit opt-out; no test uses it.
-    --config and --cache must be inside the temporary folder."""
+    --config and --cache must be inside the temporary folder. --choose and --prices are refused: in a process the
+    window guard does not hold, so they would open a real window."""
     temp = os.path.realpath(tempfile.gettempdir())
     for path in (config, cache):
         assert os.path.realpath(path).startswith(temp + os.sep), f"not a temporary path: {path}"
+    assert not {"--choose", "--prices"} & set(args), "a window switch: test it in-process with a fake window"
     argv = [*command, "--config", config, "--cache", cache, *args]
     if not allow_real_providers:
         failing = set()
@@ -603,6 +607,77 @@ class MenuBarChoice(unittest.TestCase):
         self.assertIsNone(render.choice_param("evil", "5-hour"))
 
 
+class PricesMenu(unittest.TestCase):
+    """The "Foundry prices…" item and the clickable "no price" line in the Foundry section."""
+
+    LAUNCHER = "/Users/demo/ai-limits-bar/plugin/ai-limits.5m.sh"
+    STATE = [(n, True) for n in NAMES]
+
+    @staticmethod
+    def foundry(unpriced=2):
+        return render.normalize(dict(res("MICROSOFT FOUNDRY", [row("Today", value="≥$3.00")]), unpriced=unpriced))
+
+    def menu(self, results=None, launcher=LAUNCHER, toggle_config=None, config_error=False, providers=STATE):
+        results = [("foundry", self.foundry())] if results is None else results
+        return render.menu(results, NOW, True, "/Users/demo/config.json", config_error, providers, launcher,
+                           toggle_config)
+
+    def action(self, config=None):
+        params = {"bash": self.LAUNCHER, "param1": "--prices", "terminal": "false", "refresh": "true"}
+        if config:
+            params.update(param2="--config", param3=config)
+        return params
+
+    @staticmethod
+    def find(text, title):
+        found = [x for x in menu_lines(text) if x.split(" | ")[0] == title]
+        assert len(found) == 1, (title, found)
+        return found[0]
+
+    def test_item_opens_the_window_through_the_launcher(self):
+        text = self.menu()
+        lines = menu_lines(text)
+        item = self.find(text, render.PRICES_ITEM)
+        self.assertEqual(swiftbar_params(item), self.action())
+        chooser_end = max(i for i, x in enumerate(lines) if x.startswith("--Highest of all"))
+        self.assertLess(chooser_end, lines.index(item))  # after Providers… and the Menu bar shows submenu
+        self.assertLess(lines.index(item), next(i for i, x in enumerate(lines) if x.startswith("Open settings")))
+        line = self.find(text, "2 models have no price: set prices…")
+        self.assertEqual(swiftbar_params(line), {"size": "12", "color": render.ORANGE, **self.action()})
+        self.assertIn(line, top_level(text))  # in the section itself, not in Details
+        config = "/Users/demo/My Folder/it's (a) $test.json"
+        custom = self.menu(toggle_config=config)
+        self.assertEqual(swiftbar_params(self.find(custom, render.PRICES_ITEM)), self.action(config))
+        one = self.menu([("foundry", self.foundry(1))])
+        self.assertEqual(swiftbar_params(self.find(one, "1 model has no price: set prices…"))["param1"], "--prices")
+
+    def test_only_with_a_foundry_section(self):
+        copilot = [("copilot", render.normalize(res("GITHUB COPILOT", [row("AI credits", 26.0)])))]
+        for text in (self.menu(copilot), self.menu([]), self.menu(providers=None)):
+            self.assertNotIn(render.PRICES_ITEM, text)
+        self.assertNotIn("set prices", self.menu(providers=None))  # no launcher data: the line keeps its link
+        self.assertIn(render.PRICES_ITEM, self.menu([("foundry", self.foundry(0))]))  # all priced: still editable
+        self.assertNotIn("no price", self.menu([("foundry", self.foundry(0))]))
+
+    def test_refused_paths_or_unreadable_config_leave_no_action(self):
+        launchers = ['/x/a" bash=/bin/sh x="', "/x/a\nb", "plugin/x.sh", None, "/Users/demo/ai;limits/x.sh"]
+        cases = [dict(launcher=x) for x in launchers] + [dict(toggle_config='/tmp/c" bash=/bin/sh x="'),
+                                                         dict(config_error=True)]
+        for case in cases:
+            text = self.menu(**case)
+            self.assertEqual(self.find(text, render.PRICES_ITEM), render.PRICES_ITEM, case)
+            line = self.find(text, "2 models have no price (see Details)")
+            self.assertEqual(swiftbar_params(line), {"size": "12", "color": render.ORANGE,
+                                                     "href": render.LINKS["foundry"]}, case)
+            self.assertFalse(any("bash=/bin/sh" in x for x in menu_lines(text)), case)
+
+    def test_window_action_is_fixed(self):
+        self.assertIsNone(render.window_action("--show", self.LAUNCHER))
+        self.assertIsNone(render.window_action("--prices x", self.LAUNCHER))
+        self.assertEqual(render.window_action("--choose", self.LAUNCHER),
+                         [f'bash="{self.LAUNCHER}"', "param1=--choose", "terminal=false", "refresh=true"])
+
+
 class Panel(unittest.TestCase):
     """The panel's pure parts: its argument list and the strict parsing of its output. No window is opened."""
 
@@ -647,6 +722,52 @@ class Panel(unittest.TestCase):
         for failure in (subprocess.TimeoutExpired("osascript", 600), OSError("missing")):
             with mock.patch.object(panel, "run", side_effect=failure):
                 self.assertEqual(panel.show(self.ROWS), (1, "", ""))
+
+    PRICE_ROWS = [("demo-model", "no price", ["", "", "", "", ""]),
+                  ("other-model", "", ["1.25", "10", "0.125", "3.75", ""])]
+
+    def test_prices_script_is_fixed_and_data_are_arguments(self):
+        nasty = [("x'); $.NSTask.launch(); ('", "\n\"\\`${x}", ["' + run() + '", "1", "", "", " "])]
+        plain = panel.price_arguments(self.PRICE_ROWS, "Demo message")
+        hostile = panel.price_arguments(nasty, "'); evil(); ('")
+        self.assertEqual(plain[:5], ["/usr/bin/osascript", "-l", "JavaScript", "-e", panel.PRICES_SCRIPT])
+        self.assertIs(hostile[4], panel.PRICES_SCRIPT)  # byte-identical whatever the input
+        self.assertEqual(hostile[5:], ["panel", "'); evil(); ('", "x'); $.NSTask.launch(); ('", "\n\"\\`${x}",
+                                       "' + run() + '", "1", "", "", " "])
+        self.assertEqual(plain[5:], ["panel", "Demo message", "demo-model", "no price", "", "", "", "", "",
+                                     "other-model", "", "1.25", "10", "0.125", "3.75", ""])
+        self.assertEqual(panel.price_arguments([], "No rows")[5:], ["panel", "No rows"])
+        with self.assertRaises(ValueError):
+            panel.price_arguments(self.PRICE_ROWS, "x", "anything")
+        with self.assertRaises(ValueError):
+            panel.price_arguments([("demo-model", "", ["1", "2"])], "x")  # five prices per row
+        self.assertNotIn("argv[", panel.PRICES_SCRIPT.split("function run(argv)")[0])  # no code before run()
+        self.assertEqual(panel.PRICE_COLUMNS, len(foundry.PRICE_KEYS))
+        self.assertIn("var headings = ['Input', 'Output', 'Cache read', 'Write 5m', 'Write 1h'];", panel.PRICES_SCRIPT)
+
+    def test_prices_output_is_parsed_strictly(self):
+        good = json.dumps([["1,5", "", "", "", ""], ["1.25", "10", "0.125", "3.75", ""]])
+        self.assertEqual(panel.parse_prices(0, good + "\n", 2), json.loads(good))
+        self.assertEqual(panel.parse_prices(0, good, 2), json.loads(good))
+        self.assertEqual(panel.parse_prices(0, '[["anything typed", "", "", "", ""]]', 1)[0][0], "anything typed")
+        for code, out, count in [(1, good, 2), (0, "cancel\n", 2), (0, "", 2), (0, "\n", 2), (0, "[]", 2),
+                                 (0, good, 1), (0, good, 3),                                # wrong number of rows
+                                 (0, good + "\n#active=true\n", 2), (0, good + "\n\n", 2),  # extra lines
+                                 (0, " " + good, 2), (0, '{"a": 1}', 1), (0, "[1]", 1), (0, "[[1, 2, 3, 4, 5]]", 1),
+                                 (0, '[["", "", "", ""]]', 1), (0, '[["", "", "", "", "", ""]]', 1),
+                                 (0, json.dumps([["x" * 41, "", "", "", ""]]), 1), (0, "[NaN]", 1),
+                                 (0, "[[", 1), (0, None, 1), (-9, "", 0), (0, "cancel", 0)]:
+            self.assertIsNone(panel.parse_prices(code, out, count), repr((code, out, count)))
+
+    def test_show_prices_runs_osascript_without_a_shell(self):
+        with mock.patch.object(panel, "run", return_value=(0, "cancel\n", "")) as run:
+            self.assertEqual(panel.show_prices(self.PRICE_ROWS, "Demo"), (0, "cancel\n", ""))
+        argv, = run.call_args.args
+        self.assertEqual(argv, panel.price_arguments(self.PRICE_ROWS, "Demo"))
+        self.assertEqual(run.call_args.kwargs, {"timeout": panel.TIMEOUT})
+        for failure in (subprocess.TimeoutExpired("osascript", 600), OSError("missing")):
+            with mock.patch.object(panel, "run", side_effect=failure):
+                self.assertEqual(panel.show_prices(self.PRICE_ROWS, "Demo"), (1, "", ""))
 
 
 # ---- common -----------------------------------------------------------------------------------------------
@@ -1275,6 +1396,76 @@ class FoundrySpend(unittest.TestCase):
         self.assertEqual(foundry._epoch_seconds(1.9e9), 1.9e9)
 
 
+class FoundryPrices(unittest.TestCase):
+    """Prices typed in the window or with --set-price, and the deployments file the window reads."""
+
+    def test_parse_price(self):
+        for text, value in (("2", 2), ("2.5", 2.5), ("2,5", 2.5), ("0.075", 0.075), (" 3 ", 3), (".5", 0.5),
+                            (",5", 0.5), ("0", 0), ("10000", 10000), ("0.000001", 0.000001), ("007", 7)):
+            parsed = foundry.parse_price(text)
+            self.assertEqual(parsed, value, text)
+            self.assertIs(type(parsed), type(value), text)  # whole numbers stay int
+        for text in ("", " ", "\t"):
+            self.assertIsNone(foundry.parse_price(text), repr(text))  # empty: no price
+        for text in ("nan", "NaN", "inf", "Infinity", "1e3", "1E3", "1_0", "-1", "+1", "１", "١", "1.2.3", "10001",
+                     "10000.5", "1.1234567", "abc", "1,000.5", "$1", "1 000", "5.", "0x1", "1\n", " 1",
+                     "123456", None, 5):
+            with self.assertRaises(ValueError, msg=repr(text)):
+                foundry.parse_price(text)
+
+    def test_prices_above_the_bound_are_no_price(self):
+        self.assertEqual(foundry.valid_price(10000), 10000.0)
+        for bad in (10000.01, -0.01, float("nan"), float("inf"), True, "2", None):
+            self.assertIsNone(foundry.valid_price(bad), repr(bad))
+        tokens = {"OutputTokens": 1_000_000}
+        self.assertEqual(foundry.estimate(tokens, {"output": 10000}), 10000.0)
+        self.assertIsNone(foundry.estimate(tokens, {"output": 20000}))  # a typo-sized price counts as none
+
+    def test_price_text(self):
+        for value, text in ((2, "2"), (2.0, "2"), (2.5, "2.5"), (0.075, "0.075"), (10000, "10000"), (0, "0"),
+                            (1e-7, "0"), (-1, ""), ("2", ""), (None, ""), (float("nan"), ""), (True, "")):
+            self.assertEqual(foundry.price_text(value), text, repr(value))
+
+    def test_deployments_file_round_trip_and_checks(self):
+        with tempfile.TemporaryDirectory() as d:
+            used = {"demo-model": ["InputTokens", "OutputTokens"], "other.model_2": ["cacheReadInputTokens"],
+                    "@~/x": ["OutputTokens"], "?": ["OutputTokens"], "a b": ["OutputTokens"]}
+            foundry.save_deployments(d, used)
+            path = os.path.join(d, foundry.DEPLOYMENTS_FILE)
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+            saved = common.read_json(path)
+            self.assertEqual(sorted(saved), ["deployments", "time"])
+            self.assertEqual(saved["deployments"], {"demo-model": ["InputTokens", "OutputTokens"],
+                                                    "other.model_2": ["cacheReadInputTokens"]})  # no amounts
+            self.assertEqual(foundry.load_deployments(d), saved["deployments"])
+            common.write_private_json(d, foundry.DEPLOYMENTS_FILE, {"deployments": {
+                "demo-model": ["OutputTokens", "evil", 5, "InputTokens"], "-x": ["OutputTokens"], "x" * 91: [],
+                "ok-model": "OutputTokens", "fine": []}})
+            self.assertEqual(foundry.load_deployments(d), {"demo-model": ["InputTokens", "OutputTokens"], "fine": []})
+            for broken in ([1], "x", {"deployments": [1]}, {"deployments": "demo-model"}, {}):
+                common.write_private_json(d, foundry.DEPLOYMENTS_FILE, broken)
+                self.assertEqual(foundry.load_deployments(d), {}, broken)
+            many = {f"model-{i:03d}": ["OutputTokens"] for i in range(80)}
+            foundry.save_deployments(d, many)
+            self.assertEqual(len(foundry.load_deployments(d)), foundry.MAX_DEPLOYMENTS)
+            os.remove(path)
+            self.assertEqual(foundry.load_deployments(d), {})
+        self.assertEqual(foundry.load_deployments(None), {})
+
+    def test_read_saves_deployments_only_after_a_token_read(self):
+        spend = FoundrySpend("test_period_starts")
+        spend.setUp()
+        live = {"demo-model": {"2031-08-07": {"InputTokens": 900, "OutputTokens": 50}}}
+        with tempfile.TemporaryDirectory() as d:
+            settings = {"resource_group": "demo-rg", "resource": "demo-resource", "cache_dir": d}
+            spend.read_with(settings, live)
+            self.assertEqual(foundry.load_deployments(d), {"demo-model": ["InputTokens", "OutputTokens"]})
+            spend.read_with(settings, None)  # the token read failed: the last list stays
+            self.assertEqual(foundry.load_deployments(d), {"demo-model": ["InputTokens", "OutputTokens"]})
+            spend.read_with(dict(settings, resource=None), {})  # no `resource`: no token metrics, nothing written
+            self.assertEqual(foundry.load_deployments(d), {"demo-model": ["InputTokens", "OutputTokens"]})
+
+
 # ---- main.py in this process ------------------------------------------------------------------------------
 
 def file_state(path):
@@ -1335,6 +1526,16 @@ class ProviderGuard(unittest.TestCase):
         self.assertTrue(codex.SESSIONS.startswith(_GUARD_HOME.name))
         m = load_main()
         self.assertTrue(m.CACHE.startswith(_GUARD_HOME.name) and m.CONFIG.startswith(_GUARD_HOME.name))
+
+    def test_no_test_opens_a_real_window(self):
+        with self.assertRaisesRegex(RealProviderRead, "panel.run"):
+            panel.show([("claude", "Claude", True, "")])
+        with self.assertRaisesRegex(RealProviderRead, "panel.run"):
+            panel.show_prices([("demo-model", "", ["", "", "", "", ""])], "x")
+        with tempfile.TemporaryDirectory() as d:
+            for switch in ("--choose", "--prices"):
+                with self.assertRaises(AssertionError):
+                    run_launcher([switch], config=os.path.join(d, "config.json"), cache=os.path.join(d, "c"))
 
     def test_every_process_run_goes_through_run_launcher(self):
         with open(os.path.abspath(__file__), encoding="utf-8") as f:
@@ -2076,12 +2277,344 @@ class Choose(unittest.TestCase):
         self.assertEqual(self.shown[0][2][2], True)  # the panel showed the example's state
 
 
+class SetPrice(unittest.TestCase):
+    """--set-price and the prices writer, on temporary config files only (every call passes --config)."""
+
+    TEXT = ('{"providers": [{"name": "claude", "enabled": true}, {"name": "foundry", "enabled": true, '
+            '"resource_group": "demo-rg", "prices_usd_per_million": {"old-model": {"input": 3, "output": 15, '
+            '"cache_read": 0.3, "cache_write_5m": 3.75, "note": "kept"}, "other": {"output": 1.5}}, '
+            '"timeout_seconds": 60}], "debug_shapes": false}')
+
+    def setUp(self):
+        self.main = load_main()
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.dir = os.path.join(folder.name, "settings")
+        os.mkdir(self.dir)
+        self.cache = os.path.join(folder.name, "cache")
+        self.config = os.path.join(self.dir, "config.json")
+        self.write(self.TEXT)
+
+    def write(self, text):
+        with open(self.config, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def read(self):
+        with open(self.config, encoding="utf-8") as f:
+            return f.read()
+
+    def prices(self):
+        return json.loads(self.read())["providers"][1].get("prices_usd_per_million")
+
+    def set_price(self, *values):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.main.main(["--set-price", *values, "--config", self.config, "--cache", self.cache])
+        self.assertEqual(out.getvalue(), "")  # prints nothing
+        self.assertFalse([x for x in os.listdir(self.dir) if x.endswith(".tmp")])
+        self.assertFalse(os.path.exists(self.cache))  # no marker, no cache file: it reads nothing
+        return self.read()
+
+    def test_new_deployment_and_merge_keep_everything_else(self):
+        self.set_price("demo-model", "input=1.25", "output=10", "cache_read=0,125")
+        data = json.loads(self.read())
+        self.assertEqual(list(data), ["providers", "debug_shapes"])
+        foundry_entry = data["providers"][1]
+        self.assertEqual(list(foundry_entry), ["name", "enabled", "resource_group", "prices_usd_per_million",
+                                               "timeout_seconds"])
+        self.assertEqual(foundry_entry["prices_usd_per_million"], {
+            "old-model": {"input": 3, "output": 15, "cache_read": 0.3, "cache_write_5m": 3.75, "note": "kept"},
+            "other": {"output": 1.5}, "demo-model": {"input": 1.25, "output": 10, "cache_read": 0.125}})
+        self.set_price("old-model", "output=12.5", "cache_write_1h=6")
+        self.assertEqual(list(self.prices()), ["old-model", "other", "demo-model"])  # order kept
+        self.assertEqual(list(self.prices()["old-model"].items()),
+                         [("input", 3), ("output", 12.5), ("cache_read", 0.3), ("cache_write_5m", 3.75),
+                          ("note", "kept"), ("cache_write_1h", 6)])  # the cache-write and unknown keys survive
+        lines = self.read().splitlines()
+        self.assertEqual(lines[:2], ["{", '  "providers": ['])  # still the one-provider-per-line format
+        self.assertTrue(lines[3].startswith('    {"name": "foundry", "enabled": true,'))
+
+    def test_empty_price_removes_a_field_and_an_empty_entry(self):
+        self.set_price("other", "output=")
+        self.assertNotIn("other", self.prices())
+        self.set_price("old-model", "input=", "cache_write_5m=")
+        self.assertEqual(self.prices()["old-model"], {"output": 15, "cache_read": 0.3, "note": "kept"})
+        self.write(self.TEXT)
+        with mock.patch.object(self.main, "_write_atomic") as writes:
+            self.set_price("old-model", "input=3", "output=15.0")  # same values: nothing to write
+            self.set_price("never-priced", "input=")
+        writes.assert_not_called()
+
+    def test_refusals_write_nothing(self):
+        for values in (["demo-model"], ["@~/x", "input=1"], ["-x", "input=1"], ["a b", "input=1"],
+                       ["demo-model", "input"], ["demo-model", "price=1"], ["demo-model", "Input=1"],
+                       ["demo-model", "input=1", "input=2"], ["demo-model", "input=nan"],
+                       ["demo-model", "input=inf"], ["demo-model", "input=-1"], ["demo-model", "input=1e3"],
+                       ["demo-model", "input=10001"], ["demo-model", "input=1_0"], ["demo-model", "output=１"]):
+            with self.assertRaises(self.main.ArgumentError, msg=values):
+                self.set_price(*values)
+            self.assertEqual(self.read(), self.TEXT, values)
+
+    def test_nothing_is_written_without_a_place_for_prices(self):
+        for text in ("{not json", "[1]", '{"providers": [{"name": "claude", "enabled": true}]}',
+                     '{"providers": [{"name": "foundry", "prices_usd_per_million": [1, 2]}]}',
+                     '{"providers": [{"name": "foundry", "prices_usd_per_million": {"demo-model": "cheap"}}]}'):
+            self.write(text)
+            self.assertEqual(self.set_price("demo-model", "input=1"), text)
+        self.write('{"providers": [{"name": "foundry", "enabled": false, "prices_usd_per_million": null}]}')
+        self.set_price("demo-model", "output=2")
+        self.assertEqual(self.prices_of_first(), {"demo-model": {"output": 2}})
+        self.write('{"providers": [{"name": "foundry", "enabled": false}]}')
+        self.set_price("demo-model", "output=2")
+        self.assertEqual(self.prices_of_first(), {"demo-model": {"output": 2}})
+
+    def prices_of_first(self):
+        return json.loads(self.read())["providers"][0]["prices_usd_per_million"]
+
+    def test_busy_lock_fails_fast(self):
+        lock = os.open(self.dir, os.O_RDONLY)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)  # a window is open
+            with mock.patch.object(self.main, "LOCK_SECONDS", 0.2), self.assertRaises(self.main.Busy):
+                self.set_price("demo-model", "input=1")
+        finally:
+            os.close(lock)
+        self.assertEqual(self.read(), self.TEXT)
+
+
+class ChoosePrices(unittest.TestCase):
+    """--prices with the window replaced by a fake: no window is opened. Always a temp --config and --cache."""
+
+    TEXT = ('{"providers": [{"name": "claude", "enabled": true}, {"name": "foundry", "enabled": true, '
+            '"prices_usd_per_million": {"priced": {"input": 2, "output": 8, "cache_read": 0.2, "x": 1}, '
+            '"half": {"output": 4}}}], "debug_shapes": false}')
+    USED = {"priced": ["InputTokens", "OutputTokens", "cacheReadInputTokens"], "half": ["InputTokens", "OutputTokens"],
+            "Zeta-new": ["InputTokens", "OutputTokens"], "alpha-new": ["OutputTokens"]}
+
+    def setUp(self):
+        self.main = load_main()
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.dir = os.path.join(folder.name, "settings")
+        os.mkdir(self.dir)
+        self.cache = os.path.join(folder.name, "cache")
+        self.config = os.path.join(self.dir, "config.json")
+        self.marker = os.path.join(self.cache, self.main.KEEP_FILE)
+        with open(self.config, "w") as f:
+            f.write(self.TEXT)
+        foundry.save_deployments(self.cache, self.USED)
+        self.shown = []
+
+    def choose(self, *answers, side_effect=None):
+        """Runs --prices; the fake window records (rows, message) and gives the answers in turn (code, stdout)."""
+        queue = list(answers) or [(0, "cancel\n")]
+
+        def fake(rows, message, mode="panel", timeout=None):
+            self.shown.append((rows, message))
+            if side_effect:
+                side_effect()
+            code, out = queue.pop(0) if queue else (0, "cancel\n")
+            return code, out, ""
+        out = io.StringIO()
+        with mock.patch.object(panel, "show_prices", side_effect=fake), contextlib.redirect_stdout(out):
+            self.main.main(["--prices", "--config", self.config, "--cache", self.cache])
+        self.assertEqual(out.getvalue(), "")  # prints nothing
+        self.assertFalse([x for x in os.listdir(self.dir) if x.endswith(".tmp")])
+        with open(self.config) as f:
+            return f.read()
+
+    @staticmethod
+    def typed(*rows):
+        return 0, json.dumps([list(r) for r in rows]) + "\n"
+
+    def marker_data(self):
+        with open(self.marker, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_rows_unpriced_first_with_notes_and_current_prices(self):
+        self.choose()
+        rows, message = self.shown[0]
+        self.assertEqual(rows, [("alpha-new", "no price", ["", "", "", "", ""]),
+                                ("half", "missing Input", ["", "4", "", "", ""]),
+                                ("Zeta-new", "no price", ["", "", "", "", ""]),
+                                ("priced", "", ["2", "8", "0.2", "", ""])])
+        self.assertEqual(message, self.main.PRICES_MESSAGE)
+        self.assertIn("Cache fields apply to Claude models", message)
+        rows, _ = self.main.price_rows({"odd": ["OutputTokens"]}, {"odd": "cheap"})
+        self.assertEqual(rows, [("odd", "not an object in config.json", ["", "", "", "", ""])])  # Save skips it
+
+    def test_save_writes_only_changed_fields_in_one_write(self):
+        answer = self.typed(["", "5", "", "", ""], [" 1,5 ", "4", "", "", ""], ["", "", "", "", ""],
+                            ["2", "", "0.2", "", ""])  # priced: output cleared
+        with mock.patch.object(self.main, "_write_atomic", wraps=self.main._write_atomic) as writes:
+            text = self.choose(answer)
+        self.assertEqual(writes.call_count, 1)
+        prices = json.loads(text)["providers"][1]["prices_usd_per_million"]
+        self.assertEqual(prices, {"priced": {"input": 2, "cache_read": 0.2, "x": 1},
+                                  "half": {"output": 4, "input": 1.5}, "alpha-new": {"output": 5}})
+        self.assertEqual(self.marker_data()["read"], ["foundry"])  # the click's refresh re-reads Foundry only
+        self.assertEqual(len(self.shown), 1)
+
+    def test_unchanged_fields_keep_values_the_window_cannot_show(self):
+        with open(self.config, "w") as f:
+            f.write('{"providers": [{"name": "foundry", "enabled": true, "prices_usd_per_million": '
+                    '{"priced": {"input": 1e-7, "output": "eight", "cache_read": 20000}}}]}')
+        self.choose()
+        rows = self.shown[0][0]
+        self.assertIn(("priced", "missing Output, Cache read", ["0", "", "", "", ""]), rows)  # 1e-7 shows as 0
+        answer = self.typed(*[["0", "", "", "", "1"] if r[0] == "priced" else r[2] for r in rows])
+        text = self.choose(answer)
+        self.assertEqual(json.loads(text)["providers"][0]["prices_usd_per_million"]["priced"],
+                         {"input": 1e-7, "output": "eight", "cache_read": 20000, "cache_write_1h": 1})
+
+    def test_invalid_text_shows_the_window_again(self):
+        rest = (["", "4", "", "", ""], ["", "", "", "", ""], ["2", "8", "0.2", "", ""])  # as shown
+        bad = self.typed(["abc", "5", "", "", ""], *rest)
+        fixed = self.typed(["1", "5", "", "", ""], *rest)
+        text = self.choose(bad, fixed)
+        self.assertEqual(len(self.shown), 2)
+        rows, message = self.shown[1]
+        self.assertEqual(rows[0], ("alpha-new", "no price", ["abc", "5", "", "", ""]))  # what was typed
+        self.assertEqual(message, "Not a price: alpha-new Input. Type a number such as 2.5 or 0.075, or leave the "
+                                  "field empty.")
+        self.assertEqual(json.loads(text)["providers"][1]["prices_usd_per_million"]["alpha-new"],
+                         {"input": 1, "output": 5})
+        self.shown.clear()
+        with mock.patch.object(self.main, "_write_atomic") as writes:
+            self.assertEqual(self.choose(*[bad] * 6), text)
+        writes.assert_not_called()
+        self.assertEqual(len(self.shown), 5)  # then it gives up without a change
+
+    def test_cancel_and_bad_answers_change_nothing(self):
+        good = self.typed(["1", "", "", "", ""], ["", "4", "", "", ""], ["", "", "", "", ""], ["2", "8", "0.2", "", ""])
+        for answer in [(0, "cancel\n"), (1, good[1]), (0, good[1] + "#active=true\n"), (0, "garbage"), (0, ""),
+                       (0, json.dumps([["1", "", "", "", ""]]))]:
+            with mock.patch.object(self.main, "_write_atomic") as writes:
+                self.assertEqual(self.choose(answer), self.TEXT, answer)
+            writes.assert_not_called()
+            self.assertNotIn("read", self.marker_data())  # nothing changed: the refresh keeps every value
+        with mock.patch.object(self.main, "_write_atomic") as writes:
+            self.choose(self.typed(*[r[2] for r in self.shown[0][0]]))  # Save without a change
+        writes.assert_not_called()
+
+    def test_no_window_without_a_readable_config_or_a_foundry_entry(self):
+        for text in ("{not json", "[1]", '{"providers": [{"name": "claude", "enabled": true}]}'):
+            with open(self.config, "w") as f:
+                f.write(text)
+            self.assertEqual(self.choose(self.typed(["1", "", "", "", ""])), text)
+        self.assertEqual(self.shown, [])
+
+    def test_no_deployments_yet_and_too_many(self):
+        os.remove(os.path.join(self.cache, foundry.DEPLOYMENTS_FILE))
+        self.assertEqual(self.choose(), self.TEXT)
+        self.assertEqual(self.shown[0][0], [])
+        self.assertTrue(self.shown[0][1].startswith("No model deployment with tokens yet."))
+        foundry.save_deployments(self.cache, {f"model-{i:02d}": ["OutputTokens"] for i in range(20)})
+        self.choose()
+        rows, message = self.shown[1]
+        self.assertEqual(len(rows), self.main.MAX_PRICE_ROWS)
+        self.assertTrue(message.endswith("Showing 15 of 20: set the others with --set-price."))
+
+    def test_second_window_exits_at_once_and_toggle_fails_fast_meanwhile(self):
+        lock = os.open(self.dir, os.O_RDONLY)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)  # a window is already open
+            start = time.monotonic()
+            self.assertEqual(self.choose(self.typed(["1", "", "", "", ""])), self.TEXT)
+            self.assertLess(time.monotonic() - start, 2.0)
+        finally:
+            os.close(lock)
+        self.assertEqual(self.shown, [])
+        attempts = []
+
+        def toggle_meanwhile():
+            with mock.patch.object(self.main, "LOCK_SECONDS", 0.2):
+                try:
+                    self.main.toggle(self.config, "claude", False)
+                except self.main.Busy:
+                    attempts.append("busy")
+        self.choose(side_effect=toggle_meanwhile)
+        self.assertEqual(attempts, ["busy"])
+
+
+class PricesRefresh(unittest.TestCase):
+    """After a price change, the click's refresh re-reads Foundry (unforced) and keeps every other provider."""
+
+    def setUp(self):
+        self.main = load_main()
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.cache = os.path.join(folder.name, "cache")
+        self.config = os.path.join(folder.name, "config.json")
+        with open(self.config, "w") as f:
+            json.dump({"providers": [{"name": "claude", "enabled": True}, {"name": "foundry", "enabled": True}]}, f)
+        self.calls = []
+
+        def fake(name, settings, forced):
+            self.calls.append((name, settings["force"]))
+            return {"title": name.upper(), "status": "ok", "details": [], "note": None, "time": time.time(),
+                    "rows": [row("Today", value="≈$9.00")]}
+        self.main.call = fake
+        self.write_caches()
+
+    def write_caches(self):
+        """Older than the 60 s refresh floor, younger than refresh_minutes."""
+        for name in ("claude", "foundry"):
+            common.write_private_json(self.cache, f"{name}.json", {
+                "title": name.upper(), "status": "ok", "details": [], "note": None, "time": time.time() - 120,
+                "rows": [row("Today", value="≥$1.00")]})
+
+    def refresh(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.main.main(["--refresh", "--config", self.config, "--cache", self.cache])
+        return out.getvalue()
+
+    def test_only_foundry_is_read_again(self):
+        self.main.mark_keep_values(self.cache, ("foundry",))
+        text = self.refresh()
+        self.assertEqual(self.calls, [("foundry", False)])  # not a forced refresh: its invoice history is kept
+        self.assertIn("≈$9.00", text)
+        self.assertIn("≥$1.00", text)  # Claude: the value already read
+        self.assertFalse(os.path.exists(os.path.join(self.cache, self.main.KEEP_FILE)))
+
+    def test_a_bad_read_list_means_a_forced_refresh(self):
+        for read in ("foundry", ["evil"], [5], ["foundry"] * 6, None, {"foundry": 1}):
+            self.calls.clear()
+            self.write_caches()
+            common.write_private_json(self.cache, self.main.KEEP_FILE, {"time": time.time(), "read": read})
+            self.refresh()
+            self.assertEqual(sorted(self.calls), [("claude", True), ("foundry", True)], read)
+
+
 @unittest.skipUnless("--gui" in sys.argv, "opens a window: run with --gui")
 class PanelOnScreen(unittest.TestCase):
-    """Opt-in (python3 -I tests/test_ai_limits.py --gui): the real panel, which closes itself after a second."""
+    """Opt-in (python3 -I tests/test_ai_limits.py --gui): the real windows, which close themselves after a second."""
 
     ROWS = [(n, render.HEADERS[n], n in ("claude", "gemini", "copilot"), render.NOT_SET_UP if n == "copilot" else "")
             for n in NAMES]
+    PRICE_ROWS = [("demo-model", "no price", ["", "", "", "", ""]),
+                  ("other-model", "", ["1.25", "10", "0.125", "", ""])]
+
+    def setUp(self):
+        real = mock.patch.object(panel, "run", common.run)  # the suite-wide window guard is lifted here only
+        real.start()
+        self.addCleanup(real.stop)
+
+    def test_prices_window_save_and_cancel(self):
+        start = time.monotonic()
+        code, out, err = panel.show_prices(self.PRICE_ROWS, "Demo message", "selftest-save", timeout=30)
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertEqual((code, err), (0, ""))
+        lines = out.splitlines()
+        self.assertEqual([x for x in lines if x.startswith("#")], ["#active=true", "#key=true", "#visible=true"])
+        typed = panel.parse_prices(0, "\n".join(x for x in lines if not x.startswith("#")), 2)
+        # the self-test types "1,5" into the first field and clicks Save; the other fields come back as shown
+        self.assertEqual(typed, [["1,5", "", "", "", ""], ["1.25", "10", "0.125", "", ""]])
+        code, out, err = panel.show_prices(self.PRICE_ROWS, "Demo message", "selftest-cancel", timeout=30)
+        self.assertEqual((code, err, out.splitlines()[0]), (0, "", "cancel"))
+        code, out, err = panel.show_prices([], "No rows", "selftest-save", timeout=30)
+        self.assertEqual((code, err, out.splitlines()[0]), (0, "", "cancel"))  # only an OK button: no change
 
     def test_self_test_save_and_cancel(self):
         for _ in range(2):
@@ -2287,6 +2820,30 @@ class Plugin(unittest.TestCase):
         self.assertEqual(refused.returncode, 0)
         self.assertIn("AI Limits Bar could not run", refused.stdout)
         self.assertEqual(after_refusal, before_refusal)
+
+    def test_set_price_end_to_end(self):
+        with tempfile.TemporaryDirectory() as d:
+            config, cache = os.path.join(d, "config.json"), os.path.join(d, "cache")
+            with open(config, "w") as f:
+                json.dump({"providers": [{"name": n, "enabled": True} for n in NAMES]}, f)
+            priced = self.run_plugin(["--set-price", "demo-model", "input=1,25", "output=10"], cache, config=config)
+            with open(config) as f:
+                after = json.load(f)
+            with open(config, "rb") as f:
+                before_refusal = f.read()
+            refused = [self.run_plugin(["--set-price", *values], cache, config=config)
+                       for values in (["demo-model", "input=nan"], ["@x", "input=1"], ["demo-model"])]
+            with open(config, "rb") as f:
+                after_refusal = f.read()
+            cache_files = os.listdir(cache) if os.path.isdir(cache) else []
+        self.assertEqual((priced.returncode, priced.stdout, priced.stderr), (0, "", ""))
+        self.assertEqual(after["providers"][-1]["prices_usd_per_million"],
+                         {"demo-model": {"input": 1.25, "output": 10}})
+        for p in refused:
+            self.assertEqual(p.returncode, 0)
+            self.assertIn("AI Limits Bar could not run", p.stdout)
+        self.assertEqual(after_refusal, before_refusal)
+        self.assertEqual(cache_files, [])  # nothing was read
 
     def test_show_then_the_click_refresh_through_the_launcher(self):
         with tempfile.TemporaryDirectory() as d:
