@@ -1187,6 +1187,14 @@ def load_main():
     return module
 
 
+class Version(unittest.TestCase):
+    def test_launcher_metadata_matches_the_package_version(self):
+        import ai_limits
+        with open(PLUGIN, encoding="utf-8") as f:
+            found = re.findall(r"^# <xbar\.version>v([0-9.]+)</xbar\.version>$", f.read(), re.MULTILINE)
+        self.assertEqual(found, [ai_limits.__version__])
+
+
 class ProviderGuard(unittest.TestCase):
     """Proof that the suite-wide guard holds: without a fake, a test hits the guard, not a provider."""
 

@@ -1,6 +1,6 @@
 #!/bin/zsh -f
 # <xbar.title>AI Limits Bar</xbar.title>
-# <xbar.version>v1.0.0</xbar.version>
+# <xbar.version>v1.1.0</xbar.version>
 # <xbar.desc>Usage limits of Claude, Codex, Gemini, GitHub Copilot and Microsoft Foundry.</xbar.desc>
 # <xbar.dependencies>python3</xbar.dependencies>
 # <swiftbar.runInBash>false</swiftbar.runInBash>
