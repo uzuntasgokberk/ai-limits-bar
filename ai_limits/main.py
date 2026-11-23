@@ -91,7 +91,8 @@ MAX_PRICE_ROWS = 15  # deployments in the prices window; the others are set with
 PRICE_HEADINGS = dict(zip(foundry.PRICE_KEYS, ("Input", "Output", "Cache read", "Write 5m", "Write 1h")))
 PRICES_MESSAGE = ("Only models without an Azure cost estimate are listed. US dollars per million tokens; empty means "
                   "no price. Azure reports cache tokens only for Claude models: for others, all input is priced as "
-                  "Input.")
+                  'Input. Models marked "old usage only" have no tokens this week or month: their price changes only '
+                  "Details.")
 CACHE = os.path.join(HOME, "Library", "Caches", "ai-limits-bar")
 VALID_NAME = re.compile(r"[a-z0-9_]{1,20}")
 REFRESH_FLOOR = 60.0  # seconds: even a forced refresh uses a cache this young
@@ -387,22 +388,27 @@ def set_prices(path, changes, create):
         return _set_prices_locked(path, changes, create)
 
 
-def price_rows(used, prices):
+def price_rows(used, prices, current=None):
     """The prices window's rows [(deployment, note, [five texts])] and how many deployments there were: deployments
-    with tokens and no Azure estimate (`used`: {deployment: token types}), those without a usable price first, each
-    group by name, at most MAX_PRICE_ROWS. The note says what is missing for the token types the deployment used: "" (priced), "no price"
-    or "missing Output, Cache read"; or that its entry in config.json is not an object (Save leaves such an entry
-    alone). The texts are the current prices (foundry.price_text)."""
+    with tokens and no Azure estimate (`used`: {deployment: token types}), at most MAX_PRICE_ROWS, in three groups,
+    each by name: first those whose missing price makes a shown row `≥` (`current`: token types used today, this
+    week or this month; None: unknown, every deployment counts), then those with a usable price, then those whose
+    missing price concerns only earlier usage. The note says what is missing for the token types used: "" (priced),
+    "no price" or "missing Output, Cache read", with " · old usage only" in the last group; or that the entry in
+    config.json is not an object (Save leaves such an entry alone). The texts are the current prices."""
     rows = []
     for name, metrics in used.items():
-        current = prices.get(name) if isinstance(prices.get(name), dict) else {}
-        missing = [PRICE_HEADINGS[foundry.PRICE_FIELD[m]] for m in metrics
-                   if foundry.valid_price(current.get(foundry.PRICE_FIELD[m])) is None]
+        entry = prices.get(name) if isinstance(prices.get(name), dict) else {}
+        unpriced = [m for m in metrics if foundry.valid_price(entry.get(foundry.PRICE_FIELD[m])) is None]
+        missing = [PRICE_HEADINGS[foundry.PRICE_FIELD[m]] for m in unpriced]
         note = "" if not missing else "no price" if len(missing) == len(metrics) else "missing " + ", ".join(missing)
+        shown = metrics if current is None else current.get(name, [])
+        group = 1 if not unpriced else 0 if set(unpriced) & set(shown) else 2
+        if group == 2:
+            note += " · old usage only"
         if prices.get(name) is not None and not isinstance(prices.get(name), dict):
             note = "not an object in config.json"
-        rows.append((not missing, name.lower(), name, note, [foundry.price_text(current.get(k))
-                                                             for k in foundry.PRICE_KEYS]))
+        rows.append((group, name.lower(), name, note, [foundry.price_text(entry.get(k)) for k in foundry.PRICE_KEYS]))
     rows.sort(key=lambda r: r[:2])
     return [(name, note, texts) for _, _, name, note, texts in rows[:MAX_PRICE_ROWS]], len(rows)
 
@@ -438,7 +444,8 @@ def choose_prices(path, cache, create):
             if unreadable or entry is None:
                 return False
             prices = entry.get("prices_usd_per_million")
-            rows, total = price_rows(foundry.load_deployments(cache), prices if isinstance(prices, dict) else {})
+            rows, total = price_rows(foundry.load_deployments(cache), prices if isinstance(prices, dict) else {},
+                                     foundry.load_current(cache))
             original = [texts for _, _, texts in rows]
             if not rows:
                 message = ("No model needs a price: Azure estimates the cost of every model with tokens, or none has "

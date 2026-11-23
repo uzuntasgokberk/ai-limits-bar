@@ -18,7 +18,7 @@ in config.json.
 
 Totals: each period = max(model estimates, invoiced amount). All time = invoiced months before this one + this
 month's total. A total is marked `≈` only if it can be complete, otherwise `≥` (at least): see spend_rows. The
-section says how many deployments need a price (`unpriced` in the result). The menu never
+section counts the deployments whose missing price makes a shown row `≥` (`unpriced` in the result). The menu never
 shows the subscription id, tenant, resource or resource-group name; deployment names and invoice item (model and
 service) names appear only in Details, and in the cache. Disabled by default: set it up in config.json.
 """
@@ -109,27 +109,44 @@ def price_text(x):
     return f"{x:.6f}".rstrip("0").rstrip(".") or "0"
 
 
-def save_deployments(cache_dir, used):
+def save_deployments(cache_dir, used, current=None):
     """foundry-deployments.json: the deployments with tokens but no Azure estimate (model_lines' 'by_settings') and
-    the token types each used, for the prices window (which reads no provider). Only names that pass valid_name, at
-    most MAX_DEPLOYMENTS; no amounts."""
+    the token types each used, for the prices window (which reads no provider), and under "current" the token types
+    each used in a shown period (today, this week, this month; model_lines' 'current'). Only names that pass
+    valid_name, at most MAX_DEPLOYMENTS; no amounts. Without `current` the part is left out (unknown)."""
     names = sorted(n for n in used if valid_name(n))[:MAX_DEPLOYMENTS]
     data = {"time": time.time(), "deployments": {n: [m for m in PRICE_FIELD if m in used[n]] for n in names}}
+    if current is not None:
+        data["current"] = {n: [m for m in PRICE_FIELD if m in current[n]] for n in names if n in current}
     if cache_dir:
         with contextlib.suppress(OSError):
             write_private_json(cache_dir, DEPLOYMENTS_FILE, data)
 
 
-def load_deployments(cache_dir):
-    """{deployment: [token types it used]} from foundry-deployments.json, checked strictly: names must pass
-    valid_name, token types must be known metrics, at most MAX_DEPLOYMENTS; anything else is left out."""
+def _load_part(cache_dir, key):
+    """{deployment: [token types]} from one part of foundry-deployments.json, checked strictly: names must pass
+    valid_name, token types must be known metrics, at most MAX_DEPLOYMENTS; anything else is left out. None if the
+    file or the part is missing or not an object."""
     saved = read_json(os.path.join(cache_dir, DEPLOYMENTS_FILE)) if cache_dir else None
-    found = saved.get("deployments") if isinstance(saved, dict) else None
+    found = saved.get(key) if isinstance(saved, dict) else None
+    if not isinstance(found, dict):
+        return None
     out = {}
-    for name, used in (found.items() if isinstance(found, dict) else []):
+    for name, used in found.items():
         if valid_name(name) and isinstance(used, list) and len(out) < MAX_DEPLOYMENTS:
             out[name] = [m for m in PRICE_FIELD if m in used]
     return out
+
+
+def load_deployments(cache_dir):
+    """{deployment: [token types it used]}: the deployments the prices window offers (see save_deployments)."""
+    return _load_part(cache_dir, "deployments") or {}
+
+
+def load_current(cache_dir):
+    """{deployment: [token types used today, this week or this month]}, or None if the file doesn't say (an older
+    file): the window then treats every deployment as one that changes a shown row."""
+    return _load_part(cache_dir, "current")
 
 
 def _az(az, argv, timeout=40):
@@ -434,15 +451,21 @@ def model_lines(live, saved_tokens, prices, now, live_estimates=None, saved_esti
     - Otherwise tokens x the price from settings ($ per million, per token type); a period with tokens and no usable
       price is incomplete.
     A cell is `≈$x` (complete), `≥$x` (part of it), `N out` (output tokens, nothing priced) or `–` (no usage).
-    Names: 'unpriced' (no Azure estimate, tokens, no usable price), 'by_settings' ({deployment: token types used}
-    for every deployment without an Azure estimate: those the prices window offers), 'pending' (Azure estimate, but
-    token days or months without one) and 'uncached_input' (priced from settings, input tokens, no cache tokens:
-    Azure reports cache tokens only for Anthropic deployments, so that input is priced as uncached)."""
+    Names: 'unpriced' (no Azure estimate, and tokens without a usable price today, this week or this month, so a
+    shown row is `≥` because of it: the section's orange count), 'unpriced_older' (no Azure estimate and no usable
+    price, but no such tokens in a shown period: only Details and its all-time cell depend on it; the main All time
+    row takes earlier months from the invoice), 'by_settings' ({deployment: token types used} for every deployment
+    without an Azure estimate: those the prices window offers), 'current' (the same, token types used in a shown
+    period), 'pending' (Azure estimate, but token days or months without one) and 'uncached_input' (priced from
+    settings, input tokens, no cache tokens: Azure reports cache tokens only for Anthropic deployments, so that input
+    is priced as uncached)."""
     live_estimates, saved_estimates = live_estimates or {}, saved_estimates or {}
     starts = period_starts(now)
     this_month = now.strftime("%Y-%m")
     totals = {p: [0.0, True] for p in starts}
-    lines, names = [], {"unpriced": [], "uncached_input": [], "by_settings": {}, "pending": []}
+    lines = []
+    names = {"unpriced": [], "unpriced_older": [], "uncached_input": [], "by_settings": {}, "current": {},
+             "pending": []}
     for deployment in sorted(set(live) | set(saved_tokens)):
         days = live.get(deployment, {})
         months = {m: v for m, v in (saved_tokens.get(deployment) or {}).items()
@@ -454,8 +477,8 @@ def model_lines(live, saved_tokens, prices, now, live_estimates=None, saved_esti
                 all_time[k] = all_time.get(k, 0) + v
         for k, v in per["month"].items():
             all_time[k] = all_time.get(k, 0) + v
-        if not any(all_time.values()):
-            continue
+        if not any(all_time.values()) and not any(per["week"].values()):
+            continue  # no usage at all (this week can reach into last month, before the history has that month)
         est_days = _amounts(live_estimates.get(deployment), MAX_DAILY_ESTIMATE)
         est_months = _amounts(saved_estimates.get(deployment), 31 * MAX_DAILY_ESTIMATE)
         azure = bool(est_days or est_months)
@@ -492,10 +515,14 @@ def model_lines(live, saved_tokens, prices, now, live_estimates=None, saved_esti
             if not all_complete:
                 names["pending"].append(deployment)
         else:
-            names["by_settings"][deployment] = [m for m in PRICE_FIELD if all_time.get(m)]
-            if estimate(all_time, price) is None:
+            names["by_settings"][deployment] = [m for m in PRICE_FIELD if all_time.get(m) or per["week"].get(m)]
+            current = [m for m in PRICE_FIELD if per["week"].get(m) or per["month"].get(m)]
+            if current:
+                names["current"][deployment] = current
+            if not all(complete for _, complete in amounts.values()):
                 source = "no price"
-                names["unpriced"].append(deployment)
+                shown = not (amounts["week"][1] and amounts["month"][1])  # today is inside both
+                names["unpriced" if shown else "unpriced_older"].append(deployment)
             else:
                 source = "price from settings"
                 if all_time.get("InputTokens") and not any(all_time.get(m) for m in CACHE_METRICS):
@@ -613,7 +640,7 @@ def read(settings):
     unpriced = names["unpriced"]
     tokens_read = resource_id is not None and live is not None
     if tokens_read:  # a failed token read keeps the last list, so today's new deployments stay in the window
-        save_deployments(settings.get("cache_dir"), names["by_settings"])
+        save_deployments(settings.get("cache_dir"), names["by_settings"], names["current"])
     if hist:
         items, invoiced, first_month = invoice_lines(hist, now)
     else:
@@ -631,8 +658,9 @@ def read(settings):
     if first_month:
         details.append(f"All time since {first_month}; invoices checked "
                        f"{time.strftime('%b %d %H:%M', time.localtime(_epoch_seconds(hist.get('fetched'))))}")
-    if unpriced:
-        details.append("Models shown in tokens have no price (≥ = at least): set them under Foundry prices…")
+    if unpriced or names["unpriced_older"]:
+        details.append("(no price): counted in tokens only; with tokens this week or month it makes those totals ≥. "
+                       "Set prices under Foundry prices…")
     if names["pending"]:
         details.append("Some token days or months have no Azure estimate (yet): ≥ = at least")
     if names["uncached_input"]:
@@ -640,5 +668,5 @@ def read(settings):
                        "includes cached input (OpenAI models)")
     details.append("Each total = max(model estimates, invoice); weeks start Monday; days are UTC")
     r = result("MICROSOFT FOUNDRY", rows=rows, details=details)
-    r["unpriced"] = len(unpriced)  # the section's "N models have no price" line (render.section)
+    r["unpriced"] = len(unpriced)  # the section's "N models have no price" line: only those that change a row
     return r

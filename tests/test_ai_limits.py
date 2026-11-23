@@ -1223,7 +1223,8 @@ class FoundrySpend(unittest.TestCase):
         self.assertEqual(lines[0], "m (price from settings): ≈$6.00 · ≈$15.00 · ≈$30.00 · ≈$60.00")
         self.assertIn("old (no price): – · – · – · 2.5K out", lines)
         self.assertIn("unpriced (no price): 7 out · 7 out · 7 out · 7 out", lines)
-        self.assertEqual(names["unpriced"], ["old", "unpriced"])  # every deployment with tokens but no usable price
+        self.assertEqual(names["unpriced"], ["unpriced"])  # tokens in a shown period, no usable price
+        self.assertEqual(names["unpriced_older"], ["old"])  # only earlier tokens: no shown row depends on it
         _, est, names = foundry.model_lines({"m": live["m"]}, {}, prices, self.now)
         self.assertEqual((est["today"], names["unpriced"]), ((6.0, True), []))
 
@@ -1239,6 +1240,24 @@ class FoundrySpend(unittest.TestCase):
         _, _, names = foundry.model_lines(live, {}, prices, self.now, {"plain": {"2031-08-07": 0.5}})
         self.assertEqual(names["uncached_input"], [])  # Azure's own estimate replaces the price from settings
         self.assertEqual(names["unpriced"], ["unpriced"])
+
+    def test_only_models_that_change_a_shown_row_are_counted(self):
+        now = datetime(2031, 8, 1, 12, 0, tzinfo=timezone.utc)  # a Friday: this week began on Monday, July 28
+        live = {"this-month": {"2031-08-01": {"OutputTokens": 10}},
+                "this-week": {"2031-07-29": {"OutputTokens": 20}},  # last month, but this week's row
+                "priced-now": {"2031-08-01": {"InputTokens": 1_000_000, "OutputTokens": 1_000_000}}}
+        saved = {"old-only": {"2031-05": {"OutputTokens": 30}},
+                 "priced-now": {"2031-06": {"ephemeral1hInputTokens": 40}}}  # an old token type without a price
+        prices = {"priced-now": {"input": 1.0, "output": 2.0}}
+        lines, est, names = foundry.model_lines(live, saved, prices, now)
+        self.assertEqual(names["unpriced"], ["this-month", "this-week"])
+        self.assertEqual(names["unpriced_older"], ["old-only", "priced-now"])
+        self.assertEqual((est["today"][1], est["week"][1], est["month"][1]), (False, False, False))
+        self.assertIn("old-only (no price): – · – · – · 30 out", lines)  # Details keeps it, with its tokens
+        self.assertEqual(names["current"], {"this-month": ["OutputTokens"], "this-week": ["OutputTokens"],
+                                            "priced-now": ["InputTokens", "OutputTokens"]})
+        _, est, names = foundry.model_lines({"priced-now": live["priced-now"]}, saved, prices, now)
+        self.assertEqual((est["today"], names["unpriced"]), ((3.0, True), []))  # every shown row is exact
 
     PRICED = {"today": (6.0, True), "week": (15.0, True), "month": (30.0, True)}
 
@@ -1318,7 +1337,17 @@ class FoundrySpend(unittest.TestCase):
             self.assertEqual(render.normalize(r)["unpriced"], count)  # survives the cache
         details = self.read_with(settings, live)["details"]
         self.assertIn("· demo-model (no price): 271.8K out · 271.8K out · 271.8K out · 271.8K out", details)
-        self.assertTrue(any(x.startswith("Models shown in tokens have no price") for x in details))
+        footnote = ("(no price): counted in tokens only; with tokens this week or month it makes those totals ≥. "
+                    "Set prices under Foundry prices…")
+        self.assertIn(footnote, details)
+        self.assertLessEqual(len(footnote), 140)
+        hist = {"monthly": {}, "daily": {}, "currency": "USD", "fetched": time.time(),
+                "tokens": {"old-model": {"2031-05": {"OutputTokens": 3000}}}}
+        r = self.read_with(settings, {"priced-model": live["priced-model"]}, hist=hist)
+        self.assertEqual(r["unpriced"], 0)  # used only in May: no orange line, every row "≈"
+        self.assertEqual({x["label"]: x["value"] for x in r["rows"]}["Today"], "≈$3.00")
+        self.assertIn("· old-model (no price): – · – · – · 3.0K out", r["details"])
+        self.assertIn(footnote, r["details"])
         self.assertFalse(any("uncached" in x for x in details))  # the priced model has no input tokens
         live["priced-model"]["2031-08-07"]["InputTokens"] = 5000
         details = self.read_with(settings, live)["details"]
@@ -1628,6 +1657,21 @@ class FoundryPrices(unittest.TestCase):
             os.remove(path)
             self.assertEqual(foundry.load_deployments(d), {})
         self.assertEqual(foundry.load_deployments(None), {})
+
+    def test_deployments_file_says_which_have_tokens_in_a_shown_period(self):
+        with tempfile.TemporaryDirectory() as d:
+            used = {"demo-model": ["InputTokens", "OutputTokens"], "old-model": ["OutputTokens"]}
+            foundry.save_deployments(d, used, {"demo-model": ["OutputTokens"], "@x": ["OutputTokens"],
+                                               "not-in-used": ["OutputTokens"]})
+            self.assertEqual(foundry.load_deployments(d), used)
+            self.assertEqual(foundry.load_current(d), {"demo-model": ["OutputTokens"]})
+            foundry.save_deployments(d, used, {})
+            self.assertEqual(foundry.load_current(d), {})  # nothing in a shown period
+            foundry.save_deployments(d, used)  # an older file without the part: unknown, not "nothing"
+            self.assertIsNone(foundry.load_current(d))
+            common.write_private_json(d, foundry.DEPLOYMENTS_FILE, {"deployments": used, "current": [1]})
+            self.assertIsNone(foundry.load_current(d))
+        self.assertIsNone(foundry.load_current(None))
 
     def test_read_saves_deployments_only_after_a_token_read(self):
         spend = FoundrySpend("test_period_starts")
@@ -2620,6 +2664,21 @@ class ChoosePrices(unittest.TestCase):
         self.assertIn("Azure reports cache tokens only for Claude models", message)
         rows, _ = self.main.price_rows({"odd": ["OutputTokens"]}, {"odd": "cheap"})
         self.assertEqual(rows, [("odd", "not an object in config.json", ["", "", "", "", ""])])  # Save skips it
+        self.assertIn('Models marked "old usage only" have no tokens this week or month', message)
+
+    def test_models_that_change_no_shown_row_come_last(self):
+        # Only "half" and "priced" have tokens this week or month; the file says so.
+        foundry.save_deployments(self.cache, self.USED, {"half": ["OutputTokens"], "priced": ["OutputTokens"]})
+        self.choose()
+        self.assertEqual(self.shown[0][0], [("priced", "", ["2", "8", "0.2", "", ""]),
+                                            ("alpha-new", "no price · old usage only", ["", "", "", "", ""]),
+                                            ("half", "missing Input · old usage only", ["", "4", "", "", ""]),
+                                            ("Zeta-new", "no price · old usage only", ["", "", "", "", ""])])
+        # "half" used Input this month: then it changes a shown row and comes first.
+        foundry.save_deployments(self.cache, self.USED, {"half": ["InputTokens"]})
+        self.choose()
+        self.assertEqual(self.shown[1][0][0], ("half", "missing Input", ["", "4", "", "", ""]))
+        self.assertEqual(self.shown[1][0][1], ("priced", "", ["2", "8", "0.2", "", ""]))
 
     def test_save_writes_only_changed_fields_in_one_write(self):
         answer = self.typed(["", "5", "", "", ""], [" 1,5 ", "4", "", "", ""], ["", "", "", "", ""],
