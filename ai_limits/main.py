@@ -11,8 +11,8 @@ in its own thread with its own timeout -> cache successful reads -> render.menu(
 
 Nothing is taken from the environment: SwiftBar copies the query parameters of a refresh link, which any web page
 or app can open, into it. It is replaced by a fixed one (common.ENV) before anything else runs, and every switch
-is a command-line argument, which a link can't set (SwiftBar passes none, except the --choose, --show and --config
-that this plugin's own "Providers…" and "Menu bar shows" items ask for):
+is a command-line argument, which a link can't set (SwiftBar passes none, except the --choose, --show, --prices and
+--config that this plugin's own "Providers…", "Menu bar shows" and "Foundry prices…" items ask for):
   --refresh      read every provider again. "Refresh now" is a plain SwiftBar `refresh=true` item; the launcher
                  adds --refresh when SwiftBar reports that click. A cache younger than 60 seconds is still used
                  (a refresh can also be triggered by a link), the cache stays the fallback, and the menu bar keeps
@@ -34,8 +34,19 @@ that this plugin's own "Providers…" and "Menu bar shows" items ask for):
                  is checked again here (a known provider; a limit from render.CHOICE_LABEL), anything else is refused.
                  It then leaves a marker in the cache folder so the refresh SwiftBar starts after the click does not
                  re-read the providers (choosing a number needs no new data).
-                 With --choose, --toggle or --show, the other switches except --config (and --cache for --choose)
-                 are ignored.
+  --prices       show the "Foundry prices…" window (one row of price fields per deployment with tokens that Azure
+                 gives no cost estimate for, from foundry-deployments.json in the cache folder; Save writes
+                 `prices_usd_per_million` in one write) and
+                 print nothing. Like --choose it holds the config folder's lock while open. It then leaves the
+                 marker too, naming Foundry if prices changed: the refresh after the click re-reads Foundry only
+                 (unforced), so its totals use the new prices, and keeps every other provider's values.
+  --set-price DEPLOYMENT FIELD=PRICE [FIELD=PRICE ...]
+                 set prices for one deployment (for the terminal; prints nothing): FIELD is input, output,
+                 cache_read, cache_write_5m or cache_write_1h, PRICE is USD per million tokens as the window takes it
+                 (foundry.parse_price); an empty PRICE removes that field. Anything invalid is refused before the
+                 config file is opened.
+                 With --choose, --toggle, --show, --prices or --set-price, the other switches except --config (and
+                 --cache for --choose and --prices) are ignored.
 """
 import argparse
 import contextlib
@@ -66,7 +77,7 @@ from ai_limits.common import ENV, HOME, NotConfigured, Unavailable, write_privat
 
 os.environ.update(ENV)
 
-from ai_limits.providers import NAMES  # noqa: E402
+from ai_limits.providers import NAMES, foundry  # noqa: E402
 
 CONFIG = os.path.join(ROOT, "config.json")
 EXAMPLE = os.path.join(ROOT, "config.example.json")
@@ -74,8 +85,14 @@ LAUNCHER = os.path.join(ROOT, "plugin", "ai-limits.5m.sh")  # run by the "Provid
 LOCK_SECONDS = 3.0  # --toggle waits at most this long for another change (or an open panel) to finish
 STATE_FILE = "providers-state.json"  # in the cache folder: providers the last menu run found not set up
 STATE_MAX_AGE = 3600.0  # seconds; an older state file gives no "not set up" notes
-KEEP_FILE = "keep-values.json"  # in the cache folder: written by --show, lets the next --refresh run skip re-reading
-KEEP_SECONDS = 10.0  # an older marker counts for nothing
+KEEP_FILE = "keep-values.json"  # in the cache folder: written by --show and --prices, lets the next --refresh run
+KEEP_SECONDS = 10.0  # skip re-reading (all providers, or all but those it names); an older marker counts for nothing
+MAX_PRICE_ROWS = 15  # deployments in the prices window; the others are set with --set-price
+PRICE_HEADINGS = dict(zip(foundry.PRICE_KEYS, ("Input", "Output", "Cache read", "Write 5m", "Write 1h")))
+PRICES_MESSAGE = ("Only models without an Azure cost estimate are listed. US dollars per million tokens; empty means "
+                  "no price. Azure reports cache tokens only for Claude models: for others, all input is priced as "
+                  'Input. Models marked "old usage only" have no tokens this week or month: their price changes only '
+                  "Details.")
 CACHE = os.path.join(HOME, "Library", "Caches", "ai-limits-bar")
 VALID_NAME = re.compile(r"[a-z0-9_]{1,20}")
 REFRESH_FLOOR = 60.0  # seconds: even a forced refresh uses a cache this young
@@ -102,6 +119,8 @@ def parse_args(argv):
     parser.add_argument("--toggle")
     parser.add_argument("--choose", action="store_true")
     parser.add_argument("--show")
+    parser.add_argument("--prices", action="store_true")
+    parser.add_argument("--set-price", nargs="+")
     args, _ = parser.parse_known_args(argv)
     if args.config == "" or args.cache == "":
         parser.error("empty path")
@@ -301,36 +320,196 @@ def set_menu_bar(path, value, create):
         return _change_config_locked(path, create, change)
 
 
-def mark_keep_values(cache):
-    """After --show: SwiftBar re-runs the plugin as a menu-click refresh, which the launcher turns into --refresh,
-    but a new menu bar choice needs no new data. {"time": now} in the cache folder makes that one run use the values
-    already read. An error here only means the refresh is forced, as before."""
+def parse_set_price(values):
+    """--set-price DEPLOYMENT FIELD=PRICE ... -> (deployment, {field: number or None}). The deployment must pass
+    foundry.valid_name (the same rule as the Azure names az gets), each field must be a price key given once, and
+    each price must pass foundry.parse_price (empty: remove the field). Anything else is refused with ArgumentError,
+    before the config file is opened."""
+    usage = "--set-price takes DEPLOYMENT FIELD=PRICE [FIELD=PRICE ...]"
+    if not values or len(values) < 2 or not foundry.valid_name(values[0]):
+        raise ArgumentError(usage)
+    fields = {}
+    for item in values[1:]:
+        key, equals, text = item.partition("=")
+        if not equals or key not in foundry.PRICE_KEYS or key in fields:
+            raise ArgumentError(usage)
+        try:
+            fields[key] = foundry.parse_price(text)
+        except ValueError:
+            raise ArgumentError(usage) from None
+    return values[0], fields
+
+
+def _set_prices_locked(path, changes, create):
+    """set_prices without taking the lock (the caller holds it). Returns whether the file was written."""
+    def change(data):
+        entry = provider_entries(data).get("foundry")
+        if entry is None:
+            return False  # no Foundry entry: nothing to price
+        prices = entry.get("prices_usd_per_million")
+        if prices is None:
+            prices = {}
+        elif not isinstance(prices, dict):
+            return False  # written by hand in another shape: left alone, for the user to fix
+        changed = False
+        for name, fields in changes.items():
+            current = prices.get(name)
+            if not foundry.valid_name(name) or (current is not None and not isinstance(current, dict)):
+                continue
+            new = dict(current or {})  # same key order; a new key goes last
+            for key, value in fields.items():
+                if key not in foundry.PRICE_KEYS:
+                    continue
+                if value is None:
+                    new.pop(key, None)
+                elif foundry.valid_price(value) is not None:
+                    new[key] = value
+            if new == (current or {}):
+                continue
+            if new:
+                prices[name] = new
+            else:
+                del prices[name]  # no price left: the entry goes
+            changed = True
+        if changed:
+            entry["prices_usd_per_million"] = prices  # the same object, or a new one where there was none
+        return changed
+    return _change_config_locked(path, create, change)
+
+
+def set_prices(path, changes, create):
+    """--set-price: writes `prices_usd_per_million` of the Foundry entry with the same lock and writer as set_enabled.
+    changes: {deployment: {field: number | None (= remove)}}. Only the given fields change; a deployment's other keys,
+    the other deployments, their order and every other setting are kept, and a deployment left without any key is
+    removed. No Foundry entry, an unreadable file, or prices in another shape than an object: nothing is written.
+    Raises Busy if the lock can't be had in time. Returns whether the file was written."""
+    target = os.path.realpath(path)
+    with _folder_lock(os.path.dirname(target), LOCK_SECONDS):
+        return _set_prices_locked(path, changes, create)
+
+
+def price_rows(used, prices, current=None):
+    """The prices window's rows [(deployment, note, [five texts])] and how many deployments there were: deployments
+    with tokens and no Azure estimate (`used`: {deployment: token types}), at most MAX_PRICE_ROWS, in three groups,
+    each by name: first those whose missing price makes a shown row `≥` (`current`: token types used today, this
+    week or this month; None: unknown, every deployment counts), then those with a usable price, then those whose
+    missing price concerns only earlier usage. The note says what is missing for the token types used: "" (priced),
+    "no price" or "missing Output, Cache read", with " · old usage only" in the last group; or that the entry in
+    config.json is not an object (Save leaves such an entry alone). The texts are the current prices."""
+    rows = []
+    for name, metrics in used.items():
+        entry = prices.get(name) if isinstance(prices.get(name), dict) else {}
+        unpriced = [m for m in metrics if foundry.valid_price(entry.get(foundry.PRICE_FIELD[m])) is None]
+        missing = [PRICE_HEADINGS[foundry.PRICE_FIELD[m]] for m in unpriced]
+        note = "" if not missing else "no price" if len(missing) == len(metrics) else "missing " + ", ".join(missing)
+        shown = metrics if current is None else current.get(name, [])
+        group = 1 if not unpriced else 0 if set(unpriced) & set(shown) else 2
+        if group == 2:
+            note += " · old usage only"
+        if prices.get(name) is not None and not isinstance(prices.get(name), dict):
+            note = "not an object in config.json"
+        rows.append((group, name.lower(), name, note, [foundry.price_text(entry.get(k)) for k in foundry.PRICE_KEYS]))
+    rows.sort(key=lambda r: r[:2])
+    return [(name, note, texts) for _, _, name, note, texts in rows[:MAX_PRICE_ROWS]], len(rows)
+
+
+def price_changes(rows, original, typed):
+    """({deployment: {field: number | None}} for the fields whose text was changed, the first field that is not a
+    price as "deployment Heading" or None). A field left as it was shown is not touched, so a value the window can't
+    show exactly (or an invalid one, shown empty) stays in config.json as it is."""
+    changes, problem = {}, None
+    for (name, _, _), before, after in zip(rows, original, typed):
+        for key, old, new in zip(foundry.PRICE_KEYS, before, after):
+            if new == old:
+                continue
+            try:
+                changes.setdefault(name, {})[key] = foundry.parse_price(new)
+            except ValueError:
+                problem = problem or f"{name} {PRICE_HEADINGS[key]}"
+    return changes, problem
+
+
+def choose_prices(path, cache, create):
+    """--prices: the "Foundry prices…" window. Like choose(), the config folder's lock is taken at once (a second
+    window exits without doing anything) and held until the window is closed. The rows come from the cache's
+    foundry-deployments.json; no provider is read. Save writes the changed fields with set_prices' writer in one
+    write. A field that is not a price shows the window again, with what was typed and a note, at most five times.
+    An unreadable config, no Foundry entry, Cancel, a timeout or any unexpected output changes nothing. Returns
+    whether the file was written."""
+    target = os.path.realpath(path)
+    try:
+        with _folder_lock(os.path.dirname(target), 0):
+            config, unreadable = load_config(path, create)
+            entry = provider_entries(config).get("foundry")
+            if unreadable or entry is None:
+                return False
+            prices = entry.get("prices_usd_per_million")
+            rows, total = price_rows(foundry.load_deployments(cache), prices if isinstance(prices, dict) else {},
+                                     foundry.load_current(cache))
+            original = [texts for _, _, texts in rows]
+            if not rows:
+                message = ("No model needs a price: Azure estimates the cost of every model with tokens, or none has "
+                           "tokens yet.")
+            elif total > len(rows):
+                message = f"{PRICES_MESSAGE} Showing {len(rows)} of {total}: set the others with --set-price."
+            else:
+                message = PRICES_MESSAGE
+            shown = rows
+            for _ in range(5):
+                code, out, _ = panel.show_prices(shown, message)
+                typed = panel.parse_prices(code, out, len(rows))
+                if typed is None:
+                    return False
+                changes, problem = price_changes(rows, original, typed)
+                if problem is None:
+                    return bool(changes) and _set_prices_locked(path, changes, create)
+                shown = [(name, note, texts) for (name, note, _), texts in zip(rows, typed)]
+                message = f"Not a price: {problem}. Type a number such as 2.5 or 0.075, or leave the field empty."
+            return False
+    except Busy:
+        return False  # a window is already open (or another change is running)
+
+
+def mark_keep_values(cache, read=()):
+    """After --show or --prices: SwiftBar re-runs the plugin as a menu-click refresh, which the launcher turns into
+    --refresh, but the click needs no new data, or new data from one provider only (Foundry after a price change:
+    its cached section was computed with the old prices). {"time": now} in the cache folder, plus {"read": [names]}
+    if `read` names any, makes that one run use the values already read for every other provider. An error here
+    only means the refresh is forced, as before."""
     with contextlib.suppress(Exception):
-        write_private_json(cache, KEEP_FILE, {"time": time.time()})
+        data = {"time": time.time()}
+        if read:
+            data["read"] = sorted(read)
+        write_private_json(cache, KEEP_FILE, data)
 
 
 def keep_values(cache):
-    """For a --refresh run: True if a --show just left a valid marker (a regular file holding a JSON object whose
-    time is a finite number at most KEEP_SECONDS old). This run then shows every provider that has a cached result
-    from that cache, whatever its age, and reads only providers without one, not forced. Whenever a --refresh run looks,
-    the marker is removed, valid or not (a symlinked one is not followed, just removed). The marker can only skip
-    this one re-read; anything unexpected means False, i.e. a forced refresh."""
+    """For a --refresh run: None if there is no valid marker, otherwise the set of providers that must still be read
+    (empty after --show, {"foundry"} after a price change). A valid marker is a regular file holding a JSON object
+    whose time is a finite number at most KEEP_SECONDS old and whose "read", if present, is a list of known provider
+    names. This run then shows every other provider that has a cached result from that cache, whatever its age,
+    and reads the named ones and those without a cached result, not forced. Whenever a --refresh run looks, the
+    marker is removed, valid or not (a symlinked one is not followed, just removed). The marker can only skip this one
+    re-read; anything unexpected means None, i.e. a forced refresh."""
     path = os.path.join(cache, KEEP_FILE)
-    valid = False
+    found = None
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as f:
             if stat.S_ISREG(os.fstat(f.fileno()).st_mode):
                 data = json.loads(f.read(4096))
                 t = data.get("time") if isinstance(data, dict) else None
-                if isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(t):
-                    valid = 0 <= time.time() - t <= KEEP_SECONDS
+                read = data.get("read", []) if isinstance(data, dict) else None
+                if (isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(t)
+                        and 0 <= time.time() - t <= KEEP_SECONDS and isinstance(read, list)
+                        and len(read) <= len(NAMES) and all(valid_name(n) for n in read)):
+                    found = set(read)
     except Exception:
-        valid = False  # missing, a symlink (not followed), unreadable or not JSON
+        found = None  # missing, a symlink (not followed), unreadable or not JSON
     with contextlib.suppress(OSError):
         if os.path.lexists(path):
             os.remove(path)
-    return valid
+    return found
 
 
 def save_state(cache, not_set_up):
@@ -418,14 +597,25 @@ def main(argv=None):
         # the click and its refresh both use the default cache folder; --cache only matters for tests and terminals.
         mark_keep_values(cache)
         return  # nothing is printed: the click's refresh=true re-runs the plugin for the new menu
+    if args.prices:
+        written = choose_prices(config_path, cache, create=not args.config)
+        mark_keep_values(cache, ("foundry",) if written else ())  # Foundry's totals need the new prices
+        return  # nothing is printed: the click's refresh=true re-runs the plugin for the new menu
+    if args.set_price is not None:
+        deployment, fields = parse_set_price(args.set_price)  # may refuse
+        set_prices(config_path, {deployment: fields}, create=not args.config)
+        return
     config, config_error = load_config(config_path, create=not args.config)
     force, forced, skip = args.refresh, _names(args.fail), _names(args.skip)
-    keep = False  # right after a --show: show the new choice from the cached values, whatever their age
+    # Right after a --show or --prices: the cached values, whatever their age, except for providers named in the
+    # marker (re-read, unforced) and those without a cached result.
+    keep, reread = False, set()
     if force:
         try:
-            keep = keep_values(cache)
+            marker = keep_values(cache)
         except Exception:
-            keep = False
+            marker = None
+        keep, reread = marker is not None, marker or set()
         force = not keep
     debug_shapes = config.get("debug_shapes") is True
 
@@ -443,7 +633,8 @@ def main(argv=None):
         if force:
             fresh_for = REFRESH_FLOOR
         age = now - cached["time"] if cached and cached.get("time") else None
-        if name not in forced and cached and (keep or (age is not None and 0 <= age < fresh_for)):
+        fresh = age is not None and 0 <= age < fresh_for
+        if name not in forced and name not in reread and cached and (keep or fresh):
             results[name] = cached  # fresh enough, or kept for the menu bar choice (render marks stale percents)
         else:
             timeout = _number(p.get("timeout_seconds"), 15, 1, 120)

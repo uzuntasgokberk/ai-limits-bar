@@ -1,11 +1,13 @@
 """Offline tests: rendering rules, safety of menu output, provider parsing and the plugin's failure paths.
 
-Run: python3 -I tests/test_ai_limits.py   (add --gui for the two tests that open the Providers… window)
+Run: python3 -I tests/test_ai_limits.py   (add --gui for the tests that open the Providers… and prices windows)
 No test may reach a real provider. Two structural guards enforce it: setUpModule replaces every way a provider
 module reaches the outside (its subprocess, HTTP and tool-lookup functions, and the home-folder paths it reads) with
 a guard, and load_main() replaces main.call with one, so a test that wants provider data installs its own fake; a
-guard raises RealProviderRead, which no `except Exception` in the plugin can swallow. Every run of the plugin as a
-process goes through run_launcher(), which skips all providers except those forced to fail.
+guard raises RealProviderRead, which no `except Exception` in the plugin can swallow. The windows' osascript call
+(panel.run) is guarded the same way; only the opt-in --gui tests put the real one back. Every run of the plugin as a
+process goes through run_launcher(), which skips all providers except those forced to fail and refuses the window
+switches.
 The default run opens no window and needs no Keychain, network or ~/Library/Caches; it runs on any macOS with
 Python 3.9 or later (CI: GitHub's macOS runner, with the system Python and the latest Python). Time limits are
 generous for slow machines but always shorter than the wrong behaviour they rule out.
@@ -65,7 +67,7 @@ def provider_guard(where):
 # and the guard is back when their patch ends). common's own functions stay real: the loopback tests use them.
 GUARDED_CALLS = [(claude, "run"), (claude, "https_json"), (codex, "find_tool"), (copilot, "run"),
                  (copilot, "find_tool"), (foundry, "run"), (foundry, "find_tool"), (gemini, "https_json"),
-                 (gemini, "localhost_json")]
+                 (gemini, "localhost_json"), (panel, "run")]  # panel.run: a real window
 _GUARD_HOME = tempfile.TemporaryDirectory()
 
 
@@ -92,10 +94,12 @@ def run_launcher(args, *, config, cache, env=None, command=(PLUGIN,), allow_real
     """The only way tests start the plugin as a process. --skip is added LAST, so it wins over a --skip the test
     passed itself, and skips every provider except those the test forces to fail with --fail (main.call raises for
     them before any provider code runs). allow_real_providers=True is the explicit opt-out; no test uses it.
-    --config and --cache must be inside the temporary folder."""
+    --config and --cache must be inside the temporary folder. --choose and --prices are refused: in a process the
+    window guard does not hold, so they would open a real window."""
     temp = os.path.realpath(tempfile.gettempdir())
     for path in (config, cache):
         assert os.path.realpath(path).startswith(temp + os.sep), f"not a temporary path: {path}"
+    assert not {"--choose", "--prices"} & set(args), "a window switch: test it in-process with a fake window"
     argv = [*command, "--config", config, "--cache", cache, *args]
     if not allow_real_providers:
         failing = set()
@@ -242,6 +246,25 @@ class Render(unittest.TestCase):
         text = render.menu([("foundry", res("FOUNDRY", [row("This month", value="$3.40")]))], NOW)
         self.assertIn("This month  $3.40", text)
         self.assertNotIn("%", text.split("\n", 1)[1])
+
+    def test_foundry_says_how_many_models_have_no_price(self):
+        rows = [row("Today", value="≥$3.00"), row("This month", value="≥$9.00"), row("All time", value="≥$9.50")]
+        for count, text in ((1, "1 model has no price (see Details)"), (2, "2 models have no price (see Details)")):
+            r = render.normalize(dict(res("MICROSOFT FOUNDRY", rows), unpriced=count))
+            lines = top_level(render.menu([("foundry", r)], NOW))
+            line = next(x for x in lines if x.split(" | ")[0] == text)
+            self.assertLess(lines.index(next(x for x in lines if x.startswith("All time"))), lines.index(line))
+            self.assertLess(lines.index(line), lines.index(next(x for x in lines if x.startswith("Details"))))
+            self.assertEqual(swiftbar_params(line), {"size": "12", "color": render.ORANGE,
+                                                     "href": render.LINKS["foundry"]})
+        tooltip = swiftbar_params(render.menu([("foundry", r)], NOW).splitlines()[0])["tooltip"]
+        self.assertEqual(tooltip, "Foundry ≥$3.00")  # the tooltip still reads the first row
+        for count in (0, None, "2", True, -1, 2.5, float("nan"), 10**6):
+            r = render.normalize(dict(res("MICROSOFT FOUNDRY", rows), unpriced=count))
+            self.assertIn(r["unpriced"], (0, None), repr(count))
+            self.assertNotIn("no price", render.menu([("foundry", r)], NOW), repr(count))
+        other = render.normalize(dict(res("GITHUB COPILOT", [row("AI credits", 26.0)]), unpriced=3))
+        self.assertNotIn("no price", render.menu([("copilot", other)], NOW))  # a Foundry line only
 
     def test_refresh_item_runs_no_command(self):
         lines = render.menu([], NOW, True, "/tmp/config.json").splitlines()
@@ -584,6 +607,77 @@ class MenuBarChoice(unittest.TestCase):
         self.assertIsNone(render.choice_param("evil", "5-hour"))
 
 
+class PricesMenu(unittest.TestCase):
+    """The "Foundry prices…" item and the clickable "no price" line in the Foundry section."""
+
+    LAUNCHER = "/Users/demo/ai-limits-bar/plugin/ai-limits.5m.sh"
+    STATE = [(n, True) for n in NAMES]
+
+    @staticmethod
+    def foundry(unpriced=2):
+        return render.normalize(dict(res("MICROSOFT FOUNDRY", [row("Today", value="≥$3.00")]), unpriced=unpriced))
+
+    def menu(self, results=None, launcher=LAUNCHER, toggle_config=None, config_error=False, providers=STATE):
+        results = [("foundry", self.foundry())] if results is None else results
+        return render.menu(results, NOW, True, "/Users/demo/config.json", config_error, providers, launcher,
+                           toggle_config)
+
+    def action(self, config=None):
+        params = {"bash": self.LAUNCHER, "param1": "--prices", "terminal": "false", "refresh": "true"}
+        if config:
+            params.update(param2="--config", param3=config)
+        return params
+
+    @staticmethod
+    def find(text, title):
+        found = [x for x in menu_lines(text) if x.split(" | ")[0] == title]
+        assert len(found) == 1, (title, found)
+        return found[0]
+
+    def test_item_opens_the_window_through_the_launcher(self):
+        text = self.menu()
+        lines = menu_lines(text)
+        item = self.find(text, render.PRICES_ITEM)
+        self.assertEqual(swiftbar_params(item), self.action())
+        chooser_end = max(i for i, x in enumerate(lines) if x.startswith("--Highest of all"))
+        self.assertLess(chooser_end, lines.index(item))  # after Providers… and the Menu bar shows submenu
+        self.assertLess(lines.index(item), next(i for i, x in enumerate(lines) if x.startswith("Open settings")))
+        line = self.find(text, "2 models have no price: set prices…")
+        self.assertEqual(swiftbar_params(line), {"size": "12", "color": render.ORANGE, **self.action()})
+        self.assertIn(line, top_level(text))  # in the section itself, not in Details
+        config = "/Users/demo/My Folder/it's (a) $test.json"
+        custom = self.menu(toggle_config=config)
+        self.assertEqual(swiftbar_params(self.find(custom, render.PRICES_ITEM)), self.action(config))
+        one = self.menu([("foundry", self.foundry(1))])
+        self.assertEqual(swiftbar_params(self.find(one, "1 model has no price: set prices…"))["param1"], "--prices")
+
+    def test_only_with_a_foundry_section(self):
+        copilot = [("copilot", render.normalize(res("GITHUB COPILOT", [row("AI credits", 26.0)])))]
+        for text in (self.menu(copilot), self.menu([]), self.menu(providers=None)):
+            self.assertNotIn(render.PRICES_ITEM, text)
+        self.assertNotIn("set prices", self.menu(providers=None))  # no launcher data: the line keeps its link
+        self.assertIn(render.PRICES_ITEM, self.menu([("foundry", self.foundry(0))]))  # all priced: still editable
+        self.assertNotIn("no price", self.menu([("foundry", self.foundry(0))]))
+
+    def test_refused_paths_or_unreadable_config_leave_no_action(self):
+        launchers = ['/x/a" bash=/bin/sh x="', "/x/a\nb", "plugin/x.sh", None, "/Users/demo/ai;limits/x.sh"]
+        cases = [dict(launcher=x) for x in launchers] + [dict(toggle_config='/tmp/c" bash=/bin/sh x="'),
+                                                         dict(config_error=True)]
+        for case in cases:
+            text = self.menu(**case)
+            self.assertEqual(self.find(text, render.PRICES_ITEM), render.PRICES_ITEM, case)
+            line = self.find(text, "2 models have no price (see Details)")
+            self.assertEqual(swiftbar_params(line), {"size": "12", "color": render.ORANGE,
+                                                     "href": render.LINKS["foundry"]}, case)
+            self.assertFalse(any("bash=/bin/sh" in x for x in menu_lines(text)), case)
+
+    def test_window_action_is_fixed(self):
+        self.assertIsNone(render.window_action("--show", self.LAUNCHER))
+        self.assertIsNone(render.window_action("--prices x", self.LAUNCHER))
+        self.assertEqual(render.window_action("--choose", self.LAUNCHER),
+                         [f'bash="{self.LAUNCHER}"', "param1=--choose", "terminal=false", "refresh=true"])
+
+
 class Panel(unittest.TestCase):
     """The panel's pure parts: its argument list and the strict parsing of its output. No window is opened."""
 
@@ -628,6 +722,52 @@ class Panel(unittest.TestCase):
         for failure in (subprocess.TimeoutExpired("osascript", 600), OSError("missing")):
             with mock.patch.object(panel, "run", side_effect=failure):
                 self.assertEqual(panel.show(self.ROWS), (1, "", ""))
+
+    PRICE_ROWS = [("demo-model", "no price", ["", "", "", "", ""]),
+                  ("other-model", "", ["1.25", "10", "0.125", "3.75", ""])]
+
+    def test_prices_script_is_fixed_and_data_are_arguments(self):
+        nasty = [("x'); $.NSTask.launch(); ('", "\n\"\\`${x}", ["' + run() + '", "1", "", "", " "])]
+        plain = panel.price_arguments(self.PRICE_ROWS, "Demo message")
+        hostile = panel.price_arguments(nasty, "'); evil(); ('")
+        self.assertEqual(plain[:5], ["/usr/bin/osascript", "-l", "JavaScript", "-e", panel.PRICES_SCRIPT])
+        self.assertIs(hostile[4], panel.PRICES_SCRIPT)  # byte-identical whatever the input
+        self.assertEqual(hostile[5:], ["panel", "'); evil(); ('", "x'); $.NSTask.launch(); ('", "\n\"\\`${x}",
+                                       "' + run() + '", "1", "", "", " "])
+        self.assertEqual(plain[5:], ["panel", "Demo message", "demo-model", "no price", "", "", "", "", "",
+                                     "other-model", "", "1.25", "10", "0.125", "3.75", ""])
+        self.assertEqual(panel.price_arguments([], "No rows")[5:], ["panel", "No rows"])
+        with self.assertRaises(ValueError):
+            panel.price_arguments(self.PRICE_ROWS, "x", "anything")
+        with self.assertRaises(ValueError):
+            panel.price_arguments([("demo-model", "", ["1", "2"])], "x")  # five prices per row
+        self.assertNotIn("argv[", panel.PRICES_SCRIPT.split("function run(argv)")[0])  # no code before run()
+        self.assertEqual(panel.PRICE_COLUMNS, len(foundry.PRICE_KEYS))
+        self.assertIn("var headings = ['Input', 'Output', 'Cache read', 'Write 5m', 'Write 1h'];", panel.PRICES_SCRIPT)
+
+    def test_prices_output_is_parsed_strictly(self):
+        good = json.dumps([["1,5", "", "", "", ""], ["1.25", "10", "0.125", "3.75", ""]])
+        self.assertEqual(panel.parse_prices(0, good + "\n", 2), json.loads(good))
+        self.assertEqual(panel.parse_prices(0, good, 2), json.loads(good))
+        self.assertEqual(panel.parse_prices(0, '[["anything typed", "", "", "", ""]]', 1)[0][0], "anything typed")
+        for code, out, count in [(1, good, 2), (0, "cancel\n", 2), (0, "", 2), (0, "\n", 2), (0, "[]", 2),
+                                 (0, good, 1), (0, good, 3),                                # wrong number of rows
+                                 (0, good + "\n#active=true\n", 2), (0, good + "\n\n", 2),  # extra lines
+                                 (0, " " + good, 2), (0, '{"a": 1}', 1), (0, "[1]", 1), (0, "[[1, 2, 3, 4, 5]]", 1),
+                                 (0, '[["", "", "", ""]]', 1), (0, '[["", "", "", "", "", ""]]', 1),
+                                 (0, json.dumps([["x" * 41, "", "", "", ""]]), 1), (0, "[NaN]", 1),
+                                 (0, "[[", 1), (0, None, 1), (-9, "", 0), (0, "cancel", 0)]:
+            self.assertIsNone(panel.parse_prices(code, out, count), repr((code, out, count)))
+
+    def test_show_prices_runs_osascript_without_a_shell(self):
+        with mock.patch.object(panel, "run", return_value=(0, "cancel\n", "")) as run:
+            self.assertEqual(panel.show_prices(self.PRICE_ROWS, "Demo"), (0, "cancel\n", ""))
+        argv, = run.call_args.args
+        self.assertEqual(argv, panel.price_arguments(self.PRICE_ROWS, "Demo"))
+        self.assertEqual(run.call_args.kwargs, {"timeout": panel.TIMEOUT})
+        for failure in (subprocess.TimeoutExpired("osascript", 600), OSError("missing")):
+            with mock.patch.object(panel, "run", side_effect=failure):
+                self.assertEqual(panel.show_prices(self.PRICE_ROWS, "Demo"), (1, "", ""))
 
 
 # ---- common -----------------------------------------------------------------------------------------------
@@ -1055,6 +1195,19 @@ class FoundrySpend(unittest.TestCase):
         self.assertEqual(foundry.meter_item("y - example-units", "Claude in Microsoft Foundry (Example hosted)"),
                          "Claude (Example hosted)")
         self.assertEqual(foundry.meter_item("Operations", "Example Service"), "Example Service")
+        # Long-context meters name the same model as short-context ones (two spellings each).
+        for meter in ("9.1-demo LongCo Inp Std Gl 1M Tokens", "9.1-demo LoCo Opt Std Gl 1M Tokens",
+                      "9.1-demo ShCo Cd Inp Flex Gl 1M Tokens", "9.1-demo ShortCo Opt PP DZ 1M Tokens"):
+            self.assertEqual(foundry.meter_item(meter, "Azure OpenAI GPT9"), "9.1-demo", meter)
+
+    def test_meter_items_of_other_publishers_fall_back_to_the_service(self):
+        # A made-up third publisher sold by Azure: the subcategory names the model family, readable and short.
+        for meter, sub in (("Demo-Chat-V3 Inp glbl 1M Tokens", "Azure Demo Models"),
+                           ("demo-mini-2 Outp DZ 1M Tokens", "Azure Demo Models")):
+            self.assertEqual(foundry.meter_item(meter, sub), "Azure Demo Models")
+        self.assertEqual(foundry.meter_item("x", "Demo Partner Models | bash=/bin/sh " + "y" * 60),
+                         "Demo Partner Models | bash=/bin/sh yyyyy")  # cut to 40; render.clean makes it safe
+        self.assertEqual(foundry.meter_item("", ""), "Other")
 
     def test_model_lines_four_periods_and_history(self):
         prices = {"m": {"input": 0, "output": 3.0}}
@@ -1063,13 +1216,145 @@ class FoundrySpend(unittest.TestCase):
                 "unpriced": {"2031-08-07": {"OutputTokens": 7}}}
         saved = {"m": {"2031-07": {"OutputTokens": 10_000_000}, "2031-08": {"OutputTokens": 333}},  # month ignored
                  "old": {"2031-05": {"OutputTokens": 2500}}}
-        lines, est = foundry.model_lines(live, saved, prices, self.now)
+        lines, est, names = foundry.model_lines(live, saved, prices, self.now)
         self.assertEqual(est["today"], (6.0, False))  # unpriced deployment used today -> "at least"
         self.assertEqual(est["week"][0], 15.0)        # Monday Aug 4 .. Aug 7
         self.assertEqual(est["month"][0], 30.0)
-        self.assertEqual(lines[0], "m: ≈$6.00 · ≈$15.00 · ≈$30.00 · ≈$60.00")
-        self.assertIn("old: – · – · – · 2.5K out", lines)
-        self.assertIn("unpriced: 7 out · 7 out · 7 out · 7 out", lines)
+        self.assertEqual(lines[0], "m (price from settings): ≈$6.00 · ≈$15.00 · ≈$30.00 · ≈$60.00")
+        self.assertIn("old (no price): – · – · – · 2.5K out", lines)
+        self.assertIn("unpriced (no price): 7 out · 7 out · 7 out · 7 out", lines)
+        self.assertEqual(names["unpriced"], ["unpriced"])  # tokens in a shown period, no usable price
+        self.assertEqual(names["unpriced_older"], ["old"])  # only earlier tokens: no shown row depends on it
+        _, est, names = foundry.model_lines({"m": live["m"]}, {}, prices, self.now)
+        self.assertEqual((est["today"], names["unpriced"]), ((6.0, True), []))
+
+    def test_priced_input_without_cache_reads_is_named(self):
+        prices = {p: {"input": 2.0, "output": 8.0, "cache_read": 0.2} for p in ("plain", "cached", "no-input")}
+        live = {"plain": {"2031-08-07": {"InputTokens": 900, "OutputTokens": 50}},
+                "cached": {"2031-08-07": {"InputTokens": 900, "cacheReadInputTokens": 9000, "OutputTokens": 50}},
+                "no-input": {"2031-08-07": {"OutputTokens": 50}},
+                "unpriced": {"2031-08-07": {"InputTokens": 900}}}
+        _, _, names = foundry.model_lines(live, {}, prices, self.now)
+        # Azure reports cache tokens for Claude deployments only: elsewhere all input is priced as uncached input.
+        self.assertEqual(names["uncached_input"], ["plain"])
+        _, _, names = foundry.model_lines(live, {}, prices, self.now, {"plain": {"2031-08-07": 0.5}})
+        self.assertEqual(names["uncached_input"], [])  # Azure's own estimate replaces the price from settings
+        self.assertEqual(names["unpriced"], ["unpriced"])
+
+    def test_only_models_that_change_a_shown_row_are_counted(self):
+        now = datetime(2031, 8, 1, 12, 0, tzinfo=timezone.utc)  # a Friday: this week began on Monday, July 28
+        live = {"this-month": {"2031-08-01": {"OutputTokens": 10}},
+                "this-week": {"2031-07-29": {"OutputTokens": 20}},  # last month, but this week's row
+                "priced-now": {"2031-08-01": {"InputTokens": 1_000_000, "OutputTokens": 1_000_000}}}
+        saved = {"old-only": {"2031-05": {"OutputTokens": 30}},
+                 "priced-now": {"2031-06": {"ephemeral1hInputTokens": 40}}}  # an old token type without a price
+        prices = {"priced-now": {"input": 1.0, "output": 2.0}}
+        lines, est, names = foundry.model_lines(live, saved, prices, now)
+        self.assertEqual(names["unpriced"], ["this-month", "this-week"])
+        self.assertEqual(names["unpriced_older"], ["old-only", "priced-now"])
+        self.assertEqual((est["today"][1], est["week"][1], est["month"][1]), (False, False, False))
+        self.assertIn("old-only (no price): – · – · – · 30 out", lines)  # Details keeps it, with its tokens
+        self.assertEqual(names["current"], {"this-month": ["OutputTokens"], "this-week": ["OutputTokens"],
+                                            "priced-now": ["InputTokens", "OutputTokens"]})
+        _, est, names = foundry.model_lines({"priced-now": live["priced-now"]}, saved, prices, now)
+        self.assertEqual((est["today"], names["unpriced"]), ((3.0, True), []))  # every shown row is exact
+
+    PRICED = {"today": (6.0, True), "week": (15.0, True), "month": (30.0, True)}
+
+    @staticmethod
+    def spend(est, invoiced=None, tokens_read=True, budget=None):
+        return {r["label"]: r["value"] for r in foundry.spend_rows(est, invoiced, tokens_read, budget, "USD")}
+
+    def test_spend_rows_are_exact_only_when_every_used_model_is_priced(self):
+        nothing = {"today": 0.0, "week": 0.0, "month": 0.0, "earlier": 5.0}
+        self.assertEqual(self.spend(self.PRICED, nothing), {"Today": "≈$6.00", "This week": "≈$15.00",
+                                                            "This month": "≈$30.00", "All time": "≈$35.00"})
+        # The reported case: a new deployment without a price. 0 estimated versus 0 invoiced is not exact.
+        unpriced = {p: (0.0, False) for p in ("today", "week", "month")}
+        self.assertEqual(self.spend(unpriced, dict(nothing, earlier=0.0)),
+                         {"Today": "≥$0.00", "This week": "≥$0.00", "This month": "≥$0.00", "All time": "≥$0.00"})
+        # An invoice larger than the estimate may still lack the unpriced usage (it arrives hours to days late).
+        late = {"today": 2.5, "week": 2.5, "month": 40.0, "earlier": 5.0}
+        self.assertEqual(self.spend(unpriced, late),
+                         {"Today": "≥$2.50", "This week": "≥$2.50", "This month": "≥$40.00", "All time": "≥$45.00"})
+        # Unpriced tokens only earlier this month: today and this week stay exact; the month and all time don't.
+        earlier = {"today": (1.0, True), "week": (15.0, True), "month": (30.0, False)}
+        self.assertEqual(self.spend(earlier, late),
+                         {"Today": "≈$2.50", "This week": "≈$15.00", "This month": "≥$40.00", "All time": "≥$45.00"})
+        self.assertEqual(self.spend(self.PRICED), {"Today": "≈$6.00", "This week": "≈$15.00", "This month": "≈$30.00",
+                                                   "All time": "waiting for Azure Cost Management"})
+
+    def test_spend_rows_without_token_metrics_are_at_least(self):
+        late = {"today": 2.5, "week": 2.5, "month": 40.0, "earlier": 5.0}
+        # Token metrics not read (failed, or no `resource`): the invoice alone, which is late, and estimates ignored.
+        self.assertEqual(self.spend(self.PRICED, late, tokens_read=False),
+                         {"Today": "≥$2.50", "This week": "≥$2.50", "This month": "≥$40.00", "All time": "≥$45.00"})
+        self.assertEqual(self.spend(self.PRICED, None, tokens_read=False), {"Spend": "unknown"})
+
+    def test_spend_rows_budget_keeps_the_sign(self):
+        unpriced = {p: (0.0, False) for p in ("today", "week", "month")}
+        month = foundry.spend_rows(unpriced, {"today": 0.0, "week": 0.0, "month": 25.0, "earlier": 0.0}, True, 100.0,
+                                   "USD")[2]
+        self.assertEqual((month["label"], month["percent"], month["value"]),
+                         ("This month", 25.0, "≥$25.00 / $100.00"))
+        priced = foundry.spend_rows(self.PRICED, None, True, 100.0, "USD")[2]
+        self.assertEqual((priced["percent"], priced["value"]), (30.0, "≈$30.00 / $100.00"))
+
+    def read_with(self, settings, tokens, estimates=None, hist=None):
+        """foundry.read with Azure replaced: az answers the subscription and resource id, the token metrics are
+        `tokens`, Azure's estimated cost is `estimates` (None: that query fails), the invoice history is `hist`, and
+        today is self.now."""
+        now = self.now
+
+        class FixedNow(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+        answers = iter(["demo-subscription",
+                        "/subscriptions/demo/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/demo"])
+        with mock.patch.object(foundry, "find_tool", return_value="/opt/homebrew/bin/az"), \
+                mock.patch.object(foundry, "_az", side_effect=lambda *a, **k: next(answers)), \
+                mock.patch.object(foundry, "_tokens", return_value=tokens), \
+                mock.patch.object(foundry, "_estimates", side_effect=[estimates if estimates is not None
+                                                                      else RuntimeError("az failed")]) as fake, \
+                mock.patch.object(foundry, "history", return_value=hist), \
+                mock.patch.object(foundry, "datetime", FixedNow):
+            r = foundry.read(settings)
+        self.estimate_calls = fake.call_count
+        return r
+
+    def test_read_marks_unpriced_usage_and_counts_it(self):
+        live = {"demo-model": {"2031-08-07": {"InputTokens": 900, "OutputTokens": 271_800}},
+                "priced-model": {"2031-08-07": {"OutputTokens": 1_000_000}}}
+        settings = {"resource_group": "demo-rg", "resource": "demo-resource",
+                    "prices_usd_per_million": {"priced-model": {"input": 1.0, "output": 3.0}}}
+        for tokens, expected, count in ((live, "≥$3.00", 1), ({"priced-model": live["priced-model"]}, "≈$3.00", 0)):
+            r = self.read_with(settings, tokens)
+            values = {x["label"]: x["value"] for x in r["rows"]}
+            self.assertEqual([values[k] for k in ("Today", "This week", "This month", "All time")],
+                             [expected, expected, expected, "waiting for Azure Cost Management"])
+            self.assertEqual(r["unpriced"], count)
+            self.assertEqual(render.normalize(r)["unpriced"], count)  # survives the cache
+        details = self.read_with(settings, live)["details"]
+        self.assertIn("· demo-model (no price): 271.8K out · 271.8K out · 271.8K out · 271.8K out", details)
+        footnote = ("(no price): counted in tokens only; with tokens this week or month it makes those totals ≥. "
+                    "Set prices under Foundry prices…")
+        self.assertIn(footnote, details)
+        self.assertLessEqual(len(footnote), 140)
+        hist = {"monthly": {}, "daily": {}, "currency": "USD", "fetched": time.time(),
+                "tokens": {"old-model": {"2031-05": {"OutputTokens": 3000}}}}
+        r = self.read_with(settings, {"priced-model": live["priced-model"]}, hist=hist)
+        self.assertEqual(r["unpriced"], 0)  # used only in May: no orange line, every row "≈"
+        self.assertEqual({x["label"]: x["value"] for x in r["rows"]}["Today"], "≈$3.00")
+        self.assertIn("· old-model (no price): – · – · – · 3.0K out", r["details"])
+        self.assertIn(footnote, r["details"])
+        self.assertFalse(any("uncached" in x for x in details))  # the priced model has no input tokens
+        live["priced-model"]["2031-08-07"]["InputTokens"] = 5000
+        details = self.read_with(settings, live)["details"]
+        caveat = [x for x in details if "uncached" in x]
+        self.assertEqual(caveat, ["Priced from settings, without cache tokens: all input is priced as uncached, too "
+                                  "high if it includes cached input (OpenAI models)"])
+        self.assertLessEqual(len(caveat[0]), 140)  # render.section's limit for a detail line
 
     def test_invoice_lines(self):
         hist = {"currency": "USD",
@@ -1137,7 +1422,8 @@ class FoundrySpend(unittest.TestCase):
         for failure in (Killed(), RuntimeError("az failed")):
             with tempfile.TemporaryDirectory() as d, \
                     mock.patch.object(foundry, "_invoices", side_effect=lambda *a: json.loads(json.dumps(invoices))), \
-                    mock.patch.object(foundry, "_tokens", side_effect=failure):
+                    mock.patch.object(foundry, "_tokens", side_effect=failure), \
+                    mock.patch.object(foundry, "_estimates", side_effect=RuntimeError("az failed")):
                 self.save(d, fetched=0, tokens=old_tokens)
                 with contextlib.suppress(Killed):
                     self.history(d, resource_id=resource)
@@ -1148,7 +1434,8 @@ class FoundrySpend(unittest.TestCase):
         recent = {"my-deployment": {"2031-08-05": {"OutputTokens": 9}}}
         with tempfile.TemporaryDirectory() as d, \
                 mock.patch.object(foundry, "_invoices", side_effect=lambda *a: json.loads(json.dumps(invoices))), \
-                mock.patch.object(foundry, "_tokens", return_value=recent):
+                mock.patch.object(foundry, "_tokens", return_value=recent), \
+                mock.patch.object(foundry, "_estimates", return_value={}):
             self.save(d, fetched=0, tokens=old_tokens)
             self.history(d, resource_id=resource)
             merged = common.read_json(os.path.join(d, foundry.HISTORY_FILE))["tokens"]
@@ -1158,6 +1445,246 @@ class FoundrySpend(unittest.TestCase):
         for bad in ("yesterday", None, True, float("nan"), float("inf"), 1e30, -5):
             self.assertEqual(foundry._epoch_seconds(bad), 0.0)
         self.assertEqual(foundry._epoch_seconds(1.9e9), 1.9e9)
+
+
+def metrics_answer(series):
+    """What `az monitor metrics list -o json` answers: series = {(metric, deployment): {'YYYY-MM-DD': total}}."""
+    found = {}
+    for (metric, deployment), points in series.items():
+        m = found.setdefault(metric, {"name": {"value": metric, "localizedValue": metric}, "timeseries": []})
+        m["timeseries"].append({"metadatavalues": [{"name": {"value": "modeldeploymentname"}, "value": deployment}],
+                                "data": [{"timeStamp": f"{day}T00:00:00Z", "total": t} for day, t in points.items()]})
+    return {"value": list(found.values())}
+
+
+class FoundryEstimates(unittest.TestCase):
+    """Azure's own estimated cost per deployment (FoundryModelEstimatedCost, preview) and how it combines with prices
+    from settings. All names are made up: "demo-model" stands for a model Azure estimates, "cache-model" for one with
+    cache metrics (as Anthropic deployments have), "partner-…" for a third publisher."""
+
+    TODAY = {"2031-08-07": {"InputTokens": 4_000_000, "OutputTokens": 500_000}}
+
+    def setUp(self):
+        self.now = datetime(2031, 8, 7, 12, 0, tzinfo=timezone.utc)
+        self.spend = FoundrySpend("test_period_starts")
+        self.spend.setUp()
+
+    def test_estimate_query_and_values_that_are_no_data(self):
+        answer = metrics_answer({
+            ("FoundryModelEstimatedCost", "demo-model"): {"2031-08-07": 4.25, "2031-08-06": 2.5, "2031-08-05": None,
+                                                          "2031-08-04": 0},
+            ("FoundryModelEstimatedCost", "odd-model"): {"2031-08-07": -1.0, "2031-08-06": float("nan"),
+                                                         "2031-08-05": "7", "2031-08-04": True, "2031-08-03": 5e6,
+                                                         "2031-08-02": float("inf")}})
+        start = datetime(2031, 8, 1, tzinfo=timezone.utc)
+        with mock.patch.object(foundry, "_az", return_value=answer) as az:
+            self.assertEqual(foundry._estimates("az", "/subscriptions/demo/x", start, self.now),
+                             {"demo-model": {"2031-08-07": 4.25, "2031-08-06": 2.5}})
+        argv = az.call_args.args[1]
+        self.assertEqual(argv[argv.index("--metrics") + 1:argv.index("--aggregation")], ["FoundryModelEstimatedCost"])
+        self.assertEqual(argv[argv.index("--filter") + 1], "ModelDeploymentName eq '*'")
+        for broken in ({}, {"value": []}, {"value": [{"name": {"value": "x"}}]}):
+            with mock.patch.object(foundry, "_az", return_value=broken):
+                self.assertEqual(foundry._estimates("az", "/x", start, self.now), {}, broken)
+
+    def test_token_points_that_are_not_counts_are_skipped(self):
+        answer = metrics_answer({("OutputTokens", "demo-model"): {"2031-08-07": 50, "2031-08-06": "x",
+                                                                  "2031-08-05": float("nan"), "2031-08-04": -3}})
+        with mock.patch.object(foundry, "_az", return_value=answer):
+            self.assertEqual(foundry._tokens("az", "/x", datetime(2031, 8, 1, tzinfo=timezone.utc), self.now),
+                             {"demo-model": {"2031-08-07": {"OutputTokens": 50}}})
+
+    def test_azure_estimate_wins_over_a_price_from_settings(self):
+        live = {"demo-model": {"2031-08-07": {"InputTokens": 9_000_000, "OutputTokens": 100_000},
+                               "2031-08-05": {"InputTokens": 1_000_000}}}
+        estimates = {"demo-model": {"2031-08-07": 3.25, "2031-08-05": 1.5}}
+        prices = {"demo-model": {"input": 2.0, "output": 10.0}}  # tokens x price would be $19.00 today
+        lines, est, names = foundry.model_lines(live, {}, prices, self.now, estimates)
+        self.assertEqual((est["today"], est["week"], est["month"]), ((3.25, True), (4.75, True), (4.75, True)))
+        self.assertEqual(lines, ["demo-model (Azure estimate): ≈$3.25 · ≈$4.75 · ≈$4.75 · ≈$4.75"])
+        self.assertEqual((names["unpriced"], names["by_settings"], names["pending"]), ([], {}, []))
+
+    def test_a_deployment_with_cache_metrics_and_a_price_is_unchanged(self):
+        live = {"cache-model": {"2031-08-07": {"InputTokens": 1000, "cacheReadInputTokens": 1_000_000,
+                                               "ephemeral5mInputTokens": 100_000, "OutputTokens": 200_000}}}
+        prices = {"cache-model": {"input": 3, "output": 15, "cache_read": 0.3, "cache_write_5m": 3.75}}
+        lines, est, names = foundry.model_lines(live, {}, prices, self.now, {"demo-model": {"2031-08-07": 1.0}})
+        self.assertEqual(est["today"][1], True)
+        self.assertAlmostEqual(est["today"][0], 0.003 + 0.3 + 0.375 + 3.0)
+        self.assertEqual(lines, ["cache-model (price from settings): ≈$3.68 · ≈$3.68 · ≈$3.68 · ≈$3.68"])
+        self.assertEqual(names["by_settings"], {"cache-model": ["InputTokens", "OutputTokens", "cacheReadInputTokens",
+                                                                "ephemeral5mInputTokens"]})
+
+    def test_a_third_publisher_in_each_state(self):
+        live = {"partner-a": self.TODAY, "partner-b": self.TODAY, "partner-c": self.TODAY}
+        estimates = {"partner-a": {"2031-08-07": 1.2}}           # Azure estimates it
+        prices = {"partner-b": {"input": 0.5, "output": 1.5}}    # no estimate, a price from settings: $2.75
+        lines, est, names = foundry.model_lines(live, {}, prices, self.now, estimates)  # partner-c: neither
+        self.assertEqual(lines, ["partner-b (price from settings): ≈$2.75 · ≈$2.75 · ≈$2.75 · ≈$2.75",
+                                 "partner-a (Azure estimate): ≈$1.20 · ≈$1.20 · ≈$1.20 · ≈$1.20",
+                                 "partner-c (no price): 500.0K out · 500.0K out · 500.0K out · 500.0K out"])
+        self.assertEqual(est["today"], (3.95, False))
+        self.assertEqual(names["unpriced"], ["partner-c"])
+        self.assertEqual(list(names["by_settings"]), ["partner-b", "partner-c"])  # what the prices window lists
+
+    def test_token_days_without_an_azure_estimate_are_at_least(self):
+        live = {"demo-model": {"2031-08-07": {"OutputTokens": 50_000}, "2031-08-06": {"OutputTokens": 70_000}}}
+        prices = {"demo-model": {"output": 10.0}}  # never used for a deployment that Azure estimates
+        lines, est, names = foundry.model_lines(live, {}, prices, self.now, {"demo-model": {"2031-08-06": 2.0}})
+        self.assertEqual((est["today"], est["week"]), ((0.0, False), (2.0, False)))  # today's estimate not there yet
+        self.assertEqual(lines, ["demo-model (Azure estimate): 50.0K out · ≥$2.00 · ≥$2.00 · ≥$2.00"])
+        self.assertEqual((names["pending"], names["unpriced"], names["by_settings"]), (["demo-model"], [], {}))
+        # Known from the saved history alone (this run's estimate query failed): still not priced from settings.
+        lines, est, names = foundry.model_lines(live, {}, prices, self.now, {}, {"demo-model": {"2031-07": 30.0}})
+        self.assertEqual((est["today"], names["unpriced"]), ((0.0, False), []))
+        self.assertEqual(lines, ["demo-model (Azure estimate): 50.0K out · 120.0K out · 120.0K out · ≥$30.00"])
+
+    def test_all_time_adds_saved_monthly_estimates_and_ignores_garbage(self):
+        live = {"demo-model": {"2031-08-07": {"OutputTokens": 5}}}
+        saved_tokens = {"demo-model": {"2031-07": {"OutputTokens": 9}, "2031-05": {"OutputTokens": 4}}}
+        saved_estimates = {"demo-model": {"2031-07": 4.5, "2031-08": 99.0, "2031-06": "x", "2031-04": -2.0,
+                                          "2031-03": float("nan"), "2031-02": 5e9}, "other": "garbage"}
+        lines, _, names = foundry.model_lines(live, saved_tokens, {}, self.now, {"demo-model": {"2031-08-07": 1.0}},
+                                              saved_estimates)
+        # This month comes from the live query; May has tokens but no estimate, so all time is "at least".
+        self.assertEqual(lines, ["demo-model (Azure estimate): ≈$1.00 · ≈$1.00 · ≈$1.00 · ≥$5.50"])
+        self.assertEqual(names["pending"], ["demo-model"])
+        lines, _, _ = foundry.model_lines(live, {"demo-model": {"2031-07": {"OutputTokens": 9}}}, {}, self.now,
+                                          {"demo-model": {"2031-08-07": 1.0}}, {"demo-model": {"2031-07": 4.5}})
+        self.assertEqual(lines, ["demo-model (Azure estimate): ≈$1.00 · ≈$1.00 · ≈$1.00 · ≈$5.50"])
+
+    def test_history_keeps_monthly_estimates(self):
+        invoices = {"monthly": {"Example Service": {"2031-08": 0.75}}, "daily": {}, "currency": "USD"}
+        resource = "/subscriptions/demo/resourceGroups/rg/providers/x/accounts/demo"
+        recent = {"demo-model": {"2031-08-05": 1.25, "2031-08-06": 2.0, "2031-07-30": 0.5}}
+        for answer, expected in ((recent, {"demo-model": {"2031-04": 3.0, "2031-07": 0.5, "2031-08": 3.25}}),
+                                 (RuntimeError("az failed"), {"demo-model": {"2031-04": 3.0}})):
+            with tempfile.TemporaryDirectory() as d, \
+                    mock.patch.object(foundry, "_invoices", side_effect=lambda *a: json.loads(json.dumps(invoices))), \
+                    mock.patch.object(foundry, "_tokens", return_value={}), \
+                    mock.patch.object(foundry, "_estimates", side_effect=[answer]):  # returned, or raised
+                self.spend.save(d, fetched=0, estimates={"demo-model": {"2031-04": 3.0}})
+                hist = self.spend.history(d, resource_id=resource)
+                on_disk = common.read_json(os.path.join(d, foundry.HISTORY_FILE))
+            self.assertEqual(on_disk["estimates"], expected, repr(answer))
+            self.assertEqual(hist["estimates"], expected)
+        with tempfile.TemporaryDirectory() as d:
+            self.spend.save(d, fetched=time.time(), estimates=[1, 2])  # a broken part of a saved file
+            self.assertEqual(foundry.history(None, "sub", "rg", None, d, 6, False, self.now)["estimates"], {})
+
+    def test_read_uses_the_estimate_and_lists_only_models_that_need_a_price(self):
+        live = {"demo-model": {"2031-08-07": {"InputTokens": 9_000_000, "OutputTokens": 100_000}},
+                "cache-model": {"2031-08-07": {"InputTokens": 1000, "cacheReadInputTokens": 1_000_000,
+                                               "OutputTokens": 100_000}},
+                "partner-c": self.TODAY}
+        prices = {"demo-model": {"input": 2.0, "output": 10.0},
+                  "cache-model": {"input": 3, "output": 15, "cache_read": 0.3}}  # 0.003 + 0.3 + 1.5
+        with tempfile.TemporaryDirectory() as d:
+            settings = {"resource_group": "demo-rg", "resource": "demo-resource", "cache_dir": d,
+                        "prices_usd_per_million": prices}
+            r = self.spend.read_with(settings, live, {"demo-model": {"2031-08-07": 3.5}})
+            values = {x["label"]: x["value"] for x in r["rows"]}
+            self.assertEqual(values["Today"], "≥$5.30")  # 3.50 + 1.80; partner-c has no price
+            self.assertEqual(r["unpriced"], 1)
+            self.assertIn("· demo-model (Azure estimate): ≈$3.50 · ≈$3.50 · ≈$3.50 · ≈$3.50", r["details"])
+            self.assertEqual(sorted(foundry.load_deployments(d)), ["cache-model", "partner-c"])  # not demo-model
+            # The estimate query fails (preview metric, or none on this resource): prices from settings, no error.
+            r = self.spend.read_with(settings, live, None)
+            self.assertEqual({x["label"]: x["value"] for x in r["rows"]}["Today"], "≥$20.80")  # 19.00 + 1.80
+            self.assertIn("· demo-model (price from settings): ≈$19.00 · ≈$19.00 · ≈$19.00 · ≈$19.00", r["details"])
+            # The token query fails: the estimate query is not even tried, and every row is "at least".
+            r = self.spend.read_with(settings, None, {"demo-model": {"2031-08-07": 3.5}})
+            self.assertEqual(self.spend.estimate_calls, 0)
+            self.assertEqual({x["label"]: x["value"] for x in r["rows"]}, {"Spend": "unknown"})
+        details = self.spend.read_with(dict(settings, cache_dir=None), {"demo-model": live["demo-model"]},
+                                       {})["details"]
+        self.assertFalse(any("Azure estimate" in x for x in details[2:]))  # no data: back to the price from settings
+        self.assertIn("Each total = max(model estimates, invoice); weeks start Monday; days are UTC", details)
+
+
+class FoundryPrices(unittest.TestCase):
+    """Prices typed in the window or with --set-price, and the deployments file the window reads."""
+
+    def test_parse_price(self):
+        for text, value in (("2", 2), ("2.5", 2.5), ("2,5", 2.5), ("0.075", 0.075), (" 3 ", 3), (".5", 0.5),
+                            (",5", 0.5), ("0", 0), ("10000", 10000), ("0.000001", 0.000001), ("007", 7)):
+            parsed = foundry.parse_price(text)
+            self.assertEqual(parsed, value, text)
+            self.assertIs(type(parsed), type(value), text)  # whole numbers stay int
+        for text in ("", " ", "\t"):
+            self.assertIsNone(foundry.parse_price(text), repr(text))  # empty: no price
+        for text in ("nan", "NaN", "inf", "Infinity", "1e3", "1E3", "1_0", "-1", "+1", "１", "١", "1.2.3", "10001",
+                     "10000.5", "1.1234567", "abc", "1,000.5", "$1", "1 000", "5.", "0x1", "1\n", " 1",
+                     "123456", None, 5):
+            with self.assertRaises(ValueError, msg=repr(text)):
+                foundry.parse_price(text)
+
+    def test_prices_above_the_bound_are_no_price(self):
+        self.assertEqual(foundry.valid_price(10000), 10000.0)
+        for bad in (10000.01, -0.01, float("nan"), float("inf"), True, "2", None):
+            self.assertIsNone(foundry.valid_price(bad), repr(bad))
+        tokens = {"OutputTokens": 1_000_000}
+        self.assertEqual(foundry.estimate(tokens, {"output": 10000}), 10000.0)
+        self.assertIsNone(foundry.estimate(tokens, {"output": 20000}))  # a typo-sized price counts as none
+
+    def test_price_text(self):
+        for value, text in ((2, "2"), (2.0, "2"), (2.5, "2.5"), (0.075, "0.075"), (10000, "10000"), (0, "0"),
+                            (1e-7, "0"), (-1, ""), ("2", ""), (None, ""), (float("nan"), ""), (True, "")):
+            self.assertEqual(foundry.price_text(value), text, repr(value))
+
+    def test_deployments_file_round_trip_and_checks(self):
+        with tempfile.TemporaryDirectory() as d:
+            used = {"demo-model": ["InputTokens", "OutputTokens"], "other.model_2": ["cacheReadInputTokens"],
+                    "@~/x": ["OutputTokens"], "?": ["OutputTokens"], "a b": ["OutputTokens"]}
+            foundry.save_deployments(d, used)
+            path = os.path.join(d, foundry.DEPLOYMENTS_FILE)
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+            saved = common.read_json(path)
+            self.assertEqual(sorted(saved), ["deployments", "time"])
+            self.assertEqual(saved["deployments"], {"demo-model": ["InputTokens", "OutputTokens"],
+                                                    "other.model_2": ["cacheReadInputTokens"]})  # no amounts
+            self.assertEqual(foundry.load_deployments(d), saved["deployments"])
+            common.write_private_json(d, foundry.DEPLOYMENTS_FILE, {"deployments": {
+                "demo-model": ["OutputTokens", "evil", 5, "InputTokens"], "-x": ["OutputTokens"], "x" * 91: [],
+                "ok-model": "OutputTokens", "fine": []}})
+            self.assertEqual(foundry.load_deployments(d), {"demo-model": ["InputTokens", "OutputTokens"], "fine": []})
+            for broken in ([1], "x", {"deployments": [1]}, {"deployments": "demo-model"}, {}):
+                common.write_private_json(d, foundry.DEPLOYMENTS_FILE, broken)
+                self.assertEqual(foundry.load_deployments(d), {}, broken)
+            many = {f"model-{i:03d}": ["OutputTokens"] for i in range(80)}
+            foundry.save_deployments(d, many)
+            self.assertEqual(len(foundry.load_deployments(d)), foundry.MAX_DEPLOYMENTS)
+            os.remove(path)
+            self.assertEqual(foundry.load_deployments(d), {})
+        self.assertEqual(foundry.load_deployments(None), {})
+
+    def test_deployments_file_says_which_have_tokens_in_a_shown_period(self):
+        with tempfile.TemporaryDirectory() as d:
+            used = {"demo-model": ["InputTokens", "OutputTokens"], "old-model": ["OutputTokens"]}
+            foundry.save_deployments(d, used, {"demo-model": ["OutputTokens"], "@x": ["OutputTokens"],
+                                               "not-in-used": ["OutputTokens"]})
+            self.assertEqual(foundry.load_deployments(d), used)
+            self.assertEqual(foundry.load_current(d), {"demo-model": ["OutputTokens"]})
+            foundry.save_deployments(d, used, {})
+            self.assertEqual(foundry.load_current(d), {})  # nothing in a shown period
+            foundry.save_deployments(d, used)  # an older file without the part: unknown, not "nothing"
+            self.assertIsNone(foundry.load_current(d))
+            common.write_private_json(d, foundry.DEPLOYMENTS_FILE, {"deployments": used, "current": [1]})
+            self.assertIsNone(foundry.load_current(d))
+        self.assertIsNone(foundry.load_current(None))
+
+    def test_read_saves_deployments_only_after_a_token_read(self):
+        spend = FoundrySpend("test_period_starts")
+        spend.setUp()
+        live = {"demo-model": {"2031-08-07": {"InputTokens": 900, "OutputTokens": 50}}}
+        with tempfile.TemporaryDirectory() as d:
+            settings = {"resource_group": "demo-rg", "resource": "demo-resource", "cache_dir": d}
+            spend.read_with(settings, live)
+            self.assertEqual(foundry.load_deployments(d), {"demo-model": ["InputTokens", "OutputTokens"]})
+            spend.read_with(settings, None)  # the token read failed: the last list stays
+            self.assertEqual(foundry.load_deployments(d), {"demo-model": ["InputTokens", "OutputTokens"]})
+            spend.read_with(dict(settings, resource=None), {})  # no `resource`: no token metrics, nothing written
+            self.assertEqual(foundry.load_deployments(d), {"demo-model": ["InputTokens", "OutputTokens"]})
 
 
 # ---- main.py in this process ------------------------------------------------------------------------------
@@ -1220,6 +1747,16 @@ class ProviderGuard(unittest.TestCase):
         self.assertTrue(codex.SESSIONS.startswith(_GUARD_HOME.name))
         m = load_main()
         self.assertTrue(m.CACHE.startswith(_GUARD_HOME.name) and m.CONFIG.startswith(_GUARD_HOME.name))
+
+    def test_no_test_opens_a_real_window(self):
+        with self.assertRaisesRegex(RealProviderRead, "panel.run"):
+            panel.show([("claude", "Claude", True, "")])
+        with self.assertRaisesRegex(RealProviderRead, "panel.run"):
+            panel.show_prices([("demo-model", "", ["", "", "", "", ""])], "x")
+        with tempfile.TemporaryDirectory() as d:
+            for switch in ("--choose", "--prices"):
+                with self.assertRaises(AssertionError):
+                    run_launcher([switch], config=os.path.join(d, "config.json"), cache=os.path.join(d, "c"))
 
     def test_every_process_run_goes_through_run_launcher(self):
         with open(os.path.abspath(__file__), encoding="utf-8") as f:
@@ -1961,12 +2498,362 @@ class Choose(unittest.TestCase):
         self.assertEqual(self.shown[0][2][2], True)  # the panel showed the example's state
 
 
+class SetPrice(unittest.TestCase):
+    """--set-price and the prices writer, on temporary config files only (every call passes --config)."""
+
+    TEXT = ('{"providers": [{"name": "claude", "enabled": true}, {"name": "foundry", "enabled": true, '
+            '"resource_group": "demo-rg", "prices_usd_per_million": {"old-model": {"input": 3, "output": 15, '
+            '"cache_read": 0.3, "cache_write_5m": 3.75, "note": "kept"}, "other": {"output": 1.5}}, '
+            '"timeout_seconds": 60}], "debug_shapes": false}')
+
+    def setUp(self):
+        self.main = load_main()
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.dir = os.path.join(folder.name, "settings")
+        os.mkdir(self.dir)
+        self.cache = os.path.join(folder.name, "cache")
+        self.config = os.path.join(self.dir, "config.json")
+        self.write(self.TEXT)
+
+    def write(self, text):
+        with open(self.config, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def read(self):
+        with open(self.config, encoding="utf-8") as f:
+            return f.read()
+
+    def prices(self):
+        return json.loads(self.read())["providers"][1].get("prices_usd_per_million")
+
+    def set_price(self, *values):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.main.main(["--set-price", *values, "--config", self.config, "--cache", self.cache])
+        self.assertEqual(out.getvalue(), "")  # prints nothing
+        self.assertFalse([x for x in os.listdir(self.dir) if x.endswith(".tmp")])
+        self.assertFalse(os.path.exists(self.cache))  # no marker, no cache file: it reads nothing
+        return self.read()
+
+    def test_new_deployment_and_merge_keep_everything_else(self):
+        self.set_price("demo-model", "input=1.25", "output=10", "cache_read=0,125")
+        data = json.loads(self.read())
+        self.assertEqual(list(data), ["providers", "debug_shapes"])
+        foundry_entry = data["providers"][1]
+        self.assertEqual(list(foundry_entry), ["name", "enabled", "resource_group", "prices_usd_per_million",
+                                               "timeout_seconds"])
+        self.assertEqual(foundry_entry["prices_usd_per_million"], {
+            "old-model": {"input": 3, "output": 15, "cache_read": 0.3, "cache_write_5m": 3.75, "note": "kept"},
+            "other": {"output": 1.5}, "demo-model": {"input": 1.25, "output": 10, "cache_read": 0.125}})
+        self.set_price("old-model", "output=12.5", "cache_write_1h=6")
+        self.assertEqual(list(self.prices()), ["old-model", "other", "demo-model"])  # order kept
+        self.assertEqual(list(self.prices()["old-model"].items()),
+                         [("input", 3), ("output", 12.5), ("cache_read", 0.3), ("cache_write_5m", 3.75),
+                          ("note", "kept"), ("cache_write_1h", 6)])  # the cache-write and unknown keys survive
+        lines = self.read().splitlines()
+        self.assertEqual(lines[:2], ["{", '  "providers": ['])  # still the one-provider-per-line format
+        self.assertTrue(lines[3].startswith('    {"name": "foundry", "enabled": true,'))
+
+    def test_empty_price_removes_a_field_and_an_empty_entry(self):
+        self.set_price("other", "output=")
+        self.assertNotIn("other", self.prices())
+        self.set_price("old-model", "input=", "cache_write_5m=")
+        self.assertEqual(self.prices()["old-model"], {"output": 15, "cache_read": 0.3, "note": "kept"})
+        self.write(self.TEXT)
+        with mock.patch.object(self.main, "_write_atomic") as writes:
+            self.set_price("old-model", "input=3", "output=15.0")  # same values: nothing to write
+            self.set_price("never-priced", "input=")
+        writes.assert_not_called()
+
+    def test_refusals_write_nothing(self):
+        for values in (["demo-model"], ["@~/x", "input=1"], ["-x", "input=1"], ["a b", "input=1"],
+                       ["demo-model", "input"], ["demo-model", "price=1"], ["demo-model", "Input=1"],
+                       ["demo-model", "input=1", "input=2"], ["demo-model", "input=nan"],
+                       ["demo-model", "input=inf"], ["demo-model", "input=-1"], ["demo-model", "input=1e3"],
+                       ["demo-model", "input=10001"], ["demo-model", "input=1_0"], ["demo-model", "output=１"]):
+            with self.assertRaises(self.main.ArgumentError, msg=values):
+                self.set_price(*values)
+            self.assertEqual(self.read(), self.TEXT, values)
+
+    def test_nothing_is_written_without_a_place_for_prices(self):
+        for text in ("{not json", "[1]", '{"providers": [{"name": "claude", "enabled": true}]}',
+                     '{"providers": [{"name": "foundry", "prices_usd_per_million": [1, 2]}]}',
+                     '{"providers": [{"name": "foundry", "prices_usd_per_million": {"demo-model": "cheap"}}]}'):
+            self.write(text)
+            self.assertEqual(self.set_price("demo-model", "input=1"), text)
+        self.write('{"providers": [{"name": "foundry", "enabled": false, "prices_usd_per_million": null}]}')
+        self.set_price("demo-model", "output=2")
+        self.assertEqual(self.prices_of_first(), {"demo-model": {"output": 2}})
+        self.write('{"providers": [{"name": "foundry", "enabled": false}]}')
+        self.set_price("demo-model", "output=2")
+        self.assertEqual(self.prices_of_first(), {"demo-model": {"output": 2}})
+
+    def prices_of_first(self):
+        return json.loads(self.read())["providers"][0]["prices_usd_per_million"]
+
+    def test_busy_lock_fails_fast(self):
+        lock = os.open(self.dir, os.O_RDONLY)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)  # a window is open
+            with mock.patch.object(self.main, "LOCK_SECONDS", 0.2), self.assertRaises(self.main.Busy):
+                self.set_price("demo-model", "input=1")
+        finally:
+            os.close(lock)
+        self.assertEqual(self.read(), self.TEXT)
+
+
+class ChoosePrices(unittest.TestCase):
+    """--prices with the window replaced by a fake: no window is opened. Always a temp --config and --cache."""
+
+    TEXT = ('{"providers": [{"name": "claude", "enabled": true}, {"name": "foundry", "enabled": true, '
+            '"prices_usd_per_million": {"priced": {"input": 2, "output": 8, "cache_read": 0.2, "x": 1}, '
+            '"half": {"output": 4}}}], "debug_shapes": false}')
+    USED = {"priced": ["InputTokens", "OutputTokens", "cacheReadInputTokens"], "half": ["InputTokens", "OutputTokens"],
+            "Zeta-new": ["InputTokens", "OutputTokens"], "alpha-new": ["OutputTokens"]}
+
+    def setUp(self):
+        self.main = load_main()
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.dir = os.path.join(folder.name, "settings")
+        os.mkdir(self.dir)
+        self.cache = os.path.join(folder.name, "cache")
+        self.config = os.path.join(self.dir, "config.json")
+        self.marker = os.path.join(self.cache, self.main.KEEP_FILE)
+        with open(self.config, "w") as f:
+            f.write(self.TEXT)
+        foundry.save_deployments(self.cache, self.USED)
+        self.shown = []
+
+    def choose(self, *answers, side_effect=None):
+        """Runs --prices; the fake window records (rows, message) and gives the answers in turn (code, stdout)."""
+        queue = list(answers) or [(0, "cancel\n")]
+
+        def fake(rows, message, mode="panel", timeout=None):
+            self.shown.append((rows, message))
+            if side_effect:
+                side_effect()
+            code, out = queue.pop(0) if queue else (0, "cancel\n")
+            return code, out, ""
+        out = io.StringIO()
+        with mock.patch.object(panel, "show_prices", side_effect=fake), contextlib.redirect_stdout(out):
+            self.main.main(["--prices", "--config", self.config, "--cache", self.cache])
+        self.assertEqual(out.getvalue(), "")  # prints nothing
+        self.assertFalse([x for x in os.listdir(self.dir) if x.endswith(".tmp")])
+        with open(self.config) as f:
+            return f.read()
+
+    @staticmethod
+    def typed(*rows):
+        return 0, json.dumps([list(r) for r in rows]) + "\n"
+
+    def marker_data(self):
+        with open(self.marker, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_rows_unpriced_first_with_notes_and_current_prices(self):
+        self.choose()
+        rows, message = self.shown[0]
+        self.assertEqual(rows, [("alpha-new", "no price", ["", "", "", "", ""]),
+                                ("half", "missing Input", ["", "4", "", "", ""]),
+                                ("Zeta-new", "no price", ["", "", "", "", ""]),
+                                ("priced", "", ["2", "8", "0.2", "", ""])])
+        self.assertEqual(message, self.main.PRICES_MESSAGE)
+        self.assertTrue(message.startswith("Only models without an Azure cost estimate are listed."), message)
+        self.assertIn("Azure reports cache tokens only for Claude models", message)
+        rows, _ = self.main.price_rows({"odd": ["OutputTokens"]}, {"odd": "cheap"})
+        self.assertEqual(rows, [("odd", "not an object in config.json", ["", "", "", "", ""])])  # Save skips it
+        self.assertIn('Models marked "old usage only" have no tokens this week or month', message)
+
+    def test_models_that_change_no_shown_row_come_last(self):
+        # Only "half" and "priced" have tokens this week or month; the file says so.
+        foundry.save_deployments(self.cache, self.USED, {"half": ["OutputTokens"], "priced": ["OutputTokens"]})
+        self.choose()
+        self.assertEqual(self.shown[0][0], [("priced", "", ["2", "8", "0.2", "", ""]),
+                                            ("alpha-new", "no price · old usage only", ["", "", "", "", ""]),
+                                            ("half", "missing Input · old usage only", ["", "4", "", "", ""]),
+                                            ("Zeta-new", "no price · old usage only", ["", "", "", "", ""])])
+        # "half" used Input this month: then it changes a shown row and comes first.
+        foundry.save_deployments(self.cache, self.USED, {"half": ["InputTokens"]})
+        self.choose()
+        self.assertEqual(self.shown[1][0][0], ("half", "missing Input", ["", "4", "", "", ""]))
+        self.assertEqual(self.shown[1][0][1], ("priced", "", ["2", "8", "0.2", "", ""]))
+
+    def test_save_writes_only_changed_fields_in_one_write(self):
+        answer = self.typed(["", "5", "", "", ""], [" 1,5 ", "4", "", "", ""], ["", "", "", "", ""],
+                            ["2", "", "0.2", "", ""])  # priced: output cleared
+        with mock.patch.object(self.main, "_write_atomic", wraps=self.main._write_atomic) as writes:
+            text = self.choose(answer)
+        self.assertEqual(writes.call_count, 1)
+        prices = json.loads(text)["providers"][1]["prices_usd_per_million"]
+        self.assertEqual(prices, {"priced": {"input": 2, "cache_read": 0.2, "x": 1},
+                                  "half": {"output": 4, "input": 1.5}, "alpha-new": {"output": 5}})
+        self.assertEqual(self.marker_data()["read"], ["foundry"])  # the click's refresh re-reads Foundry only
+        self.assertEqual(len(self.shown), 1)
+
+    def test_unchanged_fields_keep_values_the_window_cannot_show(self):
+        with open(self.config, "w") as f:
+            f.write('{"providers": [{"name": "foundry", "enabled": true, "prices_usd_per_million": '
+                    '{"priced": {"input": 1e-7, "output": "eight", "cache_read": 20000}}}]}')
+        self.choose()
+        rows = self.shown[0][0]
+        self.assertIn(("priced", "missing Output, Cache read", ["0", "", "", "", ""]), rows)  # 1e-7 shows as 0
+        answer = self.typed(*[["0", "", "", "", "1"] if r[0] == "priced" else r[2] for r in rows])
+        text = self.choose(answer)
+        self.assertEqual(json.loads(text)["providers"][0]["prices_usd_per_million"]["priced"],
+                         {"input": 1e-7, "output": "eight", "cache_read": 20000, "cache_write_1h": 1})
+
+    def test_invalid_text_shows_the_window_again(self):
+        rest = (["", "4", "", "", ""], ["", "", "", "", ""], ["2", "8", "0.2", "", ""])  # as shown
+        bad = self.typed(["abc", "5", "", "", ""], *rest)
+        fixed = self.typed(["1", "5", "", "", ""], *rest)
+        text = self.choose(bad, fixed)
+        self.assertEqual(len(self.shown), 2)
+        rows, message = self.shown[1]
+        self.assertEqual(rows[0], ("alpha-new", "no price", ["abc", "5", "", "", ""]))  # what was typed
+        self.assertEqual(message, "Not a price: alpha-new Input. Type a number such as 2.5 or 0.075, or leave the "
+                                  "field empty.")
+        self.assertEqual(json.loads(text)["providers"][1]["prices_usd_per_million"]["alpha-new"],
+                         {"input": 1, "output": 5})
+        self.shown.clear()
+        with mock.patch.object(self.main, "_write_atomic") as writes:
+            self.assertEqual(self.choose(*[bad] * 6), text)
+        writes.assert_not_called()
+        self.assertEqual(len(self.shown), 5)  # then it gives up without a change
+
+    def test_cancel_and_bad_answers_change_nothing(self):
+        good = self.typed(["1", "", "", "", ""], ["", "4", "", "", ""], ["", "", "", "", ""], ["2", "8", "0.2", "", ""])
+        for answer in [(0, "cancel\n"), (1, good[1]), (0, good[1] + "#active=true\n"), (0, "garbage"), (0, ""),
+                       (0, json.dumps([["1", "", "", "", ""]]))]:
+            with mock.patch.object(self.main, "_write_atomic") as writes:
+                self.assertEqual(self.choose(answer), self.TEXT, answer)
+            writes.assert_not_called()
+            self.assertNotIn("read", self.marker_data())  # nothing changed: the refresh keeps every value
+        with mock.patch.object(self.main, "_write_atomic") as writes:
+            self.choose(self.typed(*[r[2] for r in self.shown[0][0]]))  # Save without a change
+        writes.assert_not_called()
+
+    def test_no_window_without_a_readable_config_or_a_foundry_entry(self):
+        for text in ("{not json", "[1]", '{"providers": [{"name": "claude", "enabled": true}]}'):
+            with open(self.config, "w") as f:
+                f.write(text)
+            self.assertEqual(self.choose(self.typed(["1", "", "", "", ""])), text)
+        self.assertEqual(self.shown, [])
+
+    def test_no_deployments_yet_and_too_many(self):
+        os.remove(os.path.join(self.cache, foundry.DEPLOYMENTS_FILE))
+        self.assertEqual(self.choose(), self.TEXT)
+        self.assertEqual(self.shown[0][0], [])
+        self.assertEqual(self.shown[0][1], "No model needs a price: Azure estimates the cost of every model with "
+                                           "tokens, or none has tokens yet.")
+        foundry.save_deployments(self.cache, {f"model-{i:02d}": ["OutputTokens"] for i in range(20)})
+        self.choose()
+        rows, message = self.shown[1]
+        self.assertEqual(len(rows), self.main.MAX_PRICE_ROWS)
+        self.assertTrue(message.endswith("Showing 15 of 20: set the others with --set-price."))
+
+    def test_second_window_exits_at_once_and_toggle_fails_fast_meanwhile(self):
+        lock = os.open(self.dir, os.O_RDONLY)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)  # a window is already open
+            start = time.monotonic()
+            self.assertEqual(self.choose(self.typed(["1", "", "", "", ""])), self.TEXT)
+            self.assertLess(time.monotonic() - start, 2.0)
+        finally:
+            os.close(lock)
+        self.assertEqual(self.shown, [])
+        attempts = []
+
+        def toggle_meanwhile():
+            with mock.patch.object(self.main, "LOCK_SECONDS", 0.2):
+                try:
+                    self.main.toggle(self.config, "claude", False)
+                except self.main.Busy:
+                    attempts.append("busy")
+        self.choose(side_effect=toggle_meanwhile)
+        self.assertEqual(attempts, ["busy"])
+
+
+class PricesRefresh(unittest.TestCase):
+    """After a price change, the click's refresh re-reads Foundry (unforced) and keeps every other provider."""
+
+    def setUp(self):
+        self.main = load_main()
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.cache = os.path.join(folder.name, "cache")
+        self.config = os.path.join(folder.name, "config.json")
+        with open(self.config, "w") as f:
+            json.dump({"providers": [{"name": "claude", "enabled": True}, {"name": "foundry", "enabled": True}]}, f)
+        self.calls = []
+
+        def fake(name, settings, forced):
+            self.calls.append((name, settings["force"]))
+            return {"title": name.upper(), "status": "ok", "details": [], "note": None, "time": time.time(),
+                    "rows": [row("Today", value="≈$9.00")]}
+        self.main.call = fake
+        self.write_caches()
+
+    def write_caches(self):
+        """Older than the 60 s refresh floor, younger than refresh_minutes."""
+        for name in ("claude", "foundry"):
+            common.write_private_json(self.cache, f"{name}.json", {
+                "title": name.upper(), "status": "ok", "details": [], "note": None, "time": time.time() - 120,
+                "rows": [row("Today", value="≥$1.00")]})
+
+    def refresh(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.main.main(["--refresh", "--config", self.config, "--cache", self.cache])
+        return out.getvalue()
+
+    def test_only_foundry_is_read_again(self):
+        self.main.mark_keep_values(self.cache, ("foundry",))
+        text = self.refresh()
+        self.assertEqual(self.calls, [("foundry", False)])  # not a forced refresh: its invoice history is kept
+        self.assertIn("≈$9.00", text)
+        self.assertIn("≥$1.00", text)  # Claude: the value already read
+        self.assertFalse(os.path.exists(os.path.join(self.cache, self.main.KEEP_FILE)))
+
+    def test_a_bad_read_list_means_a_forced_refresh(self):
+        for read in ("foundry", ["evil"], [5], ["foundry"] * 6, None, {"foundry": 1}):
+            self.calls.clear()
+            self.write_caches()
+            common.write_private_json(self.cache, self.main.KEEP_FILE, {"time": time.time(), "read": read})
+            self.refresh()
+            self.assertEqual(sorted(self.calls), [("claude", True), ("foundry", True)], read)
+
+
 @unittest.skipUnless("--gui" in sys.argv, "opens a window: run with --gui")
 class PanelOnScreen(unittest.TestCase):
-    """Opt-in (python3 -I tests/test_ai_limits.py --gui): the real panel, which closes itself after a second."""
+    """Opt-in (python3 -I tests/test_ai_limits.py --gui): the real windows, which close themselves after a second."""
 
     ROWS = [(n, render.HEADERS[n], n in ("claude", "gemini", "copilot"), render.NOT_SET_UP if n == "copilot" else "")
             for n in NAMES]
+    PRICE_ROWS = [("demo-model", "no price", ["", "", "", "", ""]),
+                  ("other-model", "", ["1.25", "10", "0.125", "", ""])]
+
+    def setUp(self):
+        real = mock.patch.object(panel, "run", common.run)  # the suite-wide window guard is lifted here only
+        real.start()
+        self.addCleanup(real.stop)
+
+    def test_prices_window_save_and_cancel(self):
+        start = time.monotonic()
+        code, out, err = panel.show_prices(self.PRICE_ROWS, "Demo message", "selftest-save", timeout=30)
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertEqual((code, err), (0, ""))
+        lines = out.splitlines()
+        self.assertEqual([x for x in lines if x.startswith("#")],  # #edit: the hidden Edit menu for Cmd+V etc.
+                         ["#active=true", "#key=true", "#visible=true", "#edit=5"])
+        typed = panel.parse_prices(0, "\n".join(x for x in lines if not x.startswith("#")), 2)
+        # the self-test types "1,5" into the first field and clicks Save; the other fields come back as shown
+        self.assertEqual(typed, [["1,5", "", "", "", ""], ["1.25", "10", "0.125", "", ""]])
+        code, out, err = panel.show_prices(self.PRICE_ROWS, "Demo message", "selftest-cancel", timeout=30)
+        self.assertEqual((code, err, out.splitlines()[0]), (0, "", "cancel"))
+        code, out, err = panel.show_prices([], "No rows", "selftest-save", timeout=30)
+        self.assertEqual((code, err, out.splitlines()[0]), (0, "", "cancel"))  # only an OK button: no change
 
     def test_self_test_save_and_cancel(self):
         for _ in range(2):
@@ -2172,6 +3059,30 @@ class Plugin(unittest.TestCase):
         self.assertEqual(refused.returncode, 0)
         self.assertIn("AI Limits Bar could not run", refused.stdout)
         self.assertEqual(after_refusal, before_refusal)
+
+    def test_set_price_end_to_end(self):
+        with tempfile.TemporaryDirectory() as d:
+            config, cache = os.path.join(d, "config.json"), os.path.join(d, "cache")
+            with open(config, "w") as f:
+                json.dump({"providers": [{"name": n, "enabled": True} for n in NAMES]}, f)
+            priced = self.run_plugin(["--set-price", "demo-model", "input=1,25", "output=10"], cache, config=config)
+            with open(config) as f:
+                after = json.load(f)
+            with open(config, "rb") as f:
+                before_refusal = f.read()
+            refused = [self.run_plugin(["--set-price", *values], cache, config=config)
+                       for values in (["demo-model", "input=nan"], ["@x", "input=1"], ["demo-model"])]
+            with open(config, "rb") as f:
+                after_refusal = f.read()
+            cache_files = os.listdir(cache) if os.path.isdir(cache) else []
+        self.assertEqual((priced.returncode, priced.stdout, priced.stderr), (0, "", ""))
+        self.assertEqual(after["providers"][-1]["prices_usd_per_million"],
+                         {"demo-model": {"input": 1.25, "output": 10}})
+        for p in refused:
+            self.assertEqual(p.returncode, 0)
+            self.assertIn("AI Limits Bar could not run", p.stdout)
+        self.assertEqual(after_refusal, before_refusal)
+        self.assertEqual(cache_files, [])  # nothing was read
 
     def test_show_then_the_click_refresh_through_the_launcher(self):
         with tempfile.TemporaryDirectory() as d:
