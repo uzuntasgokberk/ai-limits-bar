@@ -1195,6 +1195,19 @@ class FoundrySpend(unittest.TestCase):
         self.assertEqual(foundry.meter_item("y - example-units", "Claude in Microsoft Foundry (Example hosted)"),
                          "Claude (Example hosted)")
         self.assertEqual(foundry.meter_item("Operations", "Example Service"), "Example Service")
+        # Long-context meters name the same model as short-context ones (two spellings each).
+        for meter in ("9.1-demo LongCo Inp Std Gl 1M Tokens", "9.1-demo LoCo Opt Std Gl 1M Tokens",
+                      "9.1-demo ShCo Cd Inp Flex Gl 1M Tokens", "9.1-demo ShortCo Opt PP DZ 1M Tokens"):
+            self.assertEqual(foundry.meter_item(meter, "Azure OpenAI GPT9"), "9.1-demo", meter)
+
+    def test_meter_items_of_other_publishers_fall_back_to_the_service(self):
+        # A made-up third publisher sold by Azure: the subcategory names the model family, readable and short.
+        for meter, sub in (("Demo-Chat-V3 Inp glbl 1M Tokens", "Azure Demo Models"),
+                           ("demo-mini-2 Outp DZ 1M Tokens", "Azure Demo Models")):
+            self.assertEqual(foundry.meter_item(meter, sub), "Azure Demo Models")
+        self.assertEqual(foundry.meter_item("x", "Demo Partner Models | bash=/bin/sh " + "y" * 60),
+                         "Demo Partner Models | bash=/bin/sh yyyyy")  # cut to 40; render.clean makes it safe
+        self.assertEqual(foundry.meter_item("", ""), "Other")
 
     def test_model_lines_four_periods_and_history(self):
         prices = {"m": {"input": 0, "output": 3.0}}
@@ -1207,9 +1220,9 @@ class FoundrySpend(unittest.TestCase):
         self.assertEqual(est["today"], (6.0, False))  # unpriced deployment used today -> "at least"
         self.assertEqual(est["week"][0], 15.0)        # Monday Aug 4 .. Aug 7
         self.assertEqual(est["month"][0], 30.0)
-        self.assertEqual(lines[0], "m: ≈$6.00 · ≈$15.00 · ≈$30.00 · ≈$60.00")
-        self.assertIn("old: – · – · – · 2.5K out", lines)
-        self.assertIn("unpriced: 7 out · 7 out · 7 out · 7 out", lines)
+        self.assertEqual(lines[0], "m (price from settings): ≈$6.00 · ≈$15.00 · ≈$30.00 · ≈$60.00")
+        self.assertIn("old (no price): – · – · – · 2.5K out", lines)
+        self.assertIn("unpriced (no price): 7 out · 7 out · 7 out · 7 out", lines)
         self.assertEqual(names["unpriced"], ["old", "unpriced"])  # every deployment with tokens but no usable price
         _, est, names = foundry.model_lines({"m": live["m"]}, {}, prices, self.now)
         self.assertEqual((est["today"], names["unpriced"]), ((6.0, True), []))
@@ -1221,8 +1234,10 @@ class FoundrySpend(unittest.TestCase):
                 "no-input": {"2031-08-07": {"OutputTokens": 50}},
                 "unpriced": {"2031-08-07": {"InputTokens": 900}}}
         _, _, names = foundry.model_lines(live, {}, prices, self.now)
-        # Azure reports cache reads for Claude deployments only: elsewhere all input is priced as uncached input.
+        # Azure reports cache tokens for Claude deployments only: elsewhere all input is priced as uncached input.
         self.assertEqual(names["uncached_input"], ["plain"])
+        _, _, names = foundry.model_lines(live, {}, prices, self.now, {"plain": {"2031-08-07": 0.5}})
+        self.assertEqual(names["uncached_input"], [])  # Azure's own estimate replaces the price from settings
         self.assertEqual(names["unpriced"], ["unpriced"])
 
     PRICED = {"today": (6.0, True), "week": (15.0, True), "month": (30.0, True)}
@@ -1266,9 +1281,10 @@ class FoundrySpend(unittest.TestCase):
         priced = foundry.spend_rows(self.PRICED, None, True, 100.0, "USD")[2]
         self.assertEqual((priced["percent"], priced["value"]), (30.0, "≈$30.00 / $100.00"))
 
-    def read_with(self, settings, tokens):
+    def read_with(self, settings, tokens, estimates=None, hist=None):
         """foundry.read with Azure replaced: az answers the subscription and resource id, the token metrics are
-        `tokens`, there is no invoice history, and today is self.now."""
+        `tokens`, Azure's estimated cost is `estimates` (None: that query fails), the invoice history is `hist`, and
+        today is self.now."""
         now = self.now
 
         class FixedNow(datetime):
@@ -1280,9 +1296,13 @@ class FoundrySpend(unittest.TestCase):
         with mock.patch.object(foundry, "find_tool", return_value="/opt/homebrew/bin/az"), \
                 mock.patch.object(foundry, "_az", side_effect=lambda *a, **k: next(answers)), \
                 mock.patch.object(foundry, "_tokens", return_value=tokens), \
-                mock.patch.object(foundry, "history", return_value=None), \
+                mock.patch.object(foundry, "_estimates", side_effect=[estimates if estimates is not None
+                                                                      else RuntimeError("az failed")]) as fake, \
+                mock.patch.object(foundry, "history", return_value=hist), \
                 mock.patch.object(foundry, "datetime", FixedNow):
-            return foundry.read(settings)
+            r = foundry.read(settings)
+        self.estimate_calls = fake.call_count
+        return r
 
     def test_read_marks_unpriced_usage_and_counts_it(self):
         live = {"demo-model": {"2031-08-07": {"InputTokens": 900, "OutputTokens": 271_800}},
@@ -1297,14 +1317,14 @@ class FoundrySpend(unittest.TestCase):
             self.assertEqual(r["unpriced"], count)
             self.assertEqual(render.normalize(r)["unpriced"], count)  # survives the cache
         details = self.read_with(settings, live)["details"]
-        self.assertIn("· demo-model: 271.8K out · 271.8K out · 271.8K out · 271.8K out", details)
+        self.assertIn("· demo-model (no price): 271.8K out · 271.8K out · 271.8K out · 271.8K out", details)
         self.assertTrue(any(x.startswith("Models shown in tokens have no price") for x in details))
-        self.assertFalse(any("cache reads" in x for x in details))  # the priced model has no input tokens
+        self.assertFalse(any("uncached" in x for x in details))  # the priced model has no input tokens
         live["priced-model"]["2031-08-07"]["InputTokens"] = 5000
         details = self.read_with(settings, live)["details"]
-        caveat = [x for x in details if "cache reads" in x]
-        self.assertEqual(caveat, ["Input without cache reads is priced as uncached: Azure reports cache reads for "
-                                  "Claude models only (may be too high)"])
+        caveat = [x for x in details if "uncached" in x]
+        self.assertEqual(caveat, ["Priced from settings, without cache tokens: all input is priced as uncached, too "
+                                  "high if it includes cached input (OpenAI models)"])
         self.assertLessEqual(len(caveat[0]), 140)  # render.section's limit for a detail line
 
     def test_invoice_lines(self):
@@ -1373,7 +1393,8 @@ class FoundrySpend(unittest.TestCase):
         for failure in (Killed(), RuntimeError("az failed")):
             with tempfile.TemporaryDirectory() as d, \
                     mock.patch.object(foundry, "_invoices", side_effect=lambda *a: json.loads(json.dumps(invoices))), \
-                    mock.patch.object(foundry, "_tokens", side_effect=failure):
+                    mock.patch.object(foundry, "_tokens", side_effect=failure), \
+                    mock.patch.object(foundry, "_estimates", side_effect=RuntimeError("az failed")):
                 self.save(d, fetched=0, tokens=old_tokens)
                 with contextlib.suppress(Killed):
                     self.history(d, resource_id=resource)
@@ -1384,7 +1405,8 @@ class FoundrySpend(unittest.TestCase):
         recent = {"my-deployment": {"2031-08-05": {"OutputTokens": 9}}}
         with tempfile.TemporaryDirectory() as d, \
                 mock.patch.object(foundry, "_invoices", side_effect=lambda *a: json.loads(json.dumps(invoices))), \
-                mock.patch.object(foundry, "_tokens", return_value=recent):
+                mock.patch.object(foundry, "_tokens", return_value=recent), \
+                mock.patch.object(foundry, "_estimates", return_value={}):
             self.save(d, fetched=0, tokens=old_tokens)
             self.history(d, resource_id=resource)
             merged = common.read_json(os.path.join(d, foundry.HISTORY_FILE))["tokens"]
@@ -1394,6 +1416,161 @@ class FoundrySpend(unittest.TestCase):
         for bad in ("yesterday", None, True, float("nan"), float("inf"), 1e30, -5):
             self.assertEqual(foundry._epoch_seconds(bad), 0.0)
         self.assertEqual(foundry._epoch_seconds(1.9e9), 1.9e9)
+
+
+def metrics_answer(series):
+    """What `az monitor metrics list -o json` answers: series = {(metric, deployment): {'YYYY-MM-DD': total}}."""
+    found = {}
+    for (metric, deployment), points in series.items():
+        m = found.setdefault(metric, {"name": {"value": metric, "localizedValue": metric}, "timeseries": []})
+        m["timeseries"].append({"metadatavalues": [{"name": {"value": "modeldeploymentname"}, "value": deployment}],
+                                "data": [{"timeStamp": f"{day}T00:00:00Z", "total": t} for day, t in points.items()]})
+    return {"value": list(found.values())}
+
+
+class FoundryEstimates(unittest.TestCase):
+    """Azure's own estimated cost per deployment (FoundryModelEstimatedCost, preview) and how it combines with prices
+    from settings. All names are made up: "demo-model" stands for a model Azure estimates, "cache-model" for one with
+    cache metrics (as Anthropic deployments have), "partner-…" for a third publisher."""
+
+    TODAY = {"2031-08-07": {"InputTokens": 4_000_000, "OutputTokens": 500_000}}
+
+    def setUp(self):
+        self.now = datetime(2031, 8, 7, 12, 0, tzinfo=timezone.utc)
+        self.spend = FoundrySpend("test_period_starts")
+        self.spend.setUp()
+
+    def test_estimate_query_and_values_that_are_no_data(self):
+        answer = metrics_answer({
+            ("FoundryModelEstimatedCost", "demo-model"): {"2031-08-07": 4.25, "2031-08-06": 2.5, "2031-08-05": None,
+                                                          "2031-08-04": 0},
+            ("FoundryModelEstimatedCost", "odd-model"): {"2031-08-07": -1.0, "2031-08-06": float("nan"),
+                                                         "2031-08-05": "7", "2031-08-04": True, "2031-08-03": 5e6,
+                                                         "2031-08-02": float("inf")}})
+        start = datetime(2031, 8, 1, tzinfo=timezone.utc)
+        with mock.patch.object(foundry, "_az", return_value=answer) as az:
+            self.assertEqual(foundry._estimates("az", "/subscriptions/demo/x", start, self.now),
+                             {"demo-model": {"2031-08-07": 4.25, "2031-08-06": 2.5}})
+        argv = az.call_args.args[1]
+        self.assertEqual(argv[argv.index("--metrics") + 1:argv.index("--aggregation")], ["FoundryModelEstimatedCost"])
+        self.assertEqual(argv[argv.index("--filter") + 1], "ModelDeploymentName eq '*'")
+        for broken in ({}, {"value": []}, {"value": [{"name": {"value": "x"}}]}):
+            with mock.patch.object(foundry, "_az", return_value=broken):
+                self.assertEqual(foundry._estimates("az", "/x", start, self.now), {}, broken)
+
+    def test_token_points_that_are_not_counts_are_skipped(self):
+        answer = metrics_answer({("OutputTokens", "demo-model"): {"2031-08-07": 50, "2031-08-06": "x",
+                                                                  "2031-08-05": float("nan"), "2031-08-04": -3}})
+        with mock.patch.object(foundry, "_az", return_value=answer):
+            self.assertEqual(foundry._tokens("az", "/x", datetime(2031, 8, 1, tzinfo=timezone.utc), self.now),
+                             {"demo-model": {"2031-08-07": {"OutputTokens": 50}}})
+
+    def test_azure_estimate_wins_over_a_price_from_settings(self):
+        live = {"demo-model": {"2031-08-07": {"InputTokens": 9_000_000, "OutputTokens": 100_000},
+                               "2031-08-05": {"InputTokens": 1_000_000}}}
+        estimates = {"demo-model": {"2031-08-07": 3.25, "2031-08-05": 1.5}}
+        prices = {"demo-model": {"input": 2.0, "output": 10.0}}  # tokens x price would be $19.00 today
+        lines, est, names = foundry.model_lines(live, {}, prices, self.now, estimates)
+        self.assertEqual((est["today"], est["week"], est["month"]), ((3.25, True), (4.75, True), (4.75, True)))
+        self.assertEqual(lines, ["demo-model (Azure estimate): ≈$3.25 · ≈$4.75 · ≈$4.75 · ≈$4.75"])
+        self.assertEqual((names["unpriced"], names["by_settings"], names["pending"]), ([], {}, []))
+
+    def test_a_deployment_with_cache_metrics_and_a_price_is_unchanged(self):
+        live = {"cache-model": {"2031-08-07": {"InputTokens": 1000, "cacheReadInputTokens": 1_000_000,
+                                               "ephemeral5mInputTokens": 100_000, "OutputTokens": 200_000}}}
+        prices = {"cache-model": {"input": 3, "output": 15, "cache_read": 0.3, "cache_write_5m": 3.75}}
+        lines, est, names = foundry.model_lines(live, {}, prices, self.now, {"demo-model": {"2031-08-07": 1.0}})
+        self.assertEqual(est["today"][1], True)
+        self.assertAlmostEqual(est["today"][0], 0.003 + 0.3 + 0.375 + 3.0)
+        self.assertEqual(lines, ["cache-model (price from settings): ≈$3.68 · ≈$3.68 · ≈$3.68 · ≈$3.68"])
+        self.assertEqual(names["by_settings"], {"cache-model": ["InputTokens", "OutputTokens", "cacheReadInputTokens",
+                                                                "ephemeral5mInputTokens"]})
+
+    def test_a_third_publisher_in_each_state(self):
+        live = {"partner-a": self.TODAY, "partner-b": self.TODAY, "partner-c": self.TODAY}
+        estimates = {"partner-a": {"2031-08-07": 1.2}}           # Azure estimates it
+        prices = {"partner-b": {"input": 0.5, "output": 1.5}}    # no estimate, a price from settings: $2.75
+        lines, est, names = foundry.model_lines(live, {}, prices, self.now, estimates)  # partner-c: neither
+        self.assertEqual(lines, ["partner-b (price from settings): ≈$2.75 · ≈$2.75 · ≈$2.75 · ≈$2.75",
+                                 "partner-a (Azure estimate): ≈$1.20 · ≈$1.20 · ≈$1.20 · ≈$1.20",
+                                 "partner-c (no price): 500.0K out · 500.0K out · 500.0K out · 500.0K out"])
+        self.assertEqual(est["today"], (3.95, False))
+        self.assertEqual(names["unpriced"], ["partner-c"])
+        self.assertEqual(list(names["by_settings"]), ["partner-b", "partner-c"])  # what the prices window lists
+
+    def test_token_days_without_an_azure_estimate_are_at_least(self):
+        live = {"demo-model": {"2031-08-07": {"OutputTokens": 50_000}, "2031-08-06": {"OutputTokens": 70_000}}}
+        prices = {"demo-model": {"output": 10.0}}  # never used for a deployment that Azure estimates
+        lines, est, names = foundry.model_lines(live, {}, prices, self.now, {"demo-model": {"2031-08-06": 2.0}})
+        self.assertEqual((est["today"], est["week"]), ((0.0, False), (2.0, False)))  # today's estimate not there yet
+        self.assertEqual(lines, ["demo-model (Azure estimate): 50.0K out · ≥$2.00 · ≥$2.00 · ≥$2.00"])
+        self.assertEqual((names["pending"], names["unpriced"], names["by_settings"]), (["demo-model"], [], {}))
+        # Known from the saved history alone (this run's estimate query failed): still not priced from settings.
+        lines, est, names = foundry.model_lines(live, {}, prices, self.now, {}, {"demo-model": {"2031-07": 30.0}})
+        self.assertEqual((est["today"], names["unpriced"]), ((0.0, False), []))
+        self.assertEqual(lines, ["demo-model (Azure estimate): 50.0K out · 120.0K out · 120.0K out · ≥$30.00"])
+
+    def test_all_time_adds_saved_monthly_estimates_and_ignores_garbage(self):
+        live = {"demo-model": {"2031-08-07": {"OutputTokens": 5}}}
+        saved_tokens = {"demo-model": {"2031-07": {"OutputTokens": 9}, "2031-05": {"OutputTokens": 4}}}
+        saved_estimates = {"demo-model": {"2031-07": 4.5, "2031-08": 99.0, "2031-06": "x", "2031-04": -2.0,
+                                          "2031-03": float("nan"), "2031-02": 5e9}, "other": "garbage"}
+        lines, _, names = foundry.model_lines(live, saved_tokens, {}, self.now, {"demo-model": {"2031-08-07": 1.0}},
+                                              saved_estimates)
+        # This month comes from the live query; May has tokens but no estimate, so all time is "at least".
+        self.assertEqual(lines, ["demo-model (Azure estimate): ≈$1.00 · ≈$1.00 · ≈$1.00 · ≥$5.50"])
+        self.assertEqual(names["pending"], ["demo-model"])
+        lines, _, _ = foundry.model_lines(live, {"demo-model": {"2031-07": {"OutputTokens": 9}}}, {}, self.now,
+                                          {"demo-model": {"2031-08-07": 1.0}}, {"demo-model": {"2031-07": 4.5}})
+        self.assertEqual(lines, ["demo-model (Azure estimate): ≈$1.00 · ≈$1.00 · ≈$1.00 · ≈$5.50"])
+
+    def test_history_keeps_monthly_estimates(self):
+        invoices = {"monthly": {"Example Service": {"2031-08": 0.75}}, "daily": {}, "currency": "USD"}
+        resource = "/subscriptions/demo/resourceGroups/rg/providers/x/accounts/demo"
+        recent = {"demo-model": {"2031-08-05": 1.25, "2031-08-06": 2.0, "2031-07-30": 0.5}}
+        for answer, expected in ((recent, {"demo-model": {"2031-04": 3.0, "2031-07": 0.5, "2031-08": 3.25}}),
+                                 (RuntimeError("az failed"), {"demo-model": {"2031-04": 3.0}})):
+            with tempfile.TemporaryDirectory() as d, \
+                    mock.patch.object(foundry, "_invoices", side_effect=lambda *a: json.loads(json.dumps(invoices))), \
+                    mock.patch.object(foundry, "_tokens", return_value={}), \
+                    mock.patch.object(foundry, "_estimates", side_effect=[answer]):  # returned, or raised
+                self.spend.save(d, fetched=0, estimates={"demo-model": {"2031-04": 3.0}})
+                hist = self.spend.history(d, resource_id=resource)
+                on_disk = common.read_json(os.path.join(d, foundry.HISTORY_FILE))
+            self.assertEqual(on_disk["estimates"], expected, repr(answer))
+            self.assertEqual(hist["estimates"], expected)
+        with tempfile.TemporaryDirectory() as d:
+            self.spend.save(d, fetched=time.time(), estimates=[1, 2])  # a broken part of a saved file
+            self.assertEqual(foundry.history(None, "sub", "rg", None, d, 6, False, self.now)["estimates"], {})
+
+    def test_read_uses_the_estimate_and_lists_only_models_that_need_a_price(self):
+        live = {"demo-model": {"2031-08-07": {"InputTokens": 9_000_000, "OutputTokens": 100_000}},
+                "cache-model": {"2031-08-07": {"InputTokens": 1000, "cacheReadInputTokens": 1_000_000,
+                                               "OutputTokens": 100_000}},
+                "partner-c": self.TODAY}
+        prices = {"demo-model": {"input": 2.0, "output": 10.0},
+                  "cache-model": {"input": 3, "output": 15, "cache_read": 0.3}}  # 0.003 + 0.3 + 1.5
+        with tempfile.TemporaryDirectory() as d:
+            settings = {"resource_group": "demo-rg", "resource": "demo-resource", "cache_dir": d,
+                        "prices_usd_per_million": prices}
+            r = self.spend.read_with(settings, live, {"demo-model": {"2031-08-07": 3.5}})
+            values = {x["label"]: x["value"] for x in r["rows"]}
+            self.assertEqual(values["Today"], "≥$5.30")  # 3.50 + 1.80; partner-c has no price
+            self.assertEqual(r["unpriced"], 1)
+            self.assertIn("· demo-model (Azure estimate): ≈$3.50 · ≈$3.50 · ≈$3.50 · ≈$3.50", r["details"])
+            self.assertEqual(sorted(foundry.load_deployments(d)), ["cache-model", "partner-c"])  # not demo-model
+            # The estimate query fails (preview metric, or none on this resource): prices from settings, no error.
+            r = self.spend.read_with(settings, live, None)
+            self.assertEqual({x["label"]: x["value"] for x in r["rows"]}["Today"], "≥$20.80")  # 19.00 + 1.80
+            self.assertIn("· demo-model (price from settings): ≈$19.00 · ≈$19.00 · ≈$19.00 · ≈$19.00", r["details"])
+            # The token query fails: the estimate query is not even tried, and every row is "at least".
+            r = self.spend.read_with(settings, None, {"demo-model": {"2031-08-07": 3.5}})
+            self.assertEqual(self.spend.estimate_calls, 0)
+            self.assertEqual({x["label"]: x["value"] for x in r["rows"]}, {"Spend": "unknown"})
+        details = self.spend.read_with(dict(settings, cache_dir=None), {"demo-model": live["demo-model"]},
+                                       {})["details"]
+        self.assertFalse(any("Azure estimate" in x for x in details[2:]))  # no data: back to the price from settings
+        self.assertIn("Each total = max(model estimates, invoice); weeks start Monday; days are UTC", details)
 
 
 class FoundryPrices(unittest.TestCase):
@@ -2439,7 +2616,8 @@ class ChoosePrices(unittest.TestCase):
                                 ("Zeta-new", "no price", ["", "", "", "", ""]),
                                 ("priced", "", ["2", "8", "0.2", "", ""])])
         self.assertEqual(message, self.main.PRICES_MESSAGE)
-        self.assertIn("Cache fields apply to Claude models", message)
+        self.assertTrue(message.startswith("Only models without an Azure cost estimate are listed."), message)
+        self.assertIn("Azure reports cache tokens only for Claude models", message)
         rows, _ = self.main.price_rows({"odd": ["OutputTokens"]}, {"odd": "cheap"})
         self.assertEqual(rows, [("odd", "not an object in config.json", ["", "", "", "", ""])])  # Save skips it
 
@@ -2508,7 +2686,8 @@ class ChoosePrices(unittest.TestCase):
         os.remove(os.path.join(self.cache, foundry.DEPLOYMENTS_FILE))
         self.assertEqual(self.choose(), self.TEXT)
         self.assertEqual(self.shown[0][0], [])
-        self.assertTrue(self.shown[0][1].startswith("No model deployment with tokens yet."))
+        self.assertEqual(self.shown[0][1], "No model needs a price: Azure estimates the cost of every model with "
+                                           "tokens, or none has tokens yet.")
         foundry.save_deployments(self.cache, {f"model-{i:02d}": ["OutputTokens"] for i in range(20)})
         self.choose()
         rows, message = self.shown[1]

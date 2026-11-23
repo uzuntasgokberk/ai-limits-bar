@@ -34,8 +34,9 @@ is a command-line argument, which a link can't set (SwiftBar passes none, except
                  is checked again here (a known provider; a limit from render.CHOICE_LABEL), anything else is refused.
                  It then leaves a marker in the cache folder so the refresh SwiftBar starts after the click does not
                  re-read the providers (choosing a number needs no new data).
-  --prices       show the "Foundry prices…" window (one row of price fields per deployment with tokens, from
-                 foundry-deployments.json in the cache folder; Save writes `prices_usd_per_million` in one write) and
+  --prices       show the "Foundry prices…" window (one row of price fields per deployment with tokens that Azure
+                 gives no cost estimate for, from foundry-deployments.json in the cache folder; Save writes
+                 `prices_usd_per_million` in one write) and
                  print nothing. Like --choose it holds the config folder's lock while open. It then leaves the
                  marker too, naming Foundry if prices changed: the refresh after the click re-reads Foundry only
                  (unforced), so its totals use the new prices, and keeps every other provider's values.
@@ -88,8 +89,9 @@ KEEP_FILE = "keep-values.json"  # in the cache folder: written by --show and --p
 KEEP_SECONDS = 10.0  # skip re-reading (all providers, or all but those it names); an older marker counts for nothing
 MAX_PRICE_ROWS = 15  # deployments in the prices window; the others are set with --set-price
 PRICE_HEADINGS = dict(zip(foundry.PRICE_KEYS, ("Input", "Output", "Cache read", "Write 5m", "Write 1h")))
-PRICES_MESSAGE = ("US dollars per million tokens; empty means no price. Cache fields apply to Claude models: Azure "
-                  "reports no cache tokens for other models, so all of their input is priced as Input.")
+PRICES_MESSAGE = ("Only models without an Azure cost estimate are listed. US dollars per million tokens; empty means "
+                  "no price. Azure reports cache tokens only for Claude models: for others, all input is priced as "
+                  "Input.")
 CACHE = os.path.join(HOME, "Library", "Caches", "ai-limits-bar")
 VALID_NAME = re.compile(r"[a-z0-9_]{1,20}")
 REFRESH_FLOOR = 60.0  # seconds: even a forced refresh uses a cache this young
@@ -387,8 +389,8 @@ def set_prices(path, changes, create):
 
 def price_rows(used, prices):
     """The prices window's rows [(deployment, note, [five texts])] and how many deployments there were: deployments
-    with tokens (`used`: {deployment: token types}), those without a usable price first, each group by name, at most
-    MAX_PRICE_ROWS. The note says what is missing for the token types the deployment used: "" (priced), "no price"
+    with tokens and no Azure estimate (`used`: {deployment: token types}), those without a usable price first, each
+    group by name, at most MAX_PRICE_ROWS. The note says what is missing for the token types the deployment used: "" (priced), "no price"
     or "missing Output, Cache read"; or that its entry in config.json is not an object (Save leaves such an entry
     alone). The texts are the current prices (foundry.price_text)."""
     rows = []
@@ -439,7 +441,8 @@ def choose_prices(path, cache, create):
             rows, total = price_rows(foundry.load_deployments(cache), prices if isinstance(prices, dict) else {})
             original = [texts for _, _, texts in rows]
             if not rows:
-                message = "No model deployment with tokens yet. Deployments appear here after the next Foundry read."
+                message = ("No model needs a price: Azure estimates the cost of every model with tokens, or none has "
+                           "tokens yet.")
             elif total > len(rows):
                 message = f"{PRICES_MESSAGE} Showing {len(rows)} of {total}: set the others with --set-price."
             else:

@@ -1,22 +1,24 @@
 """Microsoft Foundry (Azure): spend today, this week, this month and all time; per-item details.
 
-Identity: the Azure CLI session (`az login`); no keys. Two sources:
-- Token metrics (Azure Monitor on `resource`; input, output, cache read, cache write 5 min / 1 h; UTC days).
-  Estimated $ = tokens x the per-deployment list prices in config.json. Up to date within minutes. Azure keeps
-  these metrics for 93 days, so monthly token totals per deployment are also kept in the history file.
-  (`FoundryModelEstimatedCost` is empty for Anthropic models, so it is not used.)
+Identity: the Azure CLI session (`az login`); no keys. Two sources, both through az:
+- Azure Monitor on `resource` (UTC days): token metrics (input, output, cache read, cache write 5 min / 1 h), and
+  Azure's own estimated cost per deployment (`FoundryModelEstimatedCost`, preview, USD; a separate query). A
+  deployment's estimated $ is Azure's estimate where Azure has one for it, otherwise tokens x the per-deployment
+  prices in config.json (see model_lines). Azure keeps these metrics for 93 days, so monthly totals per deployment
+  are also kept in the history file.
 - Invoices (Cost Management for `resource_group`, grouped by meter). Actual amounts, but Claude models are
   billed through the Azure Marketplace and arrive 1-2 days late. Claude meters do not name the model.
 Cost Management throttles frequent queries (HTTP 429) and past months don't change, so the invoice and token
 history is refreshed at most every `invoice_refresh_hours` (15 minutes on "Refresh now"), not again within 15
 minutes of a failed attempt, and kept in `foundry-history.json` in the cache folder (0600; per-item and
-per-deployment amounts and token totals only). After each successful token read, the deployments with tokens and
-the token types they used (no amounts) are saved in `foundry-deployments.json` for the "Foundry prices…" window,
-which reads no provider. Prices are set there or with --set-price (main.py), or by hand in config.json.
+per-deployment amounts and token totals only). After each successful token read, the deployments with tokens but
+no Azure estimate, and the token types they used (no amounts), are saved in `foundry-deployments.json` for the
+"Foundry prices…" window, which reads no provider. Prices are set there or with --set-price (main.py), or by hand
+in config.json.
 
-Totals: each period = max(token estimate, invoiced amount). All time = invoiced months before this one + this
+Totals: each period = max(model estimates, invoiced amount). All time = invoiced months before this one + this
 month's total. A total is marked `≈` only if it can be complete, otherwise `≥` (at least): see spend_rows. The
-section says how many deployments with tokens have no usable price (`unpriced` in the result). The menu never
+section says how many deployments need a price (`unpriced` in the result). The menu never
 shows the subscription id, tenant, resource or resource-group name; deployment names and invoice item (model and
 service) names appear only in Details, and in the cache. Disabled by default: set it up in config.json.
 """
@@ -38,6 +40,11 @@ PRICE_FIELD = {"InputTokens": "input", "OutputTokens": "output", "cacheReadInput
                "ephemeral5mInputTokens": "cache_write_5m", "ephemeral1hInputTokens": "cache_write_1h"}
 # Documented by Azure Monitor for Anthropic model deployments only.
 CACHE_METRICS = ("cacheReadInputTokens", "ephemeral5mInputTokens", "ephemeral1hInputTokens")
+# Azure's own estimated cost of a deployment's usage, in USD (preview; "Applies to Foundry models only"). Present for
+# some models (seen for Azure OpenAI ones), absent for others (seen for Anthropic ones): see model_lines.
+COST_METRIC = "FoundryModelEstimatedCost"
+MAX_DAILY_ESTIMATE = 1_000_000.0  # USD per deployment and day; a larger total is taken as broken data
+MAX_TOKENS = 1e15  # per deployment, metric and day
 PRICE_KEYS = tuple(PRICE_FIELD.values())  # the order of the "Foundry prices" window's columns
 MAX_PRICE = 10000.0  # USD per million tokens; the most expensive list price is far below it
 # A typed price: ASCII digits only (float() would also take 'nan', 'inf', '1e3', '1_0' and non-ASCII digits), with
@@ -45,11 +52,11 @@ MAX_PRICE = 10000.0  # USD per million tokens; the most expensive list price is 
 PRICE_TEXT = re.compile(r"[0-9]{1,5}(?:[.,][0-9]{1,6})?|[.,][0-9]{1,6}")
 AZURE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._()-]{0,89}")
 HISTORY_FILE = "foundry-history.json"
-DEPLOYMENTS_FILE = "foundry-deployments.json"  # in the cache folder: deployments with tokens, for the prices window
+DEPLOYMENTS_FILE = "foundry-deployments.json"  # in the cache folder: what the prices window lists
 MAX_DEPLOYMENTS = 50
 PERIOD_KEY = re.compile(r"\d{4}-\d{2}(-\d{2})?")
 METER_STOP = {"inp", "outp", "opt", "cd", "wr", "shortco", "glbl", "gl", "std", "1m", "tokens", "unit", "cached",
-              "batch", "regnl", "dz", "rgnl"}
+              "batch", "regnl", "dz", "rgnl", "longco", "loco", "shco"}  # *co: the short and long context tiers
 MAX_ITEMS = 14
 FAILURE_PAUSE = 900  # seconds without a new history attempt after a failed one
 LATEST_EPOCH = 4102444800  # 2100-01-01
@@ -103,8 +110,9 @@ def price_text(x):
 
 
 def save_deployments(cache_dir, used):
-    """foundry-deployments.json: the deployments with tokens and the token types each used, for the prices window
-    (which reads no provider). Only names that pass valid_name, at most MAX_DEPLOYMENTS; no amounts."""
+    """foundry-deployments.json: the deployments with tokens but no Azure estimate (model_lines' 'by_settings') and
+    the token types each used, for the prices window (which reads no provider). Only names that pass valid_name, at
+    most MAX_DEPLOYMENTS; no amounts."""
     names = sorted(n for n in used if valid_name(n))[:MAX_DEPLOYMENTS]
     data = {"time": time.time(), "deployments": {n: [m for m in PRICE_FIELD if m in used[n]] for n in names}}
     if cache_dir:
@@ -235,15 +243,23 @@ def _invoices(az, subscription, group, now):
     return {"monthly": rnd(monthly), "daily": rnd(daily), "currency": str(currency)[:8]}
 
 
-# ---- tokens ---------------------------------------------------------------------------------------------
+# ---- token metrics and Azure's estimate ------------------------------------------------------------------
 
-def _tokens(az, resource_id, start, end):
-    """Per deployment: {'YYYY-MM-DD': {metric: n}} (UTC days). Queried in chunks of at most 28 days."""
+def _total(x, high):
+    """A metric point's total if it is a finite number above 0 and at most `high`; otherwise None (no data)."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or not 0 < x <= high:
+        return None
+    return x
+
+
+def _metric_days(az, resource_id, metrics, start, end, high):
+    """Per deployment: {'YYYY-MM-DD': {metric: total}} (UTC days) for `metrics`, queried in chunks of at most 28
+    days. A point whose total is not a number above 0 and at most `high` counts as no data."""
     models = {}
     chunk_start = start
     while chunk_start < end:
         chunk_end = min(chunk_start + timedelta(days=28), end)
-        d = _az(az, ["monitor", "metrics", "list", "--resource", resource_id, "--metrics", *METRICS,
+        d = _az(az, ["monitor", "metrics", "list", "--resource", resource_id, "--metrics", *metrics,
                      "--aggregation", "Total", "--interval", "P1D",
                      "--start-time", chunk_start.strftime("%Y-%m-%dT%H:%M:00Z"),
                      "--end-time", chunk_end.strftime("%Y-%m-%dT%H:%M:00Z"),
@@ -254,12 +270,31 @@ def _tokens(az, resource_id, start, end):
                 deployment = next((x["value"] for x in series.get("metadatavalues", [])), "?")
                 days = models.setdefault(str(deployment)[:60], {})
                 for point in series.get("data", []):
-                    n = point.get("total") or 0
-                    if n:
-                        day = days.setdefault(point.get("timeStamp", "")[:10], {})
+                    n = _total(point.get("total"), high)
+                    if n is not None:
+                        day = days.setdefault(str(point.get("timeStamp", ""))[:10], {})
                         day[name] = day.get(name, 0) + n
         chunk_start = chunk_end
-    return models
+    return {deployment: days for deployment, days in models.items() if days}
+
+
+def _tokens(az, resource_id, start, end):
+    """Per deployment: {'YYYY-MM-DD': {metric: n}} (UTC days) of the token metrics."""
+    return _metric_days(az, resource_id, METRICS, start, end, MAX_TOKENS)
+
+
+def _estimates(az, resource_id, start, end):
+    """Azure's own estimated cost per deployment (COST_METRIC, preview, USD): {deployment: {'YYYY-MM-DD': USD}}. A
+    query of its own, so that a resource or an az without this metric never costs the token metrics. A day whose total
+    is not a number above 0 and at most MAX_DAILY_ESTIMATE is no data, and a deployment without such a day is left
+    out: Azure has no estimate for some models (none for the Anthropic deployments seen so far)."""
+    days = _metric_days(az, resource_id, [COST_METRIC], start, end, MAX_DAILY_ESTIMATE)
+    out = {}
+    for deployment, per_day in days.items():
+        found = {day: m[COST_METRIC] for day, m in per_day.items() if COST_METRIC in m}
+        if found:
+            out[deployment] = found
+    return out
 
 
 def _monthly_tokens(models):
@@ -271,6 +306,23 @@ def _monthly_tokens(models):
             for k, v in metrics.items():
                 month[k] = month.get(k, 0) + v
     return out
+
+
+def _monthly_estimates(estimates):
+    """{deployment: {'YYYY-MM-DD': USD}} -> {deployment: {'YYYY-MM': USD}}."""
+    out = {}
+    for deployment, days in estimates.items():
+        months = out.setdefault(deployment, {})
+        for day, usd in days.items():
+            months[day[:7]] = round(months.get(day[:7], 0.0) + usd, 6)
+    return out
+
+
+def _amounts(x, high):
+    """{period: USD} from a saved or queried estimate: only text keys and amounts above 0 and at most `high`."""
+    if not isinstance(x, dict):
+        return {}
+    return {k: float(v) for k, v in x.items() if isinstance(k, str) and _total(v, high) is not None}
 
 
 def _epoch_seconds(x):
@@ -285,7 +337,7 @@ def _load_history(path):
     saved = read_json(path) if path else None
     if not (isinstance(saved, dict) and isinstance(saved.get("monthly"), dict)):
         return None
-    for key in ("monthly", "daily", "tokens"):
+    for key in ("monthly", "daily", "tokens", "estimates"):
         part = saved.get(key)
         saved[key] = {k: v for k, v in part.items() if isinstance(v, dict)} if isinstance(part, dict) else {}
     saved["fetched"] = _epoch_seconds(saved.get("fetched"))
@@ -299,8 +351,9 @@ def _save_history(cache_dir, data):
 
 
 def history(az, subscription, group, resource_id, cache_dir, refresh_hours, force, now):
-    """Saved history if fresh enough, otherwise refreshed: invoices and monthly token totals per deployment
-    for the last 90 days (merged into older saved months, which Azure Monitor no longer has).
+    """Saved history if fresh enough, otherwise refreshed: invoices, and monthly token totals and monthly totals of
+    Azure's estimated cost per deployment for the last 90 days (merged into older saved months, which Azure Monitor
+    no longer has).
     Any failure except an expired session keeps the saved history (None if there is none). With a saved file the
     failure time is recorded and no new attempt is made for 15 minutes, not even on "Refresh now"."""
     path = os.path.join(cache_dir, HISTORY_FILE) if cache_dir else None
@@ -320,6 +373,7 @@ def history(az, subscription, group, resource_id, cache_dir, refresh_hours, forc
             _save_history(cache_dir, saved)
         return saved  # may be None: totals then come from token estimates only
     fresh["tokens"] = dict((saved or {}).get("tokens") or {})
+    fresh["estimates"] = dict((saved or {}).get("estimates") or {})
     fresh["fetched"] = time.time()
     # Saved before the token queries: on a first run they can outlast the provider's time budget (the process
     # then exits), and the invoices would be lost and queried again. The next token refresh then comes with the
@@ -334,6 +388,16 @@ def history(az, subscription, group, resource_id, cache_dir, refresh_hours, forc
             merged = dict(fresh["tokens"].get(deployment) or {})
             merged.update(months)
             fresh["tokens"][deployment] = merged
+        if recent:
+            _save_history(cache_dir, fresh)
+        try:  # Azure's estimate: a preview metric, so any failure only means no new months
+            recent = _monthly_estimates(_estimates(az, resource_id, now - timedelta(days=90), now))
+        except Exception:
+            recent = {}
+        for deployment, months in recent.items():
+            merged = dict(fresh["estimates"].get(deployment) or {})
+            merged.update(months)
+            fresh["estimates"][deployment] = merged
         if recent:
             _save_history(cache_dir, fresh)
     return fresh
@@ -359,51 +423,85 @@ def money(x, currency="USD"):
     return f"${x:,.2f}" if currency == "USD" else f"{x:,.2f} {currency}"
 
 
-def model_lines(live, saved_tokens, prices, now):
-    """Per deployment: today · this week · this month · all time (estimated $, or output tokens without a price),
-    the estimated totals {'today','week','month'} -> (amount, every deployment with tokens in it priced?), and
-    deployment names: 'unpriced' (tokens, but a used token type has no valid price), 'uncached_input' (priced,
-    with input tokens but no cache tokens at all) and 'used' ({deployment: token types with tokens}). Azure Monitor
-    reports cache reads and writes for Anthropic deployments only; for the others (e.g. Azure OpenAI) cached input
-    is most likely inside InputTokens, so their input is priced as uncached and the estimate can be too high (the
-    Details footnote says so)."""
+def model_lines(live, saved_tokens, prices, now, live_estimates=None, saved_estimates=None):
+    """Per deployment: today · this week · this month · all time, the totals {'today','week','month'} ->
+    (amount, complete?), and lists of deployment names. The same rule for every model, whoever publishes it:
+    - Azure's estimate (COST_METRIC), if Azure has one for the deployment this month (`live_estimates`, per day) or
+      in a saved month (`saved_estimates`). A price from settings is then never used for it: for models whose
+      InputTokens include cached input (as for Azure OpenAI ones), tokens x price would price that cached input at the
+      full rate, several times too high. A day or month with tokens but without an estimate makes the period
+      incomplete (`≥`): the estimate may lag, or not cover that usage.
+    - Otherwise tokens x the price from settings ($ per million, per token type); a period with tokens and no usable
+      price is incomplete.
+    A cell is `≈$x` (complete), `≥$x` (part of it), `N out` (output tokens, nothing priced) or `–` (no usage).
+    Names: 'unpriced' (no Azure estimate, tokens, no usable price), 'by_settings' ({deployment: token types used}
+    for every deployment without an Azure estimate: those the prices window offers), 'pending' (Azure estimate, but
+    token days or months without one) and 'uncached_input' (priced from settings, input tokens, no cache tokens:
+    Azure reports cache tokens only for Anthropic deployments, so that input is priced as uncached)."""
+    live_estimates, saved_estimates = live_estimates or {}, saved_estimates or {}
     starts = period_starts(now)
     this_month = now.strftime("%Y-%m")
     totals = {p: [0.0, True] for p in starts}
-    lines, names = [], {"unpriced": [], "uncached_input": [], "used": {}}
+    lines, names = [], {"unpriced": [], "uncached_input": [], "by_settings": {}, "pending": []}
     for deployment in sorted(set(live) | set(saved_tokens)):
         days = live.get(deployment, {})
+        months = {m: v for m, v in (saved_tokens.get(deployment) or {}).items()
+                  if m < this_month and isinstance(v, dict)}
         per = {p: sum_days(days, first) for p, first in starts.items()}
         all_time = {}
-        for month, metrics in (saved_tokens.get(deployment) or {}).items():
-            if month < this_month and isinstance(metrics, dict):
-                for k, v in metrics.items():
-                    all_time[k] = all_time.get(k, 0) + v
+        for metrics in months.values():
+            for k, v in metrics.items():
+                all_time[k] = all_time.get(k, 0) + v
         for k, v in per["month"].items():
             all_time[k] = all_time.get(k, 0) + v
         if not any(all_time.values()):
             continue
-        names["used"][deployment] = [m for m in PRICE_FIELD if all_time.get(m)]
-        price = prices.get(deployment, {})
-        cells = []
+        est_days = _amounts(live_estimates.get(deployment), MAX_DAILY_ESTIMATE)
+        est_months = _amounts(saved_estimates.get(deployment), 31 * MAX_DAILY_ESTIMATE)
+        azure = bool(est_days or est_months)
+        price = prices.get(deployment, {}) if isinstance(prices, dict) else {}
+        cells, amounts = [], {}
         for p, t in list(per.items()) + [("all", all_time)]:
-            cost = estimate(t, price)
+            if not azure:
+                cost = estimate(t, price)
+                amount, complete = cost or 0.0, cost is not None or not any(t.values())
+            elif p != "all":
+                first = starts[p]
+                amount = sum(v for day, v in est_days.items() if day >= first)
+                complete = all(est_days.get(day) for day, m in days.items() if day >= first and any(m.values()))
+            else:
+                amount = amounts["month"][0] + sum(v for m, v in est_months.items() if m < this_month)
+                complete = amounts["month"][1] and all(est_months.get(m) for m, v in months.items()
+                                                       if any(v.values()))
+            amounts[p] = (amount, complete)
+            has = any(t.values()) or amount > 0
             if p in totals:
-                if cost is None and any(t.values()):
-                    totals[p][1] = False
-                totals[p][0] += cost or 0
-            if not any(t.values()):
+                totals[p][0] += amount
+                totals[p][1] = totals[p][1] and (complete or not has)
+            if not has:
                 cells.append("–")
-            elif cost is not None:
-                cells.append(f"≈{money(cost)}")
+            elif complete:
+                cells.append(f"≈{money(amount)}")
+            elif amount > 0:
+                cells.append(f"≥{money(amount)}")
             else:
                 cells.append(f"{short_number(t.get('OutputTokens', 0))} out")
-        sort_key = estimate(all_time, price)
-        if sort_key is None:
-            names["unpriced"].append(deployment)
-        elif all_time.get("InputTokens") and not any(all_time.get(m) for m in CACHE_METRICS):
-            names["uncached_input"].append(deployment)
-        lines.append((sort_key if sort_key is not None else -1, f"{deployment}: " + " · ".join(cells)))
+        all_amount, all_complete = amounts["all"]
+        if azure:
+            source = "Azure estimate"
+            if not all_complete:
+                names["pending"].append(deployment)
+        else:
+            names["by_settings"][deployment] = [m for m in PRICE_FIELD if all_time.get(m)]
+            if estimate(all_time, price) is None:
+                source = "no price"
+                names["unpriced"].append(deployment)
+            else:
+                source = "price from settings"
+                if all_time.get("InputTokens") and not any(all_time.get(m) for m in CACHE_METRICS):
+                    names["uncached_input"].append(deployment)
+        sort_key = all_amount if all_complete or all_amount > 0 else -1
+        lines.append((sort_key, f"{deployment} ({source}): " + " · ".join(cells)))
     lines.sort(key=lambda x: -x[0])
     return [line for _, line in lines], {p: (v[0], v[1]) for p, v in totals.items()}, names
 
@@ -411,11 +509,12 @@ def model_lines(live, saved_tokens, prices, now):
 def spend_rows(est, invoiced, tokens_read, budget, currency):
     """The main rows: Today, This week, This month and All time.
 
-    Each period shows max(token estimate, invoiced amount). The sign says whether that can be the whole amount:
-    - `≈` only if the token metrics were read and every deployment with tokens in that period has a usable price.
-      The token estimate then covers all model usage up to a few minutes ago, and the invoice covers the rest.
+    Each period shows max(model estimates, invoiced amount). The sign says whether that can be the whole amount:
+    - `≈` only if the token metrics were read and every deployment with tokens in that period has an amount for it
+      (Azure's estimate for each day with tokens, or a usable price from settings; see model_lines). The estimates
+      then cover all model usage up to the last read, and the invoice covers the rest.
     - `≥` (at least) otherwise, whatever the invoice says. The invoice is exact but late (Claude 1-2 days, other
-      models hours), so even an invoice larger than the estimate may not yet contain the unpriced usage, and
+      models hours), so even an invoice larger than the estimate may not yet contain the missing usage, and
       without token metrics (failed, or no `resource`) today's usage is not known at all. 0 versus 0 is `≥` too.
     All time = invoiced months before this one + this month's amount, with this month's sign.
     est: model_lines' totals; invoiced: invoice_lines' totals or None (no invoice history yet)."""
@@ -486,15 +585,21 @@ def read(settings):
     resource_id = _az(az, ["cognitiveservices", "account", "show", "-n", resource, "-g", group, "--query", "id"],
                       timeout=20) if resource else None
 
-    live = {}
+    live, estimates = {}, None
     if resource_id:
+        first = min(now.replace(day=1), now - timedelta(days=now.weekday()))
+        first = first.replace(hour=0, minute=0, second=0, microsecond=0)
         try:
-            first = min(now.replace(day=1), now - timedelta(days=now.weekday()))
-            live = _tokens(az, resource_id, first.replace(hour=0, minute=0, second=0, microsecond=0), now)
+            live = _tokens(az, resource_id, first, now)
         except SessionExpired:
             raise
         except Exception:
             live = None
+        if live is not None:  # after a failed token read another az call would only use up the time budget
+            try:
+                estimates = _estimates(az, resource_id, first, now)
+            except Exception:  # a preview metric: any failure means no estimate, never a broken section
+                estimates = None
     try:
         hist = history(az, subscription, group, resource_id, settings.get("cache_dir"), hours,
                        settings.get("force") is True, now)
@@ -503,11 +608,12 @@ def read(settings):
     except Exception:
         hist = None
 
-    models, est, names = model_lines(live or {}, (hist or {}).get("tokens") or {}, prices, now)
+    models, est, names = model_lines(live or {}, (hist or {}).get("tokens") or {}, prices, now, estimates or {},
+                                     (hist or {}).get("estimates") or {})
     unpriced = names["unpriced"]
     tokens_read = resource_id is not None and live is not None
     if tokens_read:  # a failed token read keeps the last list, so today's new deployments stay in the window
-        save_deployments(settings.get("cache_dir"), names["used"])
+        save_deployments(settings.get("cache_dir"), names["by_settings"])
     if hist:
         items, invoiced, first_month = invoice_lines(hist, now)
     else:
@@ -517,7 +623,7 @@ def read(settings):
 
     details = ["Columns: today · this week · this month · all time"]
     if models:
-        details.append("Models, estimated from tokens (up to date):")
+        details.append("Models (Azure estimate, or tokens × price from settings):")
         details += [f"· {line}" for line in models]
     if items:
         details.append("Invoice items, actual (Claude arrives 1-2 days late):")
@@ -527,10 +633,12 @@ def read(settings):
                        f"{time.strftime('%b %d %H:%M', time.localtime(_epoch_seconds(hist.get('fetched'))))}")
     if unpriced:
         details.append("Models shown in tokens have no price (≥ = at least): set them under Foundry prices…")
+    if names["pending"]:
+        details.append("Some token days or months have no Azure estimate (yet): ≥ = at least")
     if names["uncached_input"]:
-        details.append("Input without cache reads is priced as uncached: Azure reports cache reads for Claude models "
-                       "only (may be too high)")
-    details.append("Each total = max(token estimate, invoice); weeks start Monday; days are UTC")
+        details.append("Priced from settings, without cache tokens: all input is priced as uncached, too high if it "
+                       "includes cached input (OpenAI models)")
+    details.append("Each total = max(model estimates, invoice); weeks start Monday; days are UTC")
     r = result("MICROSOFT FOUNDRY", rows=rows, details=details)
     r["unpriced"] = len(unpriced)  # the section's "N models have no price" line (render.section)
     return r

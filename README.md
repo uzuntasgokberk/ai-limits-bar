@@ -30,7 +30,7 @@ A provider that isn't set up on your Mac is hidden automatically, and so are lim
 | **Codex (GPT)** | 5-hour and weekly limits, plan | A short-lived `codex app-server` (Codex's own interface); this tool never touches Codex credentials |
 | **Gemini** | Model quotas (models sharing one pool are one line), reset time, plan | The running Antigravity (`agy`) language server on `127.0.0.1`; Gemini CLI as a fallback |
 | **GitHub Copilot** | Monthly AI-credit (or premium-request) budget, used / total, reset date | `gh api copilot_internal/user` (the GitHub CLI owns the token) |
-| **Microsoft Foundry** | Spend today, this week, this month and all time. Details: every model and invoice item for the same four periods | Azure CLI: Azure Monitor metrics and Cost Management. Off by default |
+| **Microsoft Foundry** | Spend today, this week, this month and all time. Details: every model and invoice item for the same four periods | Azure CLI: Azure Monitor metrics (tokens and Azure's estimated cost) and Cost Management. Off by default |
 
 **Read-only.** This tool never changes anything in your accounts. For example, it can't use a limit reset: Codex messages are restricted to an allow-list of two read-only requests and one notification, and Claude's reset endpoint is never called. Do that in the official app or website. The only thing it ever changes is its own settings file, `config.json`, when you turn a provider on or off, choose what the menu bar shows or set Foundry prices.
 
@@ -99,27 +99,44 @@ On first run `config.json` is created from `config.example.json` (it is git-igno
   - `resource`: the Foundry resource whose token metrics are read.
   - `budget_usd`: optional monthly budget. With a budget, the month line gets a percentage bar.
   - `invoice_refresh_hours`: how often the invoice history is fetched (default 6; at most every 15 minutes on *Refresh now*). Cost Management throttles frequent queries, and past months don't change.
-  - `prices_usd_per_million`: per deployment name: `input`, `output`, `cache_read`, `cache_write_5m`, `cache_write_1h`, in US dollars per million tokens (at most 10,000). **Foundry prices…** in the menu sets them for you (see [Foundry prices](#foundry-prices)). A deployment with tokens but no price (or no price for a token type it used) is counted in tokens only: the totals of the periods with its tokens are marked `≥`, the section says how many models have no price, and Details names them.
+  - `prices_usd_per_million`: per deployment name: `input`, `output`, `cache_read`, `cache_write_5m`, `cache_write_1h`, in US dollars per million tokens (at most 10,000). They are used only for models Azure has no cost estimate for; a price for a model Azure estimates is ignored (see *How Foundry spend is computed* below). **Foundry prices…** in the menu sets them for you (see [Foundry prices](#foundry-prices)). A deployment with tokens, no Azure estimate and no price (or no price for a token type it used) is counted in tokens only: the totals of the periods with its tokens are marked `≥`, the section says how many models have no price, and Details names them.
 - `menu_bar`: what the number in the menu bar shows. `"highest"` (the default) is the highest current percentage of all limits; `{"provider": "claude", "limit": "5-hour"}` is that one limit, named exactly as listed under **Menu bar shows** (see [The menu](#the-menu)), which sets it for you. A name the menu can't offer as a click can still be written here by hand. An invalid value means highest.
 - `debug_shapes`: stores the *structure* of the Claude response (field names and value types only, no values) in the cache, to help when an endpoint changes.
 
 The plugin ignores environment variables, because a SwiftBar link can set them. Switches for testing and troubleshooting are command-line arguments (see [Troubleshooting](#troubleshooting)), which a link cannot set.
 
-**How Foundry spend is computed.** Two sources are combined:
+**How Foundry spend is computed.** All of it is read with the Azure CLI, from Azure Monitor and Cost Management:
 
-- **Token metrics** arrive within minutes and are multiplied by your list prices.
-- **The invoice** is exact, but Claude models on Azure are billed through the Marketplace and reach it one to two days late.
+- **Azure's estimated cost** per model deployment (the Azure Monitor metric `FoundryModelEstimatedCost`, a preview), up to date like the token metrics. Azure has it for some models and not for others (see below).
+- **Token metrics** per deployment, multiplied by your prices for the models Azure has no estimate for (see [Foundry prices](#foundry-prices)).
+- **The invoice** is exact, but late: Claude models on Azure are billed through the Marketplace and reach it one to two days late, other models hours later.
 
-*Today*, *This week* (from Monday) and *This month* each show the larger of the two. *All time* adds the invoiced totals of previous months to this month's figure. Azure Monitor keeps token metrics for only 93 days, so monthly token totals per model are kept in the cache too.
+Each model is handled by the same rule, whoever publishes it:
+
+1. If Azure has an estimate for the deployment, it is used, and a price you set for it is ignored. A day with tokens but no estimate (yet) makes that period `≥`.
+2. Otherwise its tokens × your prices.
+3. Otherwise it is counted in tokens only: the totals of the periods with its tokens are `≥`, the section says *N models have no price*, and **Foundry prices…** lists it. The invoice later shows its actual cost.
+
+Details names each model's source: *(Azure estimate)*, *(price from settings)* or *(no price)*.
+
+Which models have an estimate:
+
+- **Checked**, on one account in November 2026: an Azure OpenAI deployment had one, and a Claude deployment had none. The Azure OpenAI estimate there appears to price cached input at the cached rate (inferred from its size, not documented).
+- **From Microsoft's documentation**: the metric is described as "Estimated USD cost of model usage for this account. Applies to Foundry models only. This value is an estimate and is not an invoice or billed charge." The documentation does not say which models it covers. Foundry's catalog has models sold by Azure (all Azure OpenAI models and selected models from other providers, such as DeepSeek, Meta, Microsoft and Mistral AI) and models from partners and community, which need Azure Marketplace (Microsoft's partner list includes Anthropic's Claude). The Foundry portal shows estimated cost for Claude deployments billed in Claude Consumption Units, and none for older Claude deployments billed per token; whether this metric follows the same split is not documented.
+- **Not checked**: models from Microsoft, Meta, Mistral AI, DeepSeek and other publishers. For such a model you see either an automatic amount marked *(Azure estimate)* in Details, or *(no price)* there, counted in the orange *N models have no price* line, with **Foundry prices…** to set one; in both cases the invoice later.
+
+Microsoft documents the token metrics for "all the models available in the resource, including Azure OpenAI, DeepSeek, and Phi", and cache tokens (reads and writes) for Anthropic deployments only.
+
+*Today*, *This week* (from Monday) and *This month* each show the larger of the model estimates and the invoice. *All time* adds the invoiced totals of previous months to this month's figure. Azure Monitor keeps these metrics for only 93 days, so monthly token and estimate totals per model are kept in the cache too. Azure's estimate and your prices are in US dollars; with an invoice in another currency, the larger of the two compares amounts in different currencies.
 
 The sign says whether a total can be complete:
 
-- `≈`: the token metrics were read and every model with tokens in that period has a price.
+- `≈`: the token metrics were read and every model with tokens in that period has an amount for it (Azure's estimate for each of its days with tokens, or your price).
 - `≥` (at least): otherwise, even when the invoice is larger than the estimate, because the invoice may not contain that usage yet. A new model without a price and nothing invoiced yet shows `≥$0.00`. Every period is `≥` when the token metrics could not be read or `resource` is not set. *All time* takes this month's sign.
 
-Prompt caching: Azure Monitor reports cache reads and writes separately only for Claude models. For other models (for example Azure OpenAI), cached input is most likely counted in the input tokens, so all of it is priced at the `input` price. With heavy prompt caching their estimate can be several times too high, and since each period shows the larger of estimate and invoice, it stays too high. Details then says *Input without cache reads is priced as uncached*.
+Prompt caching, for models priced from your settings: Azure reports cache reads and writes separately only for Claude models. For other models all input tokens are priced at the `input` price, cached or not. For Azure OpenAI models the input tokens appear to include cached input (inferred on the account above), so a price from settings would be several times too high with heavy caching; that is why Azure's estimate is used whenever it exists. Details says *Priced from settings, without cache tokens* when this can apply.
 
-Details lists every model (estimated from tokens, or token counts if it has no price) and every invoice item (Azure OpenAI models by name, Claude grouped because its invoice lines don't name the model, and other services in the resource group), each for today · this week · this month · all time.
+Details lists every model and every invoice item (Azure OpenAI models by name, Claude grouped because its invoice lines don't name the model, other models and services by their service name), each for today · this week · this month · all time.
 
 ## Turning providers on and off
 
@@ -134,7 +151,7 @@ Choose **Providers…** in the menu. A small window opens with one checkbox per 
 
 ## Foundry prices
 
-Foundry spend is estimated from tokens × your price per model (see [How Foundry spend is computed](#settings)). Choose **Foundry prices…** in the menu, or click the orange *N models have no price* line in the Foundry section. A small window lists the model deployments that have tokens, those without a price first (marked *no price*, or *missing Output* when only some token types used have one), with fields for **Input**, **Output**, **Cache read**, **Write 5m** and **Write 1h**, in US dollars per million tokens as on the model's pricing page.
+Azure estimates the cost of some models itself; for the others, Foundry spend is estimated from tokens × your price per model (see [How Foundry spend is computed](#settings)). Choose **Foundry prices…** in the menu, or click the orange *N models have no price* line in the Foundry section. A small window lists the model deployments that have tokens but no Azure estimate, those without a price first (marked *no price*, or *missing Output* when only some token types used have one), with fields for **Input**, **Output**, **Cache read**, **Write 5m** and **Write 1h**, in US dollars per million tokens as on the model's pricing page.
 
 - Type a number such as `2.5`, `2,5` or `0.075` (at most 10,000), or leave the field empty for no price. Something else shows the window again with a note.
 - Cache fields apply to Claude models: Azure reports no cache tokens for other models, so all of their input is priced as **Input** (see the prompt caching note above).
@@ -152,7 +169,7 @@ Foundry spend is estimated from tokens × your price per model (see [How Foundry
 - **Updated**: when the menu was last built.
 - **SwiftBar**: SwiftBar's own menu (preferences, plugin folder, launch at login, quit). SwiftBar's *About*, *Run in Terminal*, *Last updated* and *Disable plugin* items are hidden.
 - Each section's header opens the provider's usage page; **Details** has extra information and the last read time.
-- Microsoft Foundry's totals are marked `≈` or `≥` (see [How Foundry spend is computed](#settings)); an orange *2 models have no price: set prices…* line counts the models with tokens (this month or earlier) that have no price, which make the totals of the periods with their tokens `≥`; a click on it opens **Foundry prices…**.
+- Microsoft Foundry's totals are marked `≈` or `≥` (see [How Foundry spend is computed](#settings)); an orange *2 models have no price: set prices…* line counts the models with tokens (this month or earlier), no Azure estimate and no price, which make the totals of the periods with their tokens `≥`; a click on it opens **Foundry prices…**.
 
 ## Privacy and security
 
@@ -161,7 +178,7 @@ In short:
 - Credentials are never refreshed, stored, logged or printed.
 - Where possible the provider's own tool does the talking (Codex app-server, GitHub CLI, Azure CLI, the Antigravity server).
 - The menu never shows your email, username, tenant or subscription id. Foundry's *Details* submenu does list the model deployment names you chose in Azure and the invoice meter names; keep it closed on a screen recording if those are private.
-- No log files are written. Besides `config.json` (created on the first run, rewritten when you turn a provider on or off, choose what the menu bar shows or set Foundry prices), the only files are a few small cache files in `~/Library/Caches/ai-limits-bar/` (folder 0700, files 0600). They hold numbers, times and labels (including those Foundry deployment and meter names), and are overwritten on every read. Foundry's monthly invoice and token totals are kept there as well (`foundry-history.json`), and the names of the deployments with tokens, for the prices window (`foundry-deployments.json`, no amounts).
+- No log files are written. Besides `config.json` (created on the first run, rewritten when you turn a provider on or off, choose what the menu bar shows or set Foundry prices), the only files are a few small cache files in `~/Library/Caches/ai-limits-bar/` (folder 0700, files 0600). They hold numbers, times and labels (including those Foundry deployment and meter names), and are overwritten on every read. Foundry's monthly invoice, token and estimated-cost totals are kept there as well (`foundry-history.json`), and the names of the deployments that need a price from your settings, for the prices window (`foundry-deployments.json`, no amounts).
 
 See [SECURITY.md](SECURITY.md) for the full model and how to report a problem.
 
