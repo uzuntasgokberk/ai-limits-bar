@@ -101,9 +101,15 @@ def _text(x, limit):
     return None if x is None else str(x).encode("utf-8", "replace").decode("utf-8")[:limit]
 
 
+def _count(x, high=999):
+    """A whole number from 0 to `high` (not a bool, not a float); anything else -> None."""
+    return x if isinstance(x, int) and not isinstance(x, bool) and 0 <= x <= high else None
+
+
 def normalize(r):
     """Brings a provider result or a cached result into a safe shape; None if it is not a result at all.
-    One broken value (NaN, a time given as text, a missing field) can therefore not break the whole menu."""
+    One broken value (NaN, a time given as text, a missing field) can therefore not break the whole menu.
+    `unpriced` (Foundry only): how many deployments with tokens have no usable price; a count or None."""
     if not isinstance(r, dict):
         return None
     rows = []
@@ -117,7 +123,7 @@ def normalize(r):
             "status": r.get("status") if r.get("status") in STATUSES else "unknown",
             "rows": rows[:12], "details": [_text(d, 200) for d in details[:30]],
             "note": _text(r.get("note"), 120), "time": _epoch(r.get("time")),
-            "debug": [_text(d, 900) for d in debug[:60]]}
+            "debug": [_text(d, 900) for d in debug[:60]], "unpriced": _count(r.get("unpriced"))}
 
 
 def bar(percent, width=10):
@@ -184,8 +190,13 @@ def label_width(results):
     return max(10, min(18, max(lengths, default=8) + 2))
 
 
+def unpriced_text(count):
+    """Fixed text with a number: why the Foundry totals are marked `≥`."""
+    return f"{count} model has no price (see Details)" if count == 1 else f"{count} models have no price (see Details)"
+
+
 def section(key, r, now, width=DEFAULT_WIDTH):
-    """Menu lines of one provider."""
+    """Menu lines of one provider. Foundry also gets a line saying how many models have no price, if any."""
     href = f"href={LINKS[key]}" if key in LINKS else None
     out = [header(key, href)]
     if r.get("note"):
@@ -208,6 +219,8 @@ def section(key, r, now, width=DEFAULT_WIDTH):
             out.append(f"{pad}{clean(reset)}{_params(MONO, f'color={GREY}', href)}")
     if not r.get("rows") and not r.get("note"):
         out.append(f"unknown{_params('size=12', f'color={GREY}', href)}")
+    if key == "foundry" and r.get("unpriced"):
+        out.append(f"{unpriced_text(r['unpriced'])}{_params('size=12', f'color={ORANGE}', href)}")
     details = [clean(d, 140) for d in r.get("details", [])]
     if r.get("time"):
         details.append(f"Last read {day_month(r['time'])} {clock(r['time'])}")

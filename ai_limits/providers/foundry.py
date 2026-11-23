@@ -13,9 +13,10 @@ minutes of a failed attempt, and kept in `foundry-history.json` in the cache fol
 per-deployment amounts and token totals only).
 
 Totals: each period = max(token estimate, invoiced amount). All time = invoiced months before this one + this
-month's total. The menu never shows the subscription id, tenant, resource or resource-group name; deployment
-names and invoice item (model and service) names appear only in Details, and in the cache. Disabled by default:
-set it up in config.json.
+month's total. A total is marked `≈` only if it can be complete, otherwise `≥` (at least): see spend_rows. The
+section says how many deployments with tokens have no usable price (`unpriced` in the result). The menu never
+shows the subscription id, tenant, resource or resource-group name; deployment names and invoice item (model and
+service) names appear only in Details, and in the cache. Disabled by default: set it up in config.json.
 """
 import contextlib
 import json
@@ -29,9 +30,12 @@ from ai_limits.common import (NotConfigured, SessionExpired, find_tool, read_jso
                               write_private_json)
 
 METRICS = ["InputTokens", "OutputTokens", "cacheReadInputTokens", "ephemeral5mInputTokens", "ephemeral1hInputTokens"]
-# Price key -> metric. InputTokens excludes cache reads and writes (Anthropic convention).
+# Price key -> metric. For Anthropic deployments InputTokens is taken to exclude cache reads and writes (Anthropic's
+# convention; Azure doesn't say). Other deployments report no cache metrics at all (see model_lines).
 PRICE_FIELD = {"InputTokens": "input", "OutputTokens": "output", "cacheReadInputTokens": "cache_read",
                "ephemeral5mInputTokens": "cache_write_5m", "ephemeral1hInputTokens": "cache_write_1h"}
+# Documented by Azure Monitor for Anthropic model deployments only.
+CACHE_METRICS = ("cacheReadInputTokens", "ephemeral5mInputTokens", "ephemeral1hInputTokens")
 AZURE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._()-]{0,89}")
 HISTORY_FILE = "foundry-history.json"
 PERIOD_KEY = re.compile(r"\d{4}-\d{2}(-\d{2})?")
@@ -294,11 +298,15 @@ def money(x, currency="USD"):
 
 def model_lines(live, saved_tokens, prices, now):
     """Per deployment: today · this week · this month · all time (estimated $, or output tokens without a price),
-    and the estimated totals {'today','week','month'} -> (amount, every deployment priced?)."""
+    the estimated totals {'today','week','month'} -> (amount, every deployment with tokens in it priced?), and
+    deployment names: 'unpriced' (tokens, but a used token type has no valid price) and 'uncached_input' (priced,
+    with input tokens but no cache tokens at all). Azure Monitor reports cache reads and writes for Anthropic
+    deployments only; for the others (e.g. Azure OpenAI) cached input is most likely inside InputTokens, so their
+    input is priced as uncached and the estimate can be too high (the Details footnote says so)."""
     starts = period_starts(now)
     this_month = now.strftime("%Y-%m")
     totals = {p: [0.0, True] for p in starts}
-    lines = []
+    lines, names = [], {"unpriced": [], "uncached_input": []}
     for deployment in sorted(set(live) | set(saved_tokens)):
         days = live.get(deployment, {})
         per = {p: sum_days(days, first) for p, first in starts.items()}
@@ -326,9 +334,45 @@ def model_lines(live, saved_tokens, prices, now):
             else:
                 cells.append(f"{short_number(t.get('OutputTokens', 0))} out")
         sort_key = estimate(all_time, price)
+        if sort_key is None:
+            names["unpriced"].append(deployment)
+        elif all_time.get("InputTokens") and not any(all_time.get(m) for m in CACHE_METRICS):
+            names["uncached_input"].append(deployment)
         lines.append((sort_key if sort_key is not None else -1, f"{deployment}: " + " · ".join(cells)))
     lines.sort(key=lambda x: -x[0])
-    return [line for _, line in lines], {p: (v[0], v[1]) for p, v in totals.items()}
+    return [line for _, line in lines], {p: (v[0], v[1]) for p, v in totals.items()}, names
+
+
+def spend_rows(est, invoiced, tokens_read, budget, currency):
+    """The main rows: Today, This week, This month and All time.
+
+    Each period shows max(token estimate, invoiced amount). The sign says whether that can be the whole amount:
+    - `≈` only if the token metrics were read and every deployment with tokens in that period has a usable price.
+      The token estimate then covers all model usage up to a few minutes ago, and the invoice covers the rest.
+    - `≥` (at least) otherwise, whatever the invoice says. The invoice is exact but late (Claude 1-2 days, other
+      models hours), so even an invoice larger than the estimate may not yet contain the unpriced usage, and
+      without token metrics (failed, or no `resource`) today's usage is not known at all. 0 versus 0 is `≥` too.
+    All time = invoiced months before this one + this month's amount, with this month's sign.
+    est: model_lines' totals; invoiced: invoice_lines' totals or None (no invoice history yet)."""
+    if not tokens_read and not invoiced:
+        return [row("Spend", value="unknown")]
+    rows, month = [], (0.0, "≥")
+    for period, label in (("today", "Today"), ("week", "This week"), ("month", "This month")):
+        e = est[period][0] if tokens_read else 0.0
+        amount = max(e, invoiced[period] if invoiced else 0.0)
+        sign = "≈" if tokens_read and est[period][1] else "≥"
+        if period == "month":
+            month = (amount, sign)
+            if budget:
+                rows.append(row(label, percent=100.0 * amount / budget,
+                                value=f"{sign}{money(amount, currency)} / {money(budget, currency)}"))
+                continue
+        rows.append(row(label, value=f"{sign}{money(amount, currency)}"))
+    if invoiced is not None:
+        rows.append(row("All time", value=f"{month[1]}{money(invoiced['earlier'] + month[0], currency)}"))
+    else:
+        rows.append(row("All time", value="waiting for Azure Cost Management"))
+    return rows
 
 
 def invoice_lines(hist, now):
@@ -394,34 +438,14 @@ def read(settings):
     except Exception:
         hist = None
 
-    models, est = model_lines(live or {}, (hist or {}).get("tokens") or {}, prices, now)
+    models, est, names = model_lines(live or {}, (hist or {}).get("tokens") or {}, prices, now)
+    unpriced = names["unpriced"]
     if hist:
         items, invoiced, first_month = invoice_lines(hist, now)
     else:
         items, invoiced, first_month = [], None, None
     currency = (hist or {}).get("currency") or "USD"
-
-    def total(period):
-        e = est[period][0] if live is not None else 0.0
-        i = invoiced[period] if invoiced else 0.0
-        return max(e, i), est[period][1] or i >= e
-
-    rows = []
-    if live is None and not invoiced:
-        rows.append(row("Spend", value="unknown"))
-    else:
-        for period, label in (("today", "Today"), ("week", "This week"), ("month", "This month")):
-            amount, exact = total(period)
-            sign = "≈" if exact else "≥"
-            if period == "month" and budget:
-                rows.append(row(label, percent=100.0 * amount / budget,
-                                value=f"{sign}{money(amount, currency)} / {money(budget, currency)}"))
-            else:
-                rows.append(row(label, value=f"{sign}{money(amount, currency)}"))
-        if invoiced is not None:
-            rows.append(row("All time", value=f"≈{money(invoiced['earlier'] + total('month')[0], currency)}"))
-        else:
-            rows.append(row("All time", value="waiting for Azure Cost Management"))
+    rows = spend_rows(est, invoiced, resource_id is not None and live is not None, budget, currency)
 
     details = ["Columns: today · this week · this month · all time"]
     if models:
@@ -433,7 +457,12 @@ def read(settings):
     if first_month:
         details.append(f"All time since {first_month}; invoices checked "
                        f"{time.strftime('%b %d %H:%M', time.localtime(_epoch_seconds(hist.get('fetched'))))}")
-    if any(" out" in line for line in models):
+    if unpriced:
         details.append("Models shown in tokens have no price in config.json (≥ = at least)")
+    if names["uncached_input"]:
+        details.append("Input without cache reads is priced as uncached: Azure reports cache reads for Claude models "
+                       "only (may be too high)")
     details.append("Each total = max(token estimate, invoice); weeks start Monday; days are UTC")
-    return result("MICROSOFT FOUNDRY", rows=rows, details=details)
+    r = result("MICROSOFT FOUNDRY", rows=rows, details=details)
+    r["unpriced"] = len(unpriced)  # the section's "N models have no price" line (render.section)
+    return r

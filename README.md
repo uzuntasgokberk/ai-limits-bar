@@ -99,7 +99,7 @@ On first run `config.json` is created from `config.example.json` (it is git-igno
   - `resource`: the Foundry resource whose token metrics are read.
   - `budget_usd`: optional monthly budget. With a budget, the month line gets a percentage bar.
   - `invoice_refresh_hours`: how often the invoice history is fetched (default 6; at most every 15 minutes on *Refresh now*). Cost Management throttles frequent queries, and past months don't change.
-  - `prices_usd_per_million`: per deployment name: `input`, `output`, `cache_read`, `cache_write_5m`, `cache_write_1h`. A deployment without a price is marked `≥` and named in Details.
+  - `prices_usd_per_million`: per deployment name: `input`, `output`, `cache_read`, `cache_write_5m`, `cache_write_1h`. A deployment with tokens but no price (or no price for a token type it used) is counted in tokens only: the totals of the periods with its tokens are marked `≥`, the section says how many models have no price, and Details names them.
 - `menu_bar`: what the number in the menu bar shows. `"highest"` (the default) is the highest current percentage of all limits; `{"provider": "claude", "limit": "5-hour"}` is that one limit, named exactly as listed under **Menu bar shows** (see [The menu](#the-menu)), which sets it for you. A name the menu can't offer as a click can still be written here by hand. An invalid value means highest.
 - `debug_shapes`: stores the *structure* of the Claude response (field names and value types only, no values) in the cache, to help when an endpoint changes.
 
@@ -111,6 +111,13 @@ The plugin ignores environment variables, because a SwiftBar link can set them. 
 - **The invoice** is exact, but Claude models on Azure are billed through the Marketplace and reach it one to two days late.
 
 *Today*, *This week* (from Monday) and *This month* each show the larger of the two. *All time* adds the invoiced totals of previous months to this month's figure. Azure Monitor keeps token metrics for only 93 days, so monthly token totals per model are kept in the cache too.
+
+The sign says whether a total can be complete:
+
+- `≈`: the token metrics were read and every model with tokens in that period has a price.
+- `≥` (at least): otherwise, even when the invoice is larger than the estimate, because the invoice may not contain that usage yet. A new model without a price and nothing invoiced yet shows `≥$0.00`. Every period is `≥` when the token metrics could not be read or `resource` is not set. *All time* takes this month's sign.
+
+Prompt caching: Azure Monitor reports cache reads and writes separately only for Claude models. For other models (for example Azure OpenAI), cached input is most likely counted in the input tokens, so all of it is priced at the `input` price. With heavy prompt caching their estimate can be several times too high, and since each period shows the larger of estimate and invoice, it stays too high. Details then says *Input without cache reads is priced as uncached*.
 
 Details lists every model (estimated from tokens, or token counts if it has no price) and every invoice item (Azure OpenAI models by name, Claude grouped because its invoice lines don't name the model, and other services in the resource group), each for today · this week · this month · all time.
 
@@ -134,6 +141,7 @@ Choose **Providers…** in the menu. A small window opens with one checkbox per 
 - **Updated**: when the menu was last built.
 - **SwiftBar**: SwiftBar's own menu (preferences, plugin folder, launch at login, quit). SwiftBar's *About*, *Run in Terminal*, *Last updated* and *Disable plugin* items are hidden.
 - Each section's header opens the provider's usage page; **Details** has extra information and the last read time.
+- Microsoft Foundry's totals are marked `≈` or `≥` (see [How Foundry spend is computed](#settings)); an orange *2 models have no price* line says why a total is `≥`.
 
 ## Privacy and security
 

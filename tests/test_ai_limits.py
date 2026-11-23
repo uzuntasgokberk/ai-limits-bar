@@ -243,6 +243,25 @@ class Render(unittest.TestCase):
         self.assertIn("This month  $3.40", text)
         self.assertNotIn("%", text.split("\n", 1)[1])
 
+    def test_foundry_says_how_many_models_have_no_price(self):
+        rows = [row("Today", value="≥$3.00"), row("This month", value="≥$9.00"), row("All time", value="≥$9.50")]
+        for count, text in ((1, "1 model has no price (see Details)"), (2, "2 models have no price (see Details)")):
+            r = render.normalize(dict(res("MICROSOFT FOUNDRY", rows), unpriced=count))
+            lines = top_level(render.menu([("foundry", r)], NOW))
+            line = next(x for x in lines if x.split(" | ")[0] == text)
+            self.assertLess(lines.index(next(x for x in lines if x.startswith("All time"))), lines.index(line))
+            self.assertLess(lines.index(line), lines.index(next(x for x in lines if x.startswith("Details"))))
+            self.assertEqual(swiftbar_params(line), {"size": "12", "color": render.ORANGE,
+                                                     "href": render.LINKS["foundry"]})
+        tooltip = swiftbar_params(render.menu([("foundry", r)], NOW).splitlines()[0])["tooltip"]
+        self.assertEqual(tooltip, "Foundry ≥$3.00")  # the tooltip still reads the first row
+        for count in (0, None, "2", True, -1, 2.5, float("nan"), 10**6):
+            r = render.normalize(dict(res("MICROSOFT FOUNDRY", rows), unpriced=count))
+            self.assertIn(r["unpriced"], (0, None), repr(count))
+            self.assertNotIn("no price", render.menu([("foundry", r)], NOW), repr(count))
+        other = render.normalize(dict(res("GITHUB COPILOT", [row("AI credits", 26.0)]), unpriced=3))
+        self.assertNotIn("no price", render.menu([("copilot", other)], NOW))  # a Foundry line only
+
     def test_refresh_item_runs_no_command(self):
         lines = render.menu([], NOW, True, "/tmp/config.json").splitlines()
         line = next(x for x in lines if x.startswith("Refresh now"))
@@ -1063,13 +1082,109 @@ class FoundrySpend(unittest.TestCase):
                 "unpriced": {"2031-08-07": {"OutputTokens": 7}}}
         saved = {"m": {"2031-07": {"OutputTokens": 10_000_000}, "2031-08": {"OutputTokens": 333}},  # month ignored
                  "old": {"2031-05": {"OutputTokens": 2500}}}
-        lines, est = foundry.model_lines(live, saved, prices, self.now)
+        lines, est, names = foundry.model_lines(live, saved, prices, self.now)
         self.assertEqual(est["today"], (6.0, False))  # unpriced deployment used today -> "at least"
         self.assertEqual(est["week"][0], 15.0)        # Monday Aug 4 .. Aug 7
         self.assertEqual(est["month"][0], 30.0)
         self.assertEqual(lines[0], "m: ≈$6.00 · ≈$15.00 · ≈$30.00 · ≈$60.00")
         self.assertIn("old: – · – · – · 2.5K out", lines)
         self.assertIn("unpriced: 7 out · 7 out · 7 out · 7 out", lines)
+        self.assertEqual(names["unpriced"], ["old", "unpriced"])  # every deployment with tokens but no usable price
+        _, est, names = foundry.model_lines({"m": live["m"]}, {}, prices, self.now)
+        self.assertEqual((est["today"], names["unpriced"]), ((6.0, True), []))
+
+    def test_priced_input_without_cache_reads_is_named(self):
+        prices = {p: {"input": 2.0, "output": 8.0, "cache_read": 0.2} for p in ("plain", "cached", "no-input")}
+        live = {"plain": {"2031-08-07": {"InputTokens": 900, "OutputTokens": 50}},
+                "cached": {"2031-08-07": {"InputTokens": 900, "cacheReadInputTokens": 9000, "OutputTokens": 50}},
+                "no-input": {"2031-08-07": {"OutputTokens": 50}},
+                "unpriced": {"2031-08-07": {"InputTokens": 900}}}
+        _, _, names = foundry.model_lines(live, {}, prices, self.now)
+        # Azure reports cache reads for Claude deployments only: elsewhere all input is priced as uncached input.
+        self.assertEqual(names["uncached_input"], ["plain"])
+        self.assertEqual(names["unpriced"], ["unpriced"])
+
+    PRICED = {"today": (6.0, True), "week": (15.0, True), "month": (30.0, True)}
+
+    @staticmethod
+    def spend(est, invoiced=None, tokens_read=True, budget=None):
+        return {r["label"]: r["value"] for r in foundry.spend_rows(est, invoiced, tokens_read, budget, "USD")}
+
+    def test_spend_rows_are_exact_only_when_every_used_model_is_priced(self):
+        nothing = {"today": 0.0, "week": 0.0, "month": 0.0, "earlier": 5.0}
+        self.assertEqual(self.spend(self.PRICED, nothing), {"Today": "≈$6.00", "This week": "≈$15.00",
+                                                            "This month": "≈$30.00", "All time": "≈$35.00"})
+        # The reported case: a new deployment without a price. 0 estimated versus 0 invoiced is not exact.
+        unpriced = {p: (0.0, False) for p in ("today", "week", "month")}
+        self.assertEqual(self.spend(unpriced, dict(nothing, earlier=0.0)),
+                         {"Today": "≥$0.00", "This week": "≥$0.00", "This month": "≥$0.00", "All time": "≥$0.00"})
+        # An invoice larger than the estimate may still lack the unpriced usage (it arrives hours to days late).
+        late = {"today": 2.5, "week": 2.5, "month": 40.0, "earlier": 5.0}
+        self.assertEqual(self.spend(unpriced, late),
+                         {"Today": "≥$2.50", "This week": "≥$2.50", "This month": "≥$40.00", "All time": "≥$45.00"})
+        # Unpriced tokens only earlier this month: today and this week stay exact; the month and all time don't.
+        earlier = {"today": (1.0, True), "week": (15.0, True), "month": (30.0, False)}
+        self.assertEqual(self.spend(earlier, late),
+                         {"Today": "≈$2.50", "This week": "≈$15.00", "This month": "≥$40.00", "All time": "≥$45.00"})
+        self.assertEqual(self.spend(self.PRICED), {"Today": "≈$6.00", "This week": "≈$15.00", "This month": "≈$30.00",
+                                                   "All time": "waiting for Azure Cost Management"})
+
+    def test_spend_rows_without_token_metrics_are_at_least(self):
+        late = {"today": 2.5, "week": 2.5, "month": 40.0, "earlier": 5.0}
+        # Token metrics not read (failed, or no `resource`): the invoice alone, which is late, and estimates ignored.
+        self.assertEqual(self.spend(self.PRICED, late, tokens_read=False),
+                         {"Today": "≥$2.50", "This week": "≥$2.50", "This month": "≥$40.00", "All time": "≥$45.00"})
+        self.assertEqual(self.spend(self.PRICED, None, tokens_read=False), {"Spend": "unknown"})
+
+    def test_spend_rows_budget_keeps_the_sign(self):
+        unpriced = {p: (0.0, False) for p in ("today", "week", "month")}
+        month = foundry.spend_rows(unpriced, {"today": 0.0, "week": 0.0, "month": 25.0, "earlier": 0.0}, True, 100.0,
+                                   "USD")[2]
+        self.assertEqual((month["label"], month["percent"], month["value"]),
+                         ("This month", 25.0, "≥$25.00 / $100.00"))
+        priced = foundry.spend_rows(self.PRICED, None, True, 100.0, "USD")[2]
+        self.assertEqual((priced["percent"], priced["value"]), (30.0, "≈$30.00 / $100.00"))
+
+    def read_with(self, settings, tokens):
+        """foundry.read with Azure replaced: az answers the subscription and resource id, the token metrics are
+        `tokens`, there is no invoice history, and today is self.now."""
+        now = self.now
+
+        class FixedNow(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+        answers = iter(["demo-subscription",
+                        "/subscriptions/demo/resourceGroups/rg/providers/Microsoft.CognitiveServices/accounts/demo"])
+        with mock.patch.object(foundry, "find_tool", return_value="/opt/homebrew/bin/az"), \
+                mock.patch.object(foundry, "_az", side_effect=lambda *a, **k: next(answers)), \
+                mock.patch.object(foundry, "_tokens", return_value=tokens), \
+                mock.patch.object(foundry, "history", return_value=None), \
+                mock.patch.object(foundry, "datetime", FixedNow):
+            return foundry.read(settings)
+
+    def test_read_marks_unpriced_usage_and_counts_it(self):
+        live = {"demo-model": {"2031-08-07": {"InputTokens": 900, "OutputTokens": 271_800}},
+                "priced-model": {"2031-08-07": {"OutputTokens": 1_000_000}}}
+        settings = {"resource_group": "demo-rg", "resource": "demo-resource",
+                    "prices_usd_per_million": {"priced-model": {"input": 1.0, "output": 3.0}}}
+        for tokens, expected, count in ((live, "≥$3.00", 1), ({"priced-model": live["priced-model"]}, "≈$3.00", 0)):
+            r = self.read_with(settings, tokens)
+            values = {x["label"]: x["value"] for x in r["rows"]}
+            self.assertEqual([values[k] for k in ("Today", "This week", "This month", "All time")],
+                             [expected, expected, expected, "waiting for Azure Cost Management"])
+            self.assertEqual(r["unpriced"], count)
+            self.assertEqual(render.normalize(r)["unpriced"], count)  # survives the cache
+        details = self.read_with(settings, live)["details"]
+        self.assertIn("· demo-model: 271.8K out · 271.8K out · 271.8K out · 271.8K out", details)
+        self.assertTrue(any(x.startswith("Models shown in tokens have no price") for x in details))
+        self.assertFalse(any("cache reads" in x for x in details))  # the priced model has no input tokens
+        live["priced-model"]["2031-08-07"]["InputTokens"] = 5000
+        details = self.read_with(settings, live)["details"]
+        caveat = [x for x in details if "cache reads" in x]
+        self.assertEqual(caveat, ["Input without cache reads is priced as uncached: Azure reports cache reads for "
+                                  "Claude models only (may be too high)"])
+        self.assertLessEqual(len(caveat[0]), 140)  # render.section's limit for a detail line
 
     def test_invoice_lines(self):
         hist = {"currency": "USD",
