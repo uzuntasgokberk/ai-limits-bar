@@ -5,9 +5,11 @@ and passed to SwiftBar as `image=<light>,<dark>`.
 Drawing: a fixed JavaScript-for-Automation script (`SCRIPT`) run by /usr/bin/osascript without a shell and with
 the fixed environment, like the panels in panel.py. Nothing is ever put into the script text: every value is an
 osascript argument, checked against a strict pattern before the run (`arguments`). The answer must be exactly two
-lines of base64, each a PNG of the expected height within the size caps (`parse`); anything else, a non-zero exit or
-the timeout means no strip, and the menu bar shows the gauge and percentage as text instead (render.menu).
-The images are cached in the cache folder by their input values: a run with the same values starts no process.
+lines of base64, each a complete PNG of the expected height within the size caps (`parse`): its chunks, their
+checksums and their order are checked, and its pixel data must unpack to exactly the size the header says
+(`check_png`); anything else, a non-zero exit or the timeout means no strip, and the menu bar shows the gauge and
+percentage as text instead (render.menu). The images are cached in the cache folder by their input values: a run
+with the same values starts no process; a cached image is checked the same way whenever it is read back.
 
 Logos: the middle of a ring is a mark from two folders, by fixed file names (never from provider data or config):
 the user's own files in LOGO_DIR (`claude.svg`, `codex-light.png` ...) win over the project's own drawings shipped in
@@ -29,6 +31,7 @@ import re
 import stat
 import struct
 import subprocess
+import zlib
 
 from ai_limits import render
 from ai_limits.common import HOME, run, write_private_json
@@ -67,7 +70,6 @@ _GAUGE_TEXT = re.compile(r"\d{1,3}%|–")
 _VALUE = re.compile(r"|\d{1,3}")
 _B64 = re.compile(r"[A-Za-z0-9+/]+={0,2}")
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-_PNG_END = b"\x00\x00\x00\x00IEND\xaeB`\x82"
 
 # Geometry: the design's arcs of 164 degrees with a 16-degree gap at the top and the bottom and butt ends; sized for
 # the optical weight of the gauge next to them (a thin ring with a mark inside reads smaller than a solid glyph of the
@@ -349,19 +351,67 @@ def arguments(values):
     return argv
 
 
+def _png_parts(data):
+    """(IHDR body, IDAT bodies joined) of a PNG, or None. After the signature, chunks must fill `data` to its end,
+    each with a length that fits, a type of four ASCII letters and a correct CRC-32. The critical chunks (upper-case
+    first letter) must be one IHDR as the first chunk, then one or more IDAT with no chunk between them, then one
+    empty IEND as the last chunk. Ancillary chunks (lower-case first letter) may stand before and after the IDAT
+    chunks, with any content: macOS writes several, and which ones is up to its version."""
+    if data[:8] != _PNG_SIGNATURE:
+        return None
+    kinds, bodies, at = [], [], 8
+    while at < len(data):
+        if len(data) - at < 12:  # length, type and CRC-32 alone
+            return None
+        length, kind = struct.unpack(">I4s", data[at:at + 8])
+        body, crc = data[at + 8:at + 8 + length], data[at + 8 + length:at + 12 + length]
+        if len(crc) != 4 or not kind.isalpha() or struct.unpack(">I", crc)[0] != zlib.crc32(kind + body):
+            return None
+        kinds.append(kind)
+        bodies.append(body)
+        at += 12 + length
+    count = kinds.count(b"IDAT")
+    if not count or [kind for kind in kinds if kind[:1].isupper()] != [b"IHDR"] + [b"IDAT"] * count + [b"IEND"]:
+        return None
+    first = kinds.index(b"IDAT")
+    if (kinds[0] != b"IHDR" or kinds[-1] != b"IEND" or bodies[-1]
+            or kinds[first:first + count] != [b"IDAT"] * count):
+        return None
+    return bodies[0], b"".join(bodies[first:first + count])
+
+
+def _unpacks(stream, rows, row):
+    """True if `stream` is one complete zlib stream, with nothing after it, of exactly `rows` scanlines of `row`
+    bytes, each starting with a filter type of 0 to 4. Never unpacks more than one byte past that size: the byte
+    that shows a longer stream, and the room a stream of exactly that size needs to reach its end."""
+    size = rows * row
+    unpacker = zlib.decompressobj()
+    try:
+        pixels = unpacker.decompress(stream, size + 1)  # never 0: that would mean no limit
+    except zlib.error:
+        return False
+    if len(pixels) != size or not unpacker.eof or unpacker.unused_data or unpacker.unconsumed_tail:
+        return False
+    return max(pixels[::row]) <= 4
+
+
 def check_png(data, width=None):
-    """The PNG's width in pixels if `data` is an RGBA PNG HEIGHT * SCALE pixels high, at most MAX_WIDTH * SCALE wide
-    (and exactly `width` if given) and MAX_PNG_BYTES long, ending with IEND; otherwise None."""
-    if not isinstance(data, bytes) or not 33 + 12 <= len(data) <= MAX_PNG_BYTES:
+    """The PNG's width in pixels if `data` is a complete RGBA PNG HEIGHT * SCALE pixels high, at most
+    MAX_WIDTH * SCALE wide (and exactly `width` if given) and MAX_PNG_BYTES long; otherwise None. Complete: every
+    chunk well formed, with a correct CRC-32 and in its place, an empty IEND at the very end (_png_parts); a 13-byte
+    IHDR saying 8 bits per sample, colour type 6 and compression, filter and interlace 0; and pixel data that is
+    one zlib stream of exactly height * (1 + 4 * width) bytes (_unpacks)."""
+    if not isinstance(data, bytes) or len(data) > MAX_PNG_BYTES:
         return None
-    if data[:8] != _PNG_SIGNATURE or data[12:16] != b"IHDR" or data[-12:] != _PNG_END:
+    parts = _png_parts(data)
+    if parts is None or len(parts[0]) != 13:
         return None
-    w, h = struct.unpack(">II", data[16:24])
-    if h != HEIGHT * SCALE or not 1 <= w <= MAX_WIDTH * SCALE or data[24] != 8 or data[25] != 6:
+    w, h, *rest = struct.unpack(">IIBBBBB", parts[0])
+    if h != HEIGHT * SCALE or not 1 <= w <= MAX_WIDTH * SCALE or rest != [8, 6, 0, 0, 0]:
         return None
     if width is not None and w != width:
         return None
-    return w
+    return w if _unpacks(parts[1], h, 1 + 4 * w) else None
 
 
 def parse(code, stdout):

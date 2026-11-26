@@ -29,14 +29,17 @@ import re
 import select
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import tracemalloc
 import unicodedata
 import unittest
 import urllib.request
+import zlib
 from datetime import datetime, timezone
 from unittest import mock
 
@@ -1577,16 +1580,42 @@ class WindowFields(unittest.TestCase):
 
 # ---- menu bar rings -------------------------------------------------------------------------------------------
 
-def make_png(width, height=44, colour_type=6, end=True):
-    """A minimal PNG (made here, nothing drawn): IHDR with these values, one empty IDAT, IEND."""
-    import struct
-    import zlib
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+PNG_BUILT = 32 * 1024 * 1024  # make_png builds the scanlines of a picture up to this many bytes of them
 
-    def chunk(kind, body):
-        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body) & 0xFFFFFFFF)
-    ihdr = struct.pack(">IIBBBBB", width, height, 8, colour_type, 0, 0, 0)
-    data = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(b"\x00"))
-    return data + chunk(b"IEND", b"") if end else data
+
+def png_chunk(kind, body=b"", crc=None):
+    """One PNG chunk: length, type, body and checksum (`crc` puts another number in its place)."""
+    crc = zlib.crc32(kind + body) if crc is None else crc
+    return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", crc)
+
+
+def png_header(width, height=44, colour_type=6, methods=(0, 0, 0)):
+    """The IHDR chunk: 8 bits per sample; methods: compression, filter, interlace."""
+    return png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, colour_type, *methods))
+
+
+def png_pixels(width, height=44, samples=4):
+    """The zlib stream of a picture with every sample 0 (transparent): per row a filter byte 0, then the samples."""
+    return zlib.compress(bytes(height * (1 + samples * width)))
+
+
+def make_png(width, height=44, colour_type=6, end=True, body=None):
+    """A complete PNG (made here, nothing drawn): IHDR with these values, one IDAT with every sample 0, IEND; `body`
+    replaces the IDAT chunk with other chunks. Only a picture too large to build (the logo tests' header checks, over
+    PNG_BUILT bytes of scanlines) gets a single byte in its IDAT instead."""
+    if body is None:
+        samples = 3 if colour_type == 2 else 4
+        built = height * (1 + samples * width) <= PNG_BUILT
+        body = png_chunk(b"IDAT", png_pixels(width, height, samples) if built else zlib.compress(b"\x00"))
+    data = PNG_SIGNATURE + png_header(width, height, colour_type) + body
+    return data + png_chunk(b"IEND") if end else data
+
+
+def flipped(data, at):
+    """`data` with one bit of its byte at `at` changed."""
+    at %= len(data)
+    return data[:at] + bytes([data[at] ^ 1]) + data[at + 1:]
 
 
 def b64(data):
@@ -1732,6 +1761,159 @@ class RingDrawing(unittest.TestCase):
         with mock.patch.object(ring, "MAX_PNG_BYTES", 40):
             self.assertIsNone(ring.parse(0, f"{a}\n{b}\n"))  # over the byte cap
 
+    def refused(self, cases):
+        """Every image of {what: bytes} is within the byte cap, and check_png and parse (on either line) refuse it."""
+        good = self.pair[0]
+        self.assertEqual([what for what, data in cases.items() if len(data) > ring.MAX_PNG_BYTES], [])
+        self.assertEqual([what for what, data in cases.items() if ring.check_png(data) is not None
+                          or ring.parse(0, f"{b64(data)}\n{good}\n") or ring.parse(0, f"{good}\n{b64(data)}\n")], [])
+
+    def test_png_needs_more_than_a_header_and_a_trailer(self):
+        good = make_png(296)
+        self.assertEqual(ring.check_png(good), 296)
+        idat, end = png_chunk(b"IDAT", png_pixels(296)), png_chunk(b"IEND")
+        other = bytes(range(256)) * 352  # 90 KB
+        longer = png_chunk(b"IHDR", struct.pack(">IIBBBBBB", 296, 44, 8, 6, 0, 0, 0, 0))
+        cases = {"no IDAT": make_png(296, body=b""),
+                 "an IHDR length of 999999": good[:8] + struct.pack(">I", 999999) + good[12:],
+                 "an IHDR of 14 bytes": PNG_SIGNATURE + longer + idat + end,
+                 "90 KB of other bytes for a body": make_png(296, body=other),
+                 "90 KB of other bytes after the pixels": make_png(296, body=idat + other)}
+        for methods in ((9, 9, 9), (1, 0, 0), (0, 1, 0), (0, 0, 1)):  # compression, filter, interlace: only 0, 0, 0
+            cases[f"methods {methods}"] = PNG_SIGNATURE + png_header(296, methods=methods) + idat + end
+        self.assertEqual(len(cases["no IDAT"]), 45)
+        self.refused(cases)
+
+    def test_png_chunk_checksums_are_checked(self):
+        parts = {"IHDR": png_header(296), "pHYs": png_chunk(b"pHYs", struct.pack(">IIB", 5669, 5669, 1)),
+                 "IDAT": png_chunk(b"IDAT", png_pixels(296)), "IEND": png_chunk(b"IEND")}
+        good = PNG_SIGNATURE + b"".join(parts.values())
+        self.assertEqual(ring.check_png(good), 296)
+        cases = {}
+        for kind, part in parts.items():
+            changes = {"another checksum": flipped(part, -1), "a checksum of 0": part[:-4] + bytes(4)}
+            if kind != "IEND":
+                changes["a changed body under the old checksum"] = flipped(part, -5)
+            for what, changed in changes.items():
+                cases[f"{kind}: {what}"] = PNG_SIGNATURE + b"".join(dict(parts, **{kind: changed}).values())
+        cases["pHYs: a changed type under the old checksum"] = good.replace(b"pHYs", b"pHYt")
+        self.refused(cases)
+        for at in range(len(good)):  # a damaged file: whichever byte it is
+            self.assertIsNone(ring.check_png(flipped(good, at)), at)
+
+    def test_png_pixel_data_must_unpack_to_exactly_its_size(self):
+        row = 1 + 4 * 296
+        size = 44 * row
+        good = png_pixels(296)
+        self.assertEqual(zlib.decompress(good), bytes(size))
+
+        def png(stream):
+            return make_png(296, body=png_chunk(b"IDAT", stream))
+        mixed = b"".join(bytes([y % 5]) + bytes((x + y) % 256 for x in range(row - 1)) for y in range(44))
+        for what, stream in {"every sample 0": good, "every filter type, other samples": zlib.compress(mixed),
+                             "stored, not compressed": zlib.compress(mixed, 0)}.items():
+            self.assertEqual(ring.check_png(png(stream)), 296, what)
+        self.refused({what: png(stream) for what, stream in {
+            "one row too few": png_pixels(296, 43),
+            "one row too many": png_pixels(296, 45),
+            "one byte too few": zlib.compress(bytes(size - 1)),
+            "one byte too many": zlib.compress(bytes(size + 1)),
+            "a zlib stream of nothing": zlib.compress(b""),
+            "an empty IDAT": b"",
+            "a zlib stream without its last byte": good[:-1],
+            "half a zlib stream": good[:len(good) // 2],
+            "a byte after the zlib stream": good + b"\x00",
+            "a second zlib stream": good + good,
+            "not a zlib stream": b"made up, not compressed",
+            "no zlib header and trailer": good[2:-4],
+            "another checksum in the zlib stream": flipped(good, -1),
+            "filter type 5 in the first row": zlib.compress(b"\x05" + bytes(size - 1)),
+            "filter type 5 in the last row": zlib.compress(bytes(size - row) + b"\x05" + bytes(row - 1)),
+            "filter type 255": zlib.compress(bytes(row) + b"\xff" + bytes(size - row - 1)),
+        }.items()})
+
+    def test_png_pixel_data_is_never_unpacked_past_its_size(self):
+        bomb = make_png(296, body=png_chunk(b"IDAT", zlib.compress(bytes(32 * 1024 * 1024))))  # 32 MB from 32 KB
+        self.refused({"32 MB of pixel data": bomb})
+        text = b64(bomb)
+        tracemalloc.start()
+        try:
+            self.assertIsNone(ring.check_png(bomb))
+            self.assertIsNone(ring.parse(0, f"{self.pair[0]}\n{text}\n"))
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 4 * 1024 * 1024)  # refused at the expected size: the 32 MB were never unpacked
+
+    def test_png_chunks_must_be_in_their_places(self):
+        head, end, text = png_header(296), png_chunk(b"IEND"), png_chunk(b"tEXt", b"made up")
+        stream = png_pixels(296)
+        idat = png_chunk(b"IDAT", stream)
+
+        def png(*chunks):
+            return PNG_SIGNATURE + b"".join(chunks)
+        good = png(head, idat, end)
+        self.assertEqual(ring.check_png(good), 296)
+        self.refused({
+            "another critical chunk": png(head, png_chunk(b"PLTE", bytes(3)), idat, end),
+            "an unknown critical chunk after the pixels": png(head, idat, png_chunk(b"MADE", b"up"), end),
+            "a second IHDR": png(head, head, idat, end),
+            "a second IHDR after the pixels": png(head, idat, head, end),
+            "IDAT chunks apart": png(head, png_chunk(b"IDAT", stream[:20]), text, png_chunk(b"IDAT", stream[20:]),
+                                     end),
+            "an empty IDAT after another chunk": png(head, idat, text, png_chunk(b"IDAT"), end),
+            "a digit in a chunk type": png(head, png_chunk(b"tEX1", b"made up"), idat, end),
+            "a space in a chunk type": png(head, idat, png_chunk(b"tE t", b"made up"), end),
+            "a letter outside ASCII in a chunk type": png(head, png_chunk(b"t\xc9Xt", b"made up"), idat, end),
+            "a chunk longer than the rest": png(head, idat, struct.pack(">I", 500) + text[4:], end),
+            "a chunk length of 4 GB": png(head, struct.pack(">I", 2 ** 32 - 1) + text[4:], idat, end),
+            "bytes after IEND": good + bytes(3),
+            "a chunk after IEND": good + text,
+            "a second IEND": good + end,
+            "IEND with a body": png(head, idat, png_chunk(b"IEND", b"x")),
+            "no IEND": png(head, idat),
+            "no IEND, another chunk last": png(head, idat, text),
+            "a chunk before IHDR": png(text, head, idat, end),
+            "IDAT before IHDR": png(idat, head, end),
+            "no IHDR": png(idat, end),
+            "no chunk": PNG_SIGNATURE,
+            "no signature": good[8:],
+        })
+
+    def test_png_cut_short_is_refused_without_an_error(self):
+        end = png_chunk(b"IEND")
+        good = make_png(296, body=png_chunk(b"pHYs", struct.pack(">IIB", 5669, 5669, 1))
+                        + png_chunk(b"IDAT", png_pixels(296)))
+        self.assertEqual(ring.check_png(good), 296)
+        for length in range(len(good)):
+            self.assertIsNone(ring.check_png(good[:length]), length)
+            if length != len(good) - len(end):
+                self.assertIsNone(ring.check_png(good[:length] + end), length)  # ... and with the trailer put back
+        for other in (None, "text", 5, bytearray(good), [good]):
+            self.assertIsNone(ring.check_png(other), type(other))
+
+    def test_png_may_have_other_ancillary_chunks_and_several_idat_chunks(self):
+        stream = png_pixels(296)
+        whole = png_chunk(b"IDAT", stream)
+        cuts = (0, 1, 20, 20, len(stream) - 1, len(stream))  # one of the pieces is empty
+        pieces = b"".join(png_chunk(b"IDAT", stream[a:b]) for a, b in zip(cuts, cuts[1:]))
+        single = b"".join(png_chunk(b"IDAT", stream[n:n + 1]) for n in range(len(stream)))
+        before = b"".join([png_chunk(b"sRGB", b"\x00"), png_chunk(b"eXIf", b"MM\x00*\x00\x00\x00\x08\x00\x00"),
+                           png_chunk(b"pHYs", struct.pack(">IIB", 5669, 5669, 1)),
+                           png_chunk(b"zzZz", bytes(range(256)))])
+        after = b"".join([png_chunk(b"tEXt", b"Comment\x00made up"), png_chunk(b"zzZz"), png_chunk(b"abcd", b"\xff")])
+        for what, body in {"chunks before": before + whole, "chunks after": whole + after,
+                           "chunks before and after": before + whole + after, "several IDAT": pieces,
+                           "an IDAT per byte": single, "both": before + pieces + after}.items():
+            data = make_png(296, body=body)
+            text = b64(data)
+            self.assertEqual(ring.check_png(data), 296, what)
+            self.assertEqual(ring.check_png(data, 296), 296, what)
+            self.assertIsNone(ring.check_png(data, 298), what)
+            self.assertEqual(ring.parse(0, f"{text}\n{self.pair[1]}\n"), (text, self.pair[1]), what)
+        for width in (1, ring.MAX_WIDTH * ring.SCALE):  # the narrowest and the widest
+            self.assertEqual(ring.check_png(make_png(width)), width)
+
     def test_draw_runs_osascript_with_a_timeout_and_no_shell(self):
         values = ring.inputs((True, 94.0), self.specs)
         with self.fake_run():
@@ -1797,8 +1979,31 @@ class RingDrawing(unittest.TestCase):
         with self.fake_run((1, "", "")):
             self.assertIsNone(ring.strip(self.specs, (False, None), self.cache))  # failure: no strip
 
+    def test_cached_image_with_a_broken_body_is_not_used(self):
+        good = make_png(296)
+        broken = {"a changed byte in the pixel data": flipped(good, -20),
+                  "other bytes between header and trailer": make_png(296, body=bytes(range(100))),
+                  "no pixel data": make_png(296, body=b"")}
+        path = os.path.join(self.cache, ring.CACHE_FILE)
+        with self.fake_run():
+            self.assertEqual(ring.strip(self.specs, (True, 94.0), self.cache), self.pair)
+            with open(path) as f:
+                data = json.load(f)
+            self.assertEqual((data["light"], data["dark"]), self.pair)
+            for what, image in broken.items():
+                self.assertEqual((image[:33], image[-12:]), (good[:33], good[-12:]), what)  # header and trailer
+                for variant in ring.VARIANTS:
+                    common.write_private_json(self.cache, ring.CACHE_FILE, dict(data, **{variant: b64(image)}))
+                    drawn = len(self.calls)
+                    self.assertEqual(ring.strip(self.specs, (True, 94.0), self.cache), self.pair, what)
+                    self.assertEqual(len(self.calls), drawn + 1, what)  # the same key, but drawn again
+                    with open(path) as f:
+                        self.assertEqual(json.load(f), data, what)  # ... and the cache is whole again
+                    self.assertEqual(ring.strip(self.specs, (True, 94.0), self.cache), self.pair, what)
+                    self.assertEqual(len(self.calls), drawn + 1, what)
 
-SHIPPED = os.path.join(ROOT, "ai_limits", "logos")
+
+SHIPPED =os.path.join(ROOT, "ai_limits", "logos")
 
 
 class RingLogos(unittest.TestCase):
