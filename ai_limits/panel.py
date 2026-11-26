@@ -1,5 +1,6 @@
 """The "Providers…" panel: five checkboxes in a native macOS alert that stays open while the user ticks and unticks
-them, then Save or Cancel. And the "Foundry prices…" window: one row of price fields per deployment.
+them, then Save or Cancel; below them the "Show gauge and percentage" switch and the quota group Gemini's ring
+follows. And the "Foundry prices…" window: one row of price fields per deployment.
 
 Why a panel: macOS closes a menu when one of its items is clicked, and SwiftBar has no item that runs a command and
 keeps the menu open, so ticking several providers in the menu itself is not possible.
@@ -23,6 +24,7 @@ TIMEOUT = 600  # seconds: a forgotten panel is closed, without a change, after 1
 # field) and then Save or Cancel by themselves after about a second, and add diagnostic lines starting with "#".
 MODES = ("panel", "selftest-save", "selftest-cancel")
 _LINE = re.compile(r"([a-z0-9_]{1,20})=(on|off)")
+_RING_LINE = re.compile(r"ring_gemini=(gemini|3p)")  # the choices of ring.GROUPS["gemini"]
 PRICE_COLUMNS = 5  # Input, Output, Cache read, Write 5m, Write 1h: foundry.PRICE_KEYS in this order
 MAX_TYPED = 40  # characters per price field in the answer
 
@@ -32,9 +34,9 @@ SCRIPT = r"""
 ObjC.import('Cocoa');
 
 function run(argv) {
-  var mode = argv[0];
+  var mode = argv[0], gaugeOn = argv[1] === 'on', ringGroup = argv[2];
   var rows = [];
-  for (var i = 1; i + 3 < argv.length; i += 4) {
+  for (var i = 3; i + 3 < argv.length; i += 4) {
     rows.push({key: argv[i], label: argv[i + 1], on: argv[i + 2] === 'on', note: argv[i + 3]});
   }
   var app = $.NSApplication.sharedApplication;
@@ -54,10 +56,10 @@ function run(argv) {
     }
   } catch (e) {}
 
-  var rowHeight = 24, width = 340;
-  var view = $.NSView.alloc.initWithFrame($.NSMakeRect(0, 0, width, rows.length * rowHeight));
+  var rowHeight = 24, width = 340, extra = 2 * rowHeight + 12;  // separator, gauge switch, Gemini ring
+  var view = $.NSView.alloc.initWithFrame($.NSMakeRect(0, 0, width, rows.length * rowHeight + extra));
   var boxes = rows.map(function (row, n) {
-    var y = (rows.length - 1 - n) * rowHeight;
+    var y = extra + (rows.length - 1 - n) * rowHeight;
     var box = $.NSButton.alloc.initWithFrame($.NSMakeRect(0, y, width, rowHeight));
     box.setButtonType(3);  // checkbox
     box.title = row.label;
@@ -74,6 +76,27 @@ function run(argv) {
     }
     return box;
   });
+  var line = $.NSBox.alloc.initWithFrame($.NSMakeRect(0, 2 * rowHeight + 5, width, 1));
+  line.boxType = 2;  // separator
+  view.addSubview(line);
+  var gauge = $.NSButton.alloc.initWithFrame($.NSMakeRect(0, rowHeight, width, rowHeight));
+  gauge.setButtonType(3);  // checkbox
+  gauge.title = 'Show gauge and percentage';
+  gauge.state = gaugeOn ? 1 : 0;
+  gauge.sizeToFit;
+  gauge.setFrameOrigin($.NSMakePoint(0, rowHeight + (rowHeight - gauge.frame.size.height) / 2));
+  view.addSubview(gauge);
+  var label = $.NSTextField.labelWithString('Gemini ring follows');
+  label.setFrameSize(label.fittingSize);
+  label.setFrameOrigin($.NSMakePoint(0, (rowHeight - label.fittingSize.height) / 2));
+  view.addSubview(label);
+  var groups = $.NSPopUpButton.alloc.initWithFramePullsDown($.NSMakeRect(0, 0, 200, rowHeight), false);
+  groups.addItemWithTitle('Gemini models');  // index 0: gemini
+  groups.addItemWithTitle('Claude and GPT models');  // index 1: 3p
+  groups.selectItemAtIndex(ringGroup === '3p' ? 1 : 0);
+  groups.sizeToFit;
+  groups.setFrameOrigin($.NSMakePoint(label.fittingSize.width + 8, (rowHeight - groups.frame.size.height) / 2));
+  view.addSubview(groups);
   alert.accessoryView = view;
   alert.layout;
   alert.window.hidesOnDeactivate = false;  // an accessory app could not bring a hidden panel back
@@ -95,44 +118,57 @@ function run(argv) {
   var response = Number(alert.runModal);
   var out = response === 1000
     ? rows.map(function (row, n) { return row.key + '=' + (Number(boxes[n].state) === 1 ? 'on' : 'off'); })
+        .concat(['gauge=' + (Number(gauge.state) === 1 ? 'on' : 'off'),
+                 'ring_gemini=' + (Number(groups.indexOfSelectedItem) === 1 ? '3p' : 'gemini')])
     : ['cancel'];
   return out.concat(seen).join('\n');
 }
 """
 
 
-def arguments(rows, mode="panel"):
-    """osascript's argument list: the fixed script, then the mode and four strings per provider (key, label, on/off,
-    note). rows: [(key, label, enabled, note)]."""
+def arguments(rows, mode="panel", gauge=True, groups=None):
+    """osascript's argument list: the fixed script, then the mode, the gauge switch (on/off), Gemini's ring group and
+    four strings per provider (key, label, on/off, note). rows: [(key, label, enabled, note)]; groups: ring.groups()."""
     if mode not in MODES:
         raise ValueError("unknown panel mode")
-    argv = [OSASCRIPT, "-l", "JavaScript", "-e", SCRIPT, mode]
+    group = (groups or {}).get("gemini", "gemini")
+    if not _RING_LINE.fullmatch(f"ring_gemini={group}"):
+        raise ValueError("unknown ring group")
+    argv = [OSASCRIPT, "-l", "JavaScript", "-e", SCRIPT, mode, "on" if gauge else "off", group]
     for key, label, enabled, note in rows:
         argv += [str(key), str(label), "on" if enabled else "off", str(note)]
     return argv
 
 
-def show(rows, mode="panel", timeout=TIMEOUT):
+def show(rows, mode="panel", timeout=TIMEOUT, gauge=True, groups=None):
     """Runs the panel and waits for it: (exit code, stdout, stderr); (1, "", "") if it could not run or timed out."""
     try:
-        return run(arguments(rows, mode), timeout=timeout)
+        return run(arguments(rows, mode, gauge, groups), timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         return 1, "", ""
 
 
 def parse(code, stdout, names):
-    """{name: on?} for exactly the given names, or None (no change): a non-zero exit, Cancel, an unknown or repeated
-    key, a missing key, or any other text."""
+    """{"providers": {name: on?} for exactly the given names, "gauge": on?, "groups": {"gemini": group}}, or None (no
+    change): a non-zero exit, Cancel, an unknown or repeated key, a missing line, or any other text. The answer is the
+    provider lines in any order, then `gauge=on|off` and `ring_gemini=gemini|3p`."""
     if code != 0 or not isinstance(stdout, str):
         return None
-    text = stdout[:-1] if stdout.endswith("\n") else stdout
+    lines = (stdout[:-1] if stdout.endswith("\n") else stdout).split("\n")
+    if len(lines) < 2:
+        return None
+    gauge, group = _LINE.fullmatch(lines[-2]), _RING_LINE.fullmatch(lines[-1])
+    if not gauge or gauge.group(1) != "gauge" or not group:
+        return None
     chosen = {}
-    for line in text.split("\n"):
+    for line in lines[:-2]:
         found = _LINE.fullmatch(line)
         if not found or found.group(1) not in names or found.group(1) in chosen:
             return None
         chosen[found.group(1)] = found.group(2) == "on"
-    return chosen if set(chosen) == set(names) else None
+    if set(chosen) != set(names):
+        return None
+    return {"providers": chosen, "gauge": gauge.group(2) == "on", "groups": {"gemini": group.group(1)}}
 
 
 # The "Foundry prices…" window. Arguments: mode, message, then per row the deployment name, a note ("" or e.g.

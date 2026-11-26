@@ -5,9 +5,10 @@ No test may reach a real provider. Two structural guards enforce it: setUpModule
 module reaches the outside (its subprocess, HTTP and tool-lookup functions, and the home-folder paths it reads) with
 a guard, and load_main() replaces main.call with one, so a test that wants provider data installs its own fake; a
 guard raises RealProviderRead, which no `except Exception` in the plugin can swallow. The windows' osascript call
-(panel.run) is guarded the same way; only the opt-in --gui tests put the real one back. Every run of the plugin as a
-process goes through run_launcher(), which skips all providers except those forced to fail and refuses the window
-switches.
+(panel.run) and the menu bar strip's drawing (ring.run) are guarded the same way; only the opt-in --gui tests put the
+real ones back. load_main() also makes main's menu_bar_strip return None, and the user's logo folder (ring.LOGO_DIR)
+points into the empty guard folder. Every run of the plugin as a process goes through run_launcher(), which skips
+all providers except those forced to fail, passes --no-image (no drawing) and refuses the window switches.
 The default run opens no window and needs no Keychain, network or ~/Library/Caches; it runs on any macOS with
 Python 3.9 or later (CI: GitHub's macOS runner, with the system Python and the latest Python). Time limits are
 generous for slow machines but always shorter than the wrong behaviour they rule out.
@@ -42,7 +43,7 @@ sys.dont_write_bytecode = True  # keep __pycache__ out of the plugin folder
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from ai_limits import common, panel, render  # noqa: E402
+from ai_limits import common, panel, render, ring  # noqa: E402
 from ai_limits.providers import NAMES, claude, codex, copilot, foundry, gemini  # noqa: E402
 
 PLUGIN = os.path.join(ROOT, "plugin", "ai-limits.5m.sh")
@@ -67,7 +68,8 @@ def provider_guard(where):
 # and the guard is back when their patch ends). common's own functions stay real: the loopback tests use them.
 GUARDED_CALLS = [(claude, "run"), (claude, "https_json"), (codex, "find_tool"), (copilot, "run"),
                  (copilot, "find_tool"), (foundry, "run"), (foundry, "find_tool"), (gemini, "https_json"),
-                 (gemini, "localhost_json"), (panel, "run")]  # panel.run: a real window
+                 (gemini, "localhost_json"), (panel, "run"),  # panel.run: a real window
+                 (ring, "run")]  # ring.run: osascript drawing the menu bar strip
 _GUARD_HOME = tempfile.TemporaryDirectory()
 
 
@@ -81,7 +83,8 @@ def setUpModule():
     for module, name, path in [(gemini, "ANTIGRAVITY_DIR", os.path.join(empty, "antigravity")),
                                (gemini, "HUB", os.path.join(empty, "antigravity", "daemon", "hub_*.json")),
                                (gemini, "CLI_CREDENTIALS", os.path.join(empty, "oauth_creds.json")),
-                               (codex, "SESSIONS", os.path.join(empty, "sessions"))]:
+                               (codex, "SESSIONS", os.path.join(empty, "sessions")),
+                               (ring, "LOGO_DIR", os.path.join(empty, "logos"))]:
         mock.patch.object(module, name, path).start()
 
 
@@ -100,7 +103,7 @@ def run_launcher(args, *, config, cache, env=None, command=(PLUGIN,), allow_real
     for path in (config, cache):
         assert os.path.realpath(path).startswith(temp + os.sep), f"not a temporary path: {path}"
     assert not {"--choose", "--prices"} & set(args), "a window switch: test it in-process with a fake window"
-    argv = [*command, "--config", config, "--cache", cache, *args]
+    argv = [*command, "--config", config, "--cache", cache, *args, "--no-image"]
     if not allow_real_providers:
         failing = set()
         for i, arg in enumerate(args):
@@ -691,23 +694,36 @@ class Panel(unittest.TestCase):
         hostile = panel.arguments(nasty)
         self.assertEqual(plain[:5], ["/usr/bin/osascript", "-l", "JavaScript", "-e", panel.SCRIPT])
         self.assertIs(hostile[4], panel.SCRIPT)  # byte-identical whatever the input
-        self.assertEqual(hostile[5:], ["panel", "claude", "x'); $.NSTask.launch(); ('", "on", "\n\"\\`${x}",
-                                       "codex", "line\nbreak", "off", "' + run() + '"])
-        self.assertEqual(plain[5:9], ["panel", "claude", "Claude", "on"])
+        self.assertEqual(hostile[5:], ["panel", "on", "gemini", "claude", "x'); $.NSTask.launch(); ('", "on",
+                                       "\n\"\\`${x}", "codex", "line\nbreak", "off", "' + run() + '"])
+        self.assertEqual(plain[5:11], ["panel", "on", "gemini", "claude", "Claude", "on"])
         self.assertEqual(plain[-4:], ["copilot", "GitHub Copilot", "on", render.NOT_SET_UP])
+        self.assertEqual(panel.arguments(self.ROWS, gauge=False, groups={"gemini": "3p"})[5:8], ["panel", "off", "3p"])
         with self.assertRaises(ValueError):
             panel.arguments(self.ROWS, "anything")
+        for groups in ({"gemini": "evil"}, {"gemini": "3p\nx"}, {"gemini": ""}):
+            with self.assertRaises(ValueError):
+                panel.arguments(self.ROWS, groups=groups)  # only the fixed choices reach the script
         self.assertNotIn("argv[", panel.SCRIPT.split("function run(argv)")[0])  # no code before run()
 
     def test_output_is_parsed_strictly(self):
         names = ("claude", "codex", "copilot")
-        good = "claude=on\ncodex=off\ncopilot=on\n"
-        self.assertEqual(panel.parse(0, good, names), {"claude": True, "codex": False, "copilot": True})
-        self.assertEqual(panel.parse(0, good.rstrip("\n"), names), {"claude": True, "codex": False, "copilot": True})
+        providers = "claude=on\ncodex=off\ncopilot=on\n"
+        good = providers + "gauge=off\nring_gemini=3p\n"
+        expected = {"providers": {"claude": True, "codex": False, "copilot": True}, "gauge": False,
+                    "groups": {"gemini": "3p"}}
+        self.assertEqual(panel.parse(0, good, names), expected)
+        self.assertEqual(panel.parse(0, good.rstrip("\n"), names), expected)
+        self.assertEqual(panel.parse(0, providers + "gauge=on\nring_gemini=gemini\n", names)["gauge"], True)
         for code, out in [(1, good), (0, "cancel\n"), (0, ""), (0, "\n"), (0, "garbage"),
-                          (0, "claude=on\ncodex=off\n"),                                # missing key
+                          (0, "claude=on\ncodex=off\ngauge=on\nring_gemini=3p\n"),     # missing key
+                          (0, providers),                                                # no settings lines
+                          (0, providers + "gauge=on\n"), (0, providers + "ring_gemini=3p\n"),
+                          (0, providers + "ring_gemini=3p\ngauge=on\n"),                 # settings swapped
+                          (0, providers + "gauge=on\nring_gemini=evil\n"), (0, providers + "gauge=x\nring_gemini=3p\n"),
+                          (0, providers + "gauge=on\ngauge=on\nring_gemini=3p\n"),      # gauge twice
                           (0, good + "evil=on\n"), (0, good.replace("copilot", "gemini")),  # unknown key
-                          (0, good + "claude=off\n"),                                    # repeated key
+                          (0, "claude=off\n" + good),                                    # repeated key
                           (0, good.replace("off", "maybe")), (0, good.replace("=", " = ")),
                           (0, good.replace("\n", "\r\n")), (0, good + "\n"), (0, " " + good),
                           (0, good + "#active=true\n"), (0, None), (-9, "")]:
@@ -1424,6 +1440,436 @@ class WindowFields(unittest.TestCase):
                                                 "window": None, "group": None})
 
 
+# ---- menu bar rings -------------------------------------------------------------------------------------------
+
+def make_png(width, height=44, colour_type=6, end=True):
+    """A minimal PNG (made here, nothing drawn): IHDR with these values, one empty IDAT, IEND."""
+    import struct
+    import zlib
+
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body) & 0xFFFFFFFF)
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, colour_type, 0, 0, 0)
+    data = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(b"\x00"))
+    return data + chunk(b"IEND", b"") if end else data
+
+
+def b64(data):
+    import base64
+    return base64.b64encode(data).decode("ascii")
+
+
+def ring_results(gemini_group_rows=True):
+    """Shown providers in menu order, as main passes them (normalized), with made-up values."""
+    future = NOW + 3600
+    rows = {
+        "claude": [common.row("5-hour", 31.0, resets=future, window="5h"),
+                   common.row("Weekly", 57.0, resets=future, window="weekly"),
+                   common.row("Weekly Opus", 88.0, resets=future)],
+        "codex": [common.row("5-hour", 82.0, resets=future, window="5h"),
+                  common.row("Weekly", 40.0, resets=future, window="weekly")],
+        "gemini": [common.row("Gemini 5-hour", 12.0, resets=future, window="5h", group="gemini"),
+                   common.row("Gemini Weekly", 94.0, resets=future, window="weekly", group="gemini"),
+                   common.row("Claude GPT 5-hour", 3.0, window="5h", group="3p"),
+                   common.row("Claude GPT Weekly", 1.0, window="weekly", group="3p")]
+        if gemini_group_rows else [common.row("All models", 0.0, resets=future)],
+        "copilot": [common.row("AI credits", 26.0, value="1,560 / 6,000", resets=future)],
+        "foundry": [common.row("This month", value="$3.40")],
+    }
+    return [(k, render.normalize(res(k.upper(), v))) for k, v in rows.items()]
+
+
+class RingSpecs(unittest.TestCase):
+    """Which values the rings show: picked by the rows' window and group, never by label."""
+
+    def specs(self, results=None, chosen=None):
+        return ring.specs(ring_results() if results is None else results,
+                          ring.groups(None) if chosen is None else chosen, NOW)
+
+    def test_claude_and_codex_arcs_come_from_their_windows(self):
+        by_key = {x["key"]: x for x in self.specs()}
+        self.assertEqual((by_key["claude"]["right"], by_key["claude"]["left"]), (31.0, 57.0))  # not Weekly Opus 88
+        self.assertEqual((by_key["codex"]["right"], by_key["codex"]["left"]), (82.0, 40.0))
+        relabelled = [("claude", render.normalize(res("CLAUDE", [common.row("x", 9.0, window="weekly"),
+                                                                  common.row("5-hour", 70.0)])))]
+        self.assertEqual([(x["right"], x["left"]) for x in self.specs(relabelled)], [(None, 9.0)])  # labels ignored
+
+    def test_copilot_fills_both_arcs_with_its_one_limit(self):
+        copilot = next(x for x in self.specs() if x["key"] == "copilot")
+        self.assertEqual((copilot["right"], copilot["left"], copilot["single"]), (26.0, 26.0, True))
+
+    def test_foundry_and_hidden_providers_get_no_ring_and_order_follows_the_menu(self):
+        self.assertEqual([x["key"] for x in self.specs()], ["claude", "codex", "gemini", "copilot"])
+        shown = [r for r in ring_results() if r[0] in ("copilot", "claude")][::-1]  # hidden ones are not in results
+        self.assertEqual([x["key"] for x in self.specs(shown)], ["copilot", "claude"])
+        self.assertEqual(self.specs([]), [])
+
+    def test_gemini_follows_the_chosen_group(self):
+        gemini = next(x for x in self.specs() if x["key"] == "gemini")
+        self.assertEqual((gemini["right"], gemini["left"], gemini["name"]), (12.0, 94.0, "Gemini"))
+        gemini = next(x for x in self.specs(chosen={"gemini": "3p"}) if x["key"] == "gemini")
+        self.assertEqual((gemini["right"], gemini["left"], gemini["name"]), (3.0, 1.0, "Gemini (Claude GPT)"))
+        fallback = next(x for x in self.specs(ring_results(gemini_group_rows=False)) if x["key"] == "gemini")
+        self.assertEqual((fallback["right"], fallback["left"]), (None, None))  # per-model rows: track only
+
+    def test_stale_missing_or_unreadable_values_give_no_value(self):
+        stale = [("codex", render.normalize(res("CODEX", [common.row("5-hour", 44.0, resets=NOW - 60, window="5h"),
+                                                         common.row("Weekly", None, window="weekly")])))]
+        self.assertEqual([(x["right"], x["left"]) for x in self.specs(stale)], [(None, None)])
+        failed = [("claude", render.normalize({"title": "CLAUDE", "status": "unknown", "note": "Couldn't read"}))]
+        self.assertEqual([(x["key"], x["right"], x["left"]) for x in self.specs(failed)], [("claude", None, None)])
+
+    def test_groups_setting_falls_back_to_the_default(self):
+        self.assertEqual(ring.groups({"gemini": "3p"}), {"gemini": "3p"})
+        for value in (None, [], "3p", {"gemini": "evil"}, {"gemini": ["3p"]}, {"other": "3p"}):
+            self.assertEqual(ring.groups(value), {"gemini": "gemini"}, repr(value))
+
+
+class RingDrawing(unittest.TestCase):
+    """The drawing's argument list, its strict output check and the cache. ring.run is faked: no osascript."""
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.cache = os.path.join(folder.name, "cache")
+        self.specs = ring.specs(ring_results(), ring.groups(None), NOW)
+        self.pair = (b64(make_png(296)), b64(make_png(296)))
+        self.calls = []
+
+    def fake_run(self, answer=None):
+        def fake(argv, timeout):
+            self.calls.append((argv, timeout))
+            return answer if answer is not None else (0, f"{self.pair[0]}\n{self.pair[1]}\n", "")
+        return mock.patch.object(ring, "run", fake)
+
+    def test_inputs_round_and_classify_the_values(self):
+        values = ring.inputs((True, 94.4), self.specs)
+        self.assertEqual(values["gauge"], [True, render.icon(94.4), "94%", "r"])
+        self.assertEqual(values["rings"][0], ["Cl", None, None, "31", "n", "57", "n"])
+        self.assertEqual(values["rings"][1][3:], ["82", "o", "40", "n"])  # orange from 75%
+        self.assertEqual(values["rings"][2][3:], ["12", "n", "94", "r"])  # red from 90%
+        self.assertEqual(ring.inputs((False, None), [dict(self.specs[0], right=None, left=150.0)]),
+                         {"gauge": [False, render.icon(None), "–", "n"],
+                          "rings": [["Cl", None, None, "", "n", "100", "r"]]})
+
+    def test_script_is_fixed_and_values_are_arguments(self):
+        argv = ring.arguments(ring.inputs((True, 94.0), self.specs))
+        self.assertEqual(argv[:5], ["/usr/bin/osascript", "-l", "JavaScript", "-e", ring.SCRIPT])
+        self.assertEqual(argv[5:11], ["strip", "1", render.icon(94.0), "94%", "r", "4"])
+        self.assertEqual(argv[11:18], ["Cl", "", "", "31", "n", "57", "n"])
+        self.assertEqual(len(argv), 11 + 4 * 7)
+        self.assertNotIn("argv[", ring.SCRIPT.split("function run(argv)")[0])  # no code before run()
+        good = ring.inputs((True, 50.0), self.specs[:1])
+        bad_values = [("gauge", [True, "evil.symbol", "50%", "n"]), ("gauge", [True, render.icon(50), "50%'", "n"]),
+                      ("gauge", [True, render.icon(50), "50%", "x"]),
+                      ("rings", [["Zz", None, None, "1", "n", "2", "n"]]),
+                      ("rings", [["Cl", ("/tmp/claude.svg", 1, 1), None, "1", "n", "2", "n"]]),
+                      ("rings", [["Cl", None, None, "101", "n", "2", "n"]]),
+                      ("rings", [["Cl", None, None, "5.5", "n", "2", "n"]]),
+                      ("rings", [["Cl", None, None, "1", "n", "-2", "n"]]),
+                      ("rings", [["Cl", None, None, "1", "x", "2", "n"]]),
+                      ("rings", [["Cl", None, None, "1", "n", "2", "n"]] * (ring.MAX_RINGS + 1))]
+        for key, value in bad_values:
+            with self.assertRaises(ValueError, msg=repr(value)):
+                ring.arguments(dict(good, **{key: value}))
+
+    def test_output_is_checked_strictly(self):
+        a, b = self.pair
+        self.assertEqual(ring.parse(0, f"{a}\n{b}\n"), (a, b))
+        self.assertEqual(ring.parse(0, f"{a}\n{b}"), (a, b))
+        wide = b64(make_png(ring.MAX_WIDTH * ring.SCALE + 1))
+        for code, out in [(1, f"{a}\n{b}\n"), (0, a), (0, f"{a}\n{b}\n{a}\n"), (0, ""), (0, None), (-9, ""),
+                          (0, f"{a}!\n{b}\n"), (0, f"{a} \n{b}\n"), (0, f"{a}\n{b}\n\n"),
+                          (0, f"{a}\n{b64(make_png(300))}\n"),                     # widths differ
+                          (0, f"{b64(make_png(296, height=22))}\n{b}\n"),          # not 44 pixels high
+                          (0, f"{wide}\n{wide}\n"),                                # too wide
+                          (0, f"{b64(make_png(296, colour_type=2))}\n{b}\n"),      # not RGBA
+                          (0, f"{b64(make_png(296, end=False))}\n{b}\n"),          # no IEND
+                          (0, f"{b64(b'GIF89a' + bytes(60))}\n{b}\n"), (0, "QUJD\nQUJD\n"), (0, "QQ=\nQQ=\n")]:
+            self.assertIsNone(ring.parse(code, out), repr((code, out))[:80])
+        with mock.patch.object(ring, "MAX_PNG_BYTES", 40):
+            self.assertIsNone(ring.parse(0, f"{a}\n{b}\n"))  # over the byte cap
+
+    def test_draw_runs_osascript_with_a_timeout_and_no_shell(self):
+        values = ring.inputs((True, 94.0), self.specs)
+        with self.fake_run():
+            self.assertEqual(ring.draw(values), self.pair)
+        self.assertEqual(self.calls, [(ring.arguments(values), ring.TIMEOUT)])
+        for failure in (subprocess.TimeoutExpired("osascript", 5), OSError("missing")):
+            with mock.patch.object(ring, "run", side_effect=failure):
+                self.assertIsNone(ring.draw(values))
+        for answer in ((1, "", "error"), (0, "garbage", "")):
+            with self.fake_run(answer):
+                self.assertIsNone(ring.draw(values))
+        self.calls.clear()
+        with self.fake_run():
+            self.assertIsNone(ring.draw(dict(values, gauge=[True, "evil", "1%", "n"])))
+        self.assertEqual(self.calls, [])  # refused before any process
+
+    def test_strip_is_cached_by_its_inputs(self):
+        with self.fake_run():
+            self.assertEqual(ring.strip(self.specs, (True, 94.0), self.cache), self.pair)
+            self.assertEqual(ring.strip(self.specs, (True, 94.0), self.cache), self.pair)
+            self.assertEqual(len(self.calls), 1)  # the second run starts no process
+            ring.strip(self.specs, (True, 94.4), self.cache)  # rounds to the same 94%
+            self.assertEqual(len(self.calls), 1)
+            ring.strip([dict(self.specs[0], right=32.0)] + self.specs[1:], (True, 94.0), self.cache)
+            self.assertEqual(len(self.calls), 2)
+            path = os.path.join(self.cache, ring.CACHE_FILE)
+            with open(path) as f:
+                data = json.load(f)
+            common.write_private_json(self.cache, ring.CACHE_FILE, dict(data, light="QUJD"))  # not a PNG
+            ring.strip([dict(self.specs[0], right=32.0)] + self.specs[1:], (True, 94.0), self.cache)
+            self.assertEqual(len(self.calls), 3)  # checked again, drawn again
+            self.assertIsNone(ring.strip([], (True, 94.0), self.cache))
+            self.assertEqual(len(self.calls), 3)  # no ring: nothing drawn, the text title is used
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(os.stat(self.cache).st_mode), 0o700)
+        with self.fake_run((1, "", "")):
+            self.assertIsNone(ring.strip(self.specs, (False, None), self.cache))  # failure: no strip
+
+
+class RingLogos(unittest.TestCase):
+    """The user's own logo files: fixed names in one folder, strict file checks, initials otherwise."""
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.dir = os.path.join(folder.name, "logos")
+        os.mkdir(self.dir, 0o700)
+        patch = mock.patch.object(ring, "LOGO_DIR", self.dir)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def put(self, name, data=b"<svg/>", mode=0o600):
+        path = os.path.join(self.dir, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        os.chmod(path, mode)
+        return path
+
+    def test_no_folder_or_no_file_means_initials(self):
+        self.assertEqual(ring.logos("claude"), (None, None))
+        with mock.patch.object(ring, "LOGO_DIR", os.path.join(self.dir, "missing")):
+            self.assertEqual(ring.logos("claude"), (None, None))
+        self.assertEqual(ring.logos("foundry"), (None, None))  # no ring, no logo
+        self.assertEqual(ring.logos("../claude"), (None, None))
+
+    def test_fixed_names_and_type_order(self):
+        png = self.put("claude.png")
+        self.assertEqual(ring.logos("claude")[0][0], png)
+        svg = self.put("claude.svg")
+        light, dark = ring.logos("claude")
+        self.assertEqual((light[0], dark[0]), (svg, svg))  # svg first; the dark bar uses the same file
+        dark_file = self.put("claude-dark.pdf")
+        self.assertEqual(ring.logos("claude")[1][0], dark_file)
+        self.put("Claude.svg.bak")
+        self.assertEqual(ring.logos("codex"), (None, None))
+
+    def test_files_that_fail_a_check_are_ignored(self):
+        target = self.put("elsewhere.svg")
+        os.symlink(target, os.path.join(self.dir, "claude.svg"))
+        self.assertEqual(ring.logos("claude"), (None, None))  # a symlink: not followed, no next type
+        self.put("codex.svg", mode=0o620)
+        self.put("codex.png")
+        self.assertEqual(ring.logos("codex"), (None, None))  # group-writable
+        self.put("gemini.svg", mode=0o602)
+        self.assertEqual(ring.logos("gemini"), (None, None))  # writable by others
+        self.put("copilot.svg", data=b"")
+        self.assertEqual(ring.logos("copilot"), (None, None))  # empty
+        os.remove(os.path.join(self.dir, "copilot.svg"))
+        self.put("copilot.svg", data=b"x" * 11)
+        with mock.patch.object(ring, "LOGO_MAX_BYTES", 10):
+            self.assertEqual(ring.logos("copilot"), (None, None))  # over the size cap
+        os.mkfifo(os.path.join(self.dir, "claude-dark.svg"), 0o600)
+        with mock.patch("os.getuid", return_value=os.getuid() + 1):
+            self.assertEqual(ring.logos("copilot"), (None, None))  # owned by someone else
+
+    def test_folder_must_be_private(self):
+        self.put("claude.svg")
+        os.chmod(self.dir, 0o777)
+        self.assertEqual(ring.logos("claude"), (None, None))
+        os.chmod(self.dir, 0o700)
+        link = self.dir + "-link"
+        os.symlink(self.dir, link)
+        with mock.patch.object(ring, "LOGO_DIR", link):
+            self.assertEqual(ring.logos("claude"), (None, None))
+
+    def test_logo_paths_reach_the_script_and_the_cache_key(self):
+        path = self.put("claude.svg")
+        specs = ring.specs(ring_results(), ring.groups(None), NOW)
+        values = ring.inputs((True, 50.0), specs)
+        self.assertEqual(ring.arguments(values)[11:14], ["Cl", path, path])
+        before = ring._key(values)
+        os.utime(path, ns=(1, 1))
+        self.assertNotEqual(ring._key(ring.inputs((True, 50.0), specs)), before)  # a changed file is drawn again
+
+
+class RingMenu(unittest.TestCase):
+    """render.menu with the strip: the image line, its tooltip, and the text title whenever there is no strip."""
+
+    PAIR = ("QUJDRA==", "RUZHSA==")
+
+    def setUp(self):
+        self.results = ring_results()
+        self.specs = ring.specs(self.results, ring.groups(None), NOW)
+
+    def first(self, **kwargs):
+        line = menu_lines(render.menu(self.results, NOW, rings=self.specs, **kwargs))[0]
+        return line, swiftbar_params(line)
+
+    def test_strip_is_the_whole_item_with_a_tooltip(self):
+        line, params = self.first(strip=self.PAIR)
+        self.assertTrue(line.startswith("| image=QUJDRA==,RUZHSA== tooltip="), line[:60])
+        self.assertEqual(set(params), {"image", "tooltip"})  # no title text, no sfimage, no colour
+        self.assertEqual(params["image"], "QUJDRA==,RUZHSA==")
+        self.assertEqual(params["tooltip"],
+                         "Highest: Gemini Gemini Weekly 94% · Claude 5-hour 31%, weekly 57% · "
+                         "Codex 5-hour 82%, weekly 40% · Gemini 5-hour 12%, weekly 94% · Copilot 26% · "
+                         "Foundry $3.40")
+
+    def test_tooltip_names_the_group_and_says_when_there_is_no_value(self):
+        specs = ring.specs(self.results, {"gemini": "3p"}, NOW)
+        specs[0] = dict(specs[0], left=None)
+        tooltip = swiftbar_params(menu_lines(render.menu(self.results, NOW, rings=specs, strip=self.PAIR))[0])
+        self.assertIn("Claude 5-hour 31%, weekly – ·", tooltip["tooltip"])
+        self.assertIn("Gemini (Claude GPT) 5-hour 3%, weekly 1%", tooltip["tooltip"])
+
+    def test_anything_but_base64_falls_back_to_the_text_title(self):
+        for strip in (("QUJD!", "RUZH"), ("QUJD", None), ("QU JD", "RUZH"), ("QUJD,RUZH", "RUZH"), "QUJD",
+                      ("QUJD",), ("QUJD", "RUZH", "SUpL"), ("QUJD\n--x | bash=/bin/sh", "RUZH"), None, ("", "")):
+            line, params = self.first(strip=strip)
+            self.assertTrue(line.startswith("94% | "), repr(strip))
+            self.assertEqual(params["sfimage"], render.icon(94.0))
+            self.assertNotIn("image", params)
+            self.assertEqual(len(menu_lines(render.menu(self.results, NOW, rings=self.specs, strip=strip))[1:2]), 1)
+
+    def test_text_title_when_drawing_failed_keeps_the_gauge(self):
+        line, params = self.first(strip=None, gauge=False)  # rings exist: the fallback still shows the number
+        self.assertTrue(line.startswith("94% | "))
+        self.assertTrue(params["tooltip"].startswith("Highest: Gemini Gemini Weekly 94% · Claude 5-hour 31%"))
+
+    def test_gauge_off_without_rings_shows_a_dash(self):
+        foundry_only = [r for r in self.results if r[0] == "foundry"]
+        line = menu_lines(render.menu(foundry_only, NOW, rings=[], gauge=False))[0]
+        self.assertTrue(line.startswith("– | "), line)
+        self.assertEqual(swiftbar_params(line)["sfimage"], render.icon(None))
+        self.assertTrue(menu_lines(render.menu(foundry_only, NOW, rings=[], gauge=True))[0].startswith("– | "))
+        self.assertTrue(menu_lines(render.menu([], NOW, gauge=False))[0].startswith("– | "))
+
+
+class RingSettings(unittest.TestCase):
+    """--gauge and --ring on temporary config files only: every call passes --config and --cache."""
+
+    def setUp(self):
+        self.main = load_main()
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.dir = os.path.join(folder.name, "settings")
+        os.mkdir(self.dir)
+        self.cache = os.path.join(folder.name, "cache")
+        self.config = os.path.join(self.dir, "config.json")
+        self.text = '{"providers": [{"name": "gemini", "enabled": true}], "menu_bar": "highest"}'
+        with open(self.config, "w") as f:
+            f.write(self.text)
+
+    def run_main(self, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.main.main([*args, "--config", self.config, "--cache", self.cache])
+        self.assertEqual(out.getvalue(), "")  # prints nothing
+        with open(self.config) as f:
+            return f.read()
+
+    def test_gauge_switch(self):
+        self.assertEqual(self.run_main("--gauge", "on"), self.text)  # shown is the default: nothing written
+        data = json.loads(self.run_main("--gauge", "off"))
+        self.assertIs(data["menu_bar_gauge"], False)
+        self.assertEqual(list(data), ["providers", "menu_bar", "menu_bar_gauge"])
+        self.assertTrue(os.path.exists(os.path.join(self.cache, self.main.KEEP_FILE)))  # no re-read after it
+        self.assertIs(json.loads(self.run_main("--gauge", "on"))["menu_bar_gauge"], True)
+
+    def test_ring_switch(self):
+        self.assertEqual(self.run_main("--ring", "gemini:gemini"), self.text)  # the default: nothing written
+        self.assertEqual(json.loads(self.run_main("--ring", "gemini:3p"))["ring_group"], {"gemini": "3p"})
+        self.assertEqual(json.loads(self.run_main("--ring", "gemini:gemini"))["ring_group"], {"gemini": "gemini"})
+        with open(self.config, "w") as f:
+            f.write('{"ring_group": "odd", "providers": []}')
+        self.assertEqual(json.loads(self.run_main("--ring", "gemini:3p"))["ring_group"], {"gemini": "3p"})
+
+    def test_panel_choices_match_the_ring_groups(self):
+        for group in ring.GROUPS["gemini"]:
+            self.assertTrue(panel._RING_LINE.fullmatch(f"ring_gemini={group}"), group)
+            self.assertEqual(panel.arguments([], groups={"gemini": group})[7], group)
+        self.assertEqual(set(ring.GROUP_LABELS["gemini"]), set(ring.GROUPS["gemini"]))
+        self.assertIn("'Gemini models'", panel.SCRIPT)
+        self.assertIn("'Claude and GPT models'", panel.SCRIPT)
+
+    def test_bad_values_are_refused_before_the_config_is_opened(self):
+        for args in (("--gauge", "maybe"), ("--gauge", ""), ("--gauge", "ON"), ("--ring", "gemini"),
+                     ("--ring", "gemini:evil"), ("--ring", "claude:3p"), ("--ring", ":3p"), ("--ring", ""),
+                     ("--ring", "gemini:3p:x"), ("--ring", "gemini:3p\n")):
+            with mock.patch.object(self.main, "load_config", side_effect=AssertionError("opened")):
+                with self.assertRaises(self.main.ArgumentError, msg=args):
+                    self.main.main([*args, "--config", self.config, "--cache", self.cache])
+        with open(self.config) as f:
+            self.assertEqual(f.read(), self.text)
+        self.assertEqual(self.main.parse_ring("gemini:3p"), ("gemini", "3p"))
+        self.assertEqual((self.main.parse_gauge("on"), self.main.parse_gauge("off")), (True, False))
+
+
+class RingMain(unittest.TestCase):
+    """main.main() hands the rings and the strip to the menu; menu_bar_strip and call are fakes (no osascript)."""
+
+    def setUp(self):
+        self.main = load_main()
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.cache = os.path.join(folder.name, "cache")
+        self.config = os.path.join(folder.name, "config.json")
+        self.write({})
+        self.strips = []
+        data = dict(ring_results())
+        self.main.call = lambda name, settings, forced: dict(data[name], time=time.time())
+
+    def write(self, extra):
+        providers = [{"name": n, "enabled": n in ("claude", "copilot", "foundry")} for n in NAMES]
+        with open(self.config, "w") as f:
+            json.dump(dict({"providers": providers}, **extra), f)
+
+    def run_main(self, *args, strip=("QUJDRA==", "RUZHSA==")):
+        def fake(rings, gauge, cache):
+            self.strips.append(([x["key"] for x in rings], gauge, cache))
+            if isinstance(strip, Exception):
+                raise strip
+            return strip
+        self.main.menu_bar_strip = fake
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(time, "time", return_value=NOW):
+            self.main.main(["--config", self.config, "--cache", self.cache, *args])
+        return menu_lines(out.getvalue())
+
+    def test_rings_and_strip_reach_the_menu(self):
+        lines = self.run_main()
+        self.assertEqual(self.strips, [(["claude", "copilot"], (True, 88.0), self.cache)])  # Foundry: no ring
+        self.assertEqual(swiftbar_params(lines[0])["image"], "QUJDRA==,RUZHSA==")
+        self.assertIn("Claude 5-hour 31%, weekly 57% · Copilot 26% · Foundry $3.40",
+                      swiftbar_params(lines[0])["tooltip"])
+        self.write({"menu_bar_gauge": False, "menu_bar": {"provider": "copilot", "limit": "AI credits"}})
+        self.run_main()
+        self.assertEqual(self.strips[-1][1], (False, 26.0))  # gauge off; its value follows "Menu bar shows"
+
+    def test_no_image_and_failures_keep_the_text_title(self):
+        lines = self.run_main("--no-image")
+        self.assertEqual(self.strips, [])  # not even asked
+        self.assertTrue(lines[0].startswith("88% | sfimage="))  # the highest: Weekly Opus
+        for strip in (None, RuntimeError("drawing broke")):
+            lines = self.run_main(strip=strip)
+            self.assertTrue(lines[0].startswith("88% | sfimage="), strip)
+            self.assertIn("Copilot 26%", swiftbar_params(lines[0])["tooltip"])
+        self.assertTrue(any(x.startswith("Claude") for x in lines))  # the rest of the menu is intact
+
+
 class CodexChannel(unittest.TestCase):
     """The app-server reader and writer on plain pipes: codex is never started."""
 
@@ -2091,6 +2537,7 @@ def load_main():
         os.environ.clear()
         os.environ.update(saved)
     module.call = provider_guard("main.call")
+    module.menu_bar_strip = lambda *args, **kwargs: None  # no drawing; a test that wants the strip sets its own
     defaults = tempfile.mkdtemp(dir=_GUARD_HOME.name)
     module.CACHE = os.path.join(defaults, "cache")
     module.CONFIG = os.path.join(defaults, "config.json")
@@ -2780,12 +3227,13 @@ class Choose(unittest.TestCase):
                      '{"name": "copilot", "enabled": true}], "debug_shapes": false}')
         with open(self.config, "w") as f:
             f.write(self.text)
-        self.shown = []
+        self.shown, self.settings = [], []
 
     def choose(self, answer=None, side_effect=None):
         """Runs --choose; the fake panel records its rows and answers (code, stdout, stderr)."""
-        def fake(rows, mode="panel", timeout=None):
+        def fake(rows, mode="panel", timeout=None, gauge=True, groups=None):
             self.shown.append(rows)
+            self.settings.append((gauge, groups))
             if side_effect:
                 side_effect()
             return answer if answer is not None else (0, "cancel\n", "")
@@ -2798,8 +3246,9 @@ class Choose(unittest.TestCase):
             return f.read()
 
     @staticmethod
-    def answer(**states):
-        return 0, "".join(f"{n}={'on' if states.get(n) else 'off'}\n" for n in NAMES), ""
+    def answer(gauge="on", ring_group="gemini", **states):
+        lines = "".join(f"{n}={'on' if states.get(n) else 'off'}\n" for n in NAMES)
+        return 0, f"{lines}gauge={gauge}\nring_gemini={ring_group}\n", ""
 
     def test_save_applies_everything_in_one_write(self):
         with mock.patch.object(self.main, "_write_atomic", wraps=self.main._write_atomic) as writes:
@@ -2811,6 +3260,31 @@ class Choose(unittest.TestCase):
                           ("foundry", True)])
         self.assertEqual(data["providers"][0]["x"], 1)
         self.assertEqual(list(data), ["providers", "debug_shapes"])
+
+    def test_panel_shows_the_current_gauge_and_ring_group(self):
+        self.choose()
+        self.assertEqual(self.settings, [(True, {"gemini": "gemini"})])  # defaults
+        data = json.loads(self.text)
+        data.update(menu_bar_gauge=False, ring_group={"gemini": "3p"})
+        with open(self.config, "w") as f:
+            json.dump(data, f)
+        self.choose()
+        self.assertEqual(self.settings[1], (False, {"gemini": "3p"}))
+
+    def test_save_writes_gauge_and_ring_group_in_the_same_write(self):
+        unchanged = dict(claude=True, codex=True, copilot=True)
+        with mock.patch.object(self.main, "_write_atomic", wraps=self.main._write_atomic) as writes:
+            self.assertEqual(self.choose(self.answer(**unchanged)), self.text)  # nothing changed: no write
+            text = self.choose(self.answer(gauge="off", ring_group="3p", **unchanged))
+            self.assertEqual(writes.call_count, 1)
+            data = json.loads(text)
+            self.assertEqual((data["menu_bar_gauge"], data["ring_group"]), (False, {"gemini": "3p"}))
+            self.assertEqual([p["enabled"] for p in data["providers"]], [True, True, False, True])
+            text = self.choose(self.answer(gauge="on", ring_group="gemini", claude=False, codex=True, copilot=True))
+            self.assertEqual(writes.call_count, 2)  # providers and settings together, once
+        data = json.loads(text)
+        self.assertEqual((data["menu_bar_gauge"], data["ring_group"], data["providers"][0]["enabled"]),
+                         (True, {"gemini": "gemini"}, False))
 
     def test_panel_rows_and_notes(self):
         common.write_private_json(self.cache, self.main.STATE_FILE,
@@ -3208,6 +3682,31 @@ class PricesRefresh(unittest.TestCase):
             self.assertEqual(sorted(self.calls), [("claude", True), ("foundry", True)], read)
 
 
+@unittest.skipUnless("--gui" in sys.argv, "draws with osascript: run with --gui")
+class RingOnScreen(unittest.TestCase):
+    """Opt-in (python3 -I tests/test_ai_limits.py --gui): the real drawing script draws a five-ring strip; no window
+    opens and no provider is read (made-up values)."""
+
+    def test_real_drawing(self):
+        specs = ring.specs(ring_results(), ring.groups(None), NOW)
+        specs.append(dict(specs[0], key="copilot", right=None, left=None, single=True))
+        values = ring.inputs((True, 94.0), specs)
+        with mock.patch.object(ring, "run", common.run):  # the suite-wide guard is lifted here only
+            start = time.monotonic()
+            pair = ring.draw(values)
+            seconds = time.monotonic() - start
+        self.assertIsNotNone(pair)
+        self.assertLess(seconds, ring.TIMEOUT)
+        import base64
+        import struct
+        for image in pair:
+            data = base64.b64decode(image)
+            self.assertGreater(ring.check_png(data), 5 * 2 * 18)  # five rings at 2x, plus the gauge
+            at = data.find(b"pHYs")
+            self.assertGreater(at, 0)
+            self.assertEqual(struct.unpack(">IIB", data[at + 4:at + 13]), (5669, 5669, 1))  # 144 dpi: Retina size
+
+
 @unittest.skipUnless("--gui" in sys.argv, "opens a window: run with --gui")
 class PanelOnScreen(unittest.TestCase):
     """Opt-in (python3 -I tests/test_ai_limits.py --gui): the real windows, which close themselves after a second."""
@@ -3248,8 +3747,9 @@ class PanelOnScreen(unittest.TestCase):
             self.assertEqual([x for x in lines if x.startswith("#")], ["#active=true", "#key=true", "#visible=true"])
             states = panel.parse(0, "\n".join(x for x in lines if not x.startswith("#")), NAMES)
             # the self-test clicks the first checkbox (Claude: on -> off) and then Save
-            self.assertEqual(states, {"claude": False, "codex": False, "gemini": True, "copilot": True,
-                                      "foundry": False})
+            self.assertEqual(states, {"providers": {"claude": False, "codex": False, "gemini": True, "copilot": True,
+                                                    "foundry": False},
+                                      "gauge": True, "groups": {"gemini": "gemini"}})  # the settings unchanged
             code, out, err = panel.show(self.ROWS, "selftest-cancel", timeout=30)
             self.assertEqual((code, err), (0, ""))
             self.assertEqual(out.splitlines()[0], "cancel")

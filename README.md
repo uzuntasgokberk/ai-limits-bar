@@ -4,7 +4,7 @@ See how much of your AI usage limits is left, right from the macOS menu bar: **C
 
 **macOS only:** it is a SwiftBar plugin and does not run on Windows or Linux (see [Requirements](#requirements)).
 
-The menu bar shows a gauge and a percentage: by default the highest current usage of all limits, or one limit you choose under **Menu bar shows** (for example `57%`, orange from 75%, red from 90%). Hover for a one-line summary that starts with what the number is, click for the details. Each limit has a bar, its percentage and when it resets:
+The menu bar shows a gauge and a percentage: by default the highest current usage of all limits, or one limit you choose under **Menu bar shows** (for example `57%`, orange from 75%, red from 90%). Next to it, one ring per provider: the right arc is its 5-hour limit, the left arc its weekly limit (see [Menu bar rings](#menu-bar-rings)). Hover for a one-line summary that starts with what the number is, then each ring's values; click for the details. Each limit has a bar, its percentage and when it resets:
 
 ```
 Claude
@@ -35,6 +35,17 @@ A provider that isn't set up on your Mac is hidden automatically, and so are lim
 **Gemini limits.** The quota groups and their windows are the ones on Antigravity's Usage screen: Gemini models, and Claude and GPT models, each with a 5-hour and a weekly limit. They come from Antigravity's local server, which gets them from Google itself; the plugin only asks that server. A limit the server lists without a value is not shown as a bar; Details says *no value reported* for it. An account or Antigravity version without this quota summary shows the per-model lines as before, and so does the Gemini CLI fallback, which has no windows. This was verified on one Google AI Pro account with untouched and partly used limits; a window that has not started yet (no usage in it) has no reset time, so none is shown. An exhausted limit, and accounts without the quota summary, are not confirmed yet.
 
 **Read-only.** This tool never changes anything in your accounts. For example, it can't use a limit reset: Codex messages are restricted to an allow-list of two read-only requests and one notification, and Claude's reset endpoint is never called. Do that in the official app or website. The only thing it ever changes is its own settings file, `config.json`, when you turn a provider on or off, choose what the menu bar shows or set Foundry prices.
+
+## Menu bar rings
+
+After the gauge and percentage, each provider that has a section in the menu gets a ring, in the menu's order. A provider that is off, or on but not set up on this Mac, has none, and neither has Microsoft Foundry (it has no percentage).
+
+- **Right arc: the 5-hour limit. Left arc: the weekly limit.** Each arc is a dim track with the used part bright, growing from the gap at the bottom towards the top; it turns orange from 75% and red from 90%, like the rest of the menu. GitHub Copilot has one limit, so both arcs show it. Gemini's ring follows one quota group: *Gemini models* (the default) or *Claude and GPT models*, chosen in **Providers…**. Both groups stay listed in the menu.
+- **No current value** (not read yet, the reset time passed, or Gemini's per-model lines, which have no windows): the ring shows only its track, and its middle is dimmed.
+- **The middle** shows the provider's initials: *Cl* Claude, *Cx* Codex, *Ge* Gemini, *Cp* GitHub Copilot. This repository ships no company logos. To see a logo instead, put your own copy in `~/Library/Application Support/ai-limits-bar/logos/`, named after the provider: `claude`, `codex`, `gemini` or `copilot`, with `.svg`, `.pdf` or `.png` (for example `claude.svg`). An optional second file such as `codex-dark.svg` is used on a dark menu bar. The folder and the file must be yours and not writable by others, the file a regular file (not a link) of at most 512 KB; anything else is ignored and the initials are drawn. If an `.svg` file is not shown (support depends on the macOS version), use `.pdf` or `.png`. **Such files are your responsibility under each company's own terms**: several companies allow their logos only with their permission.
+- **Light and dark menu bars:** the strip is drawn twice, for a light and for a dark menu bar, and SwiftBar shows the one that matches your menu bar; it switches by itself when the system appearance changes.
+- **Gauge and percentage:** **Show gauge and percentage** in **Providers…** turns them off, so the menu bar shows the rings only. With no ring to draw either, the gauge stays, with `–`.
+- The whole strip is one image, drawn by macOS (`osascript`) in about 0.15 seconds, and only when a value changes: the last one is kept in the cache folder. If it can't be drawn, the menu bar shows the gauge and percentage as text, as before.
 
 ## Requirements
 
@@ -103,6 +114,8 @@ On first run `config.json` is created from `config.example.json` (it is git-igno
   - `invoice_refresh_hours`: how often the invoice history is fetched (default 6; at most every 15 minutes on *Refresh now*). Cost Management throttles frequent queries, and past months don't change.
   - `prices_usd_per_million`: per deployment name: `input`, `output`, `cache_read`, `cache_write_5m`, `cache_write_1h`, in US dollars per million tokens (at most 10,000). They are used only for models Azure has no cost estimate for; a price for a model Azure estimates is ignored (see *How Foundry spend is computed* below). **Foundry prices…** in the menu sets them for you (see [Foundry prices](#foundry-prices)). A deployment with tokens, no Azure estimate and no price (or no price for a token type it used) is counted in tokens only and Details names it *(no price)*. If it has tokens today, this week or this month, those totals are marked `≥` and the section counts it in *N models have no price*; if its tokens are all older, no total depends on it (earlier months reach *All time* through the invoice) and it is not counted.
 - `menu_bar`: what the number in the menu bar shows. `"highest"` (the default) is the highest current percentage of all limits; `{"provider": "claude", "limit": "5-hour"}` is that one limit, named exactly as listed under **Menu bar shows** (see [The menu](#the-menu)), which sets it for you. A name the menu can't offer as a click can still be written here by hand. An invalid value means highest.
+- `menu_bar_gauge`: `false` hides the gauge and percentage, so the menu bar shows the rings only; `true` or no value shows them. **Providers…** sets it for you.
+- `ring_group`: the quota group a ring follows, `{"gemini": "gemini"}` (the default: Gemini models) or `{"gemini": "3p"}` (Claude and GPT models). **Providers…** sets it for you.
 - `debug_shapes`: stores the *structure* of the Claude response (field names and value types only, no values) in the cache, to help when an endpoint changes.
 
 The plugin ignores environment variables, because a SwiftBar link can set them. Switches for testing and troubleshooting are command-line arguments (see [Troubleshooting](#troubleshooting)), which a link cannot set.
@@ -146,7 +159,8 @@ Choose **Providers…** in the menu. A small window opens with one checkbox per 
 
 - **Off** (unticked) means the provider is not read at all (no process, no request, not even its cache) and has no section in the menu. Use this for a service you don't have, e.g. untick Gemini if you don't use Gemini.
 - **On, with *· not set up on this Mac*** next to it means the provider is on, but the last menu update found its tool missing or not signed in (see [Requirements](#requirements)), or, for Foundry, `resource_group` missing. That is why it has no section.
-- **Save** writes `enabled` for all providers to `config.json` at once, and the menu is rebuilt right after the window closes. Like **Refresh now**, that reads the providers that are on again (values read less than a minute ago are kept). The file is rewritten in place with one provider per line; your values and their order are kept. While the menu says *config.json could not be read*, the window doesn't open: fix the file first.
+- Below the providers: **Show gauge and percentage** (off: the menu bar shows the rings only) and **Gemini ring follows**, *Gemini models* or *Claude and GPT models* (see [Menu bar rings](#menu-bar-rings)).
+- **Save** writes `enabled` for all providers, and the two settings, to `config.json` at once, and the menu is rebuilt right after the window closes. Like **Refresh now**, that reads the providers that are on again (values read less than a minute ago are kept). The file is rewritten in place with one provider per line; your values and their order are kept. While the menu says *config.json could not be read*, the window doesn't open: fix the file first.
 - The window closes by itself, without changes, after 10 minutes. Choosing **Providers…** again while it is open does nothing.
 - If the repository's path contains a `"` or a backslash, **Providers…** can't be clicked (and **Open settings** is left out). The same goes for **Providers…** if it contains `'`, `$`, `;`, `&`, `|`, `<`, `>` or a backtick. Use the terminal command below then.
 - From a terminal, one provider at a time: `~/ai-limits-bar/plugin/ai-limits.5m.sh --toggle gemini` turns Gemini on or off (it prints nothing; the menu changes on its next refresh). The window itself: `--choose`.
@@ -180,7 +194,7 @@ In short:
 - Credentials are never refreshed, stored, logged or printed.
 - Where possible the provider's own tool does the talking (Codex app-server, GitHub CLI, Azure CLI, the Antigravity server).
 - The menu never shows your email, username, tenant or subscription id. Foundry's *Details* submenu does list the model deployment names you chose in Azure and the invoice meter names; keep it closed on a screen recording if those are private.
-- No log files are written. Besides `config.json` (created on the first run, rewritten when you turn a provider on or off, choose what the menu bar shows or set Foundry prices), the only files are a few small cache files in `~/Library/Caches/ai-limits-bar/` (folder 0700, files 0600). They hold numbers, times and labels (including those Foundry deployment and meter names), and are overwritten on every read. Foundry's monthly invoice, token and estimated-cost totals are kept there as well (`foundry-history.json`), and the names of the deployments without an Azure estimate, for the prices window (`foundry-deployments.json`, no amounts).
+- No log files are written. Besides `config.json` (created on the first run, rewritten when you turn a provider on or off, choose what the menu bar shows, change the gauge or ring settings, or set Foundry prices), the only files are a few small cache files in `~/Library/Caches/ai-limits-bar/` (folder 0700, files 0600). They hold numbers, times and labels (including those Foundry deployment and meter names), and are overwritten on every read. `menu-bar-image.json` holds the last drawn menu bar strip (the two images and a fingerprint of their values). Foundry's monthly invoice, token and estimated-cost totals are kept there as well (`foundry-history.json`), and the names of the deployments without an Azure estimate, for the prices window (`foundry-deployments.json`, no amounts).
 
 See [SECURITY.md](SECURITY.md) for the full model and how to report a problem.
 
@@ -196,6 +210,8 @@ The plugin ignores environment variables; these switches are command-line argume
 - A provider has no section: open **Providers…**. Unticked means it is off; *· not set up on this Mac* means its tool was not found or is not signed in (see [Requirements](#requirements)).
 - Turn a provider on or off: `--toggle gemini`; open the window: `--choose`
 - Choose what the menu bar shows: `--show claude:5-hour` (provider, a colon, then the limit's name as listed under **Menu bar shows**); back to the highest: `--show highest`
+- Hide or show the gauge and percentage: `--gauge off`, `--gauge on`. Choose the quota group of Gemini's ring: `--ring gemini:3p` (Claude and GPT models) or `--ring gemini:gemini`. Both print nothing; the menu changes on its next refresh.
+- The menu bar shows the gauge and percentage as text and no rings: the strip could not be drawn (the next refresh tries again). `--no-image` shows that text title on purpose, for one run.
 - Set Foundry prices: `--set-price demo-model input=1.25 output=10 cache_read=0.125` (see [Foundry prices](#foundry-prices)); open the window: `--prices`
 - *AI Limits Bar could not run*: `~/ai-limits-bar/plugin/ai-limits.5m.sh --debug` prints the error to the terminal. Add `>/dev/null` to see only the error, without the menu and your numbers (for example for an issue).
 - Read every provider again instead of using the cache (values read less than a minute ago are still used): `--refresh`
@@ -225,6 +241,7 @@ CI runs the offline suite on GitHub's macOS runner with the system Python (3.9) 
 | `ai_limits/main.py` | Order, cache, timeouts, `--choose`, `--toggle`, `--show`, `--prices` and `--set-price` |
 | `ai_limits/panel.py` | The **Providers…** and **Foundry prices…** windows (fixed scripts run by `osascript`) |
 | `ai_limits/render.py` | Menu text and output safety |
+| `ai_limits/ring.py` | The menu bar strip (gauge and rings), drawn by a fixed `osascript` script |
 | `ai_limits/common.py` | HTTP and subprocess helpers |
 | `ai_limits/providers/` | One module per provider |
 

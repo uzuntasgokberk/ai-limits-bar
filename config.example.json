@@ -11,5 +11,7 @@
      }}
   ],
   "menu_bar": "highest",
+  "menu_bar_gauge": true,
+  "ring_group": {"gemini": "gemini"},
   "debug_shapes": false
 }

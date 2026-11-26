@@ -45,8 +45,15 @@ is a command-line argument, which a link can't set (SwiftBar passes none, except
                  cache_read, cache_write_5m or cache_write_1h, PRICE is USD per million tokens as the window takes it
                  (foundry.parse_price); an empty PRICE removes that field. Anything invalid is refused before the
                  config file is opened.
-                 With --choose, --toggle, --show, --prices or --set-price, the other switches except --config (and
-                 --cache for --choose and --prices) are ignored.
+  --gauge on|off show or hide the gauge and percentage on the left of the menu bar item (`menu_bar_gauge` in the
+                 config file; the rings stay) and print nothing. Like --show, it leaves the marker for the refresh.
+  --ring PROVIDER:GROUP
+                 which quota group a provider's ring follows (`ring_group`), e.g. `gemini:3p` for Gemini's Claude and
+                 GPT models; only the choices in ring.GROUPS are accepted. Prints nothing; leaves the marker.
+  --no-image     never draw the menu bar strip for this run: the gauge and percentage as text, as before the rings
+                 (for troubleshooting; every test run of the plugin as a process passes it).
+                 With --choose, --toggle, --show, --gauge, --ring, --prices or --set-price, the other switches except
+                 --config (and --cache for --choose, --show, --gauge, --ring and --prices) are ignored.
 """
 import argparse
 import contextlib
@@ -72,7 +79,7 @@ sys.path.insert(0, ROOT)
 # http_proxy and friends then; provider modules resolve `~`), and replaced by the fixed one.
 os.environ.clear()
 
-from ai_limits import panel, render  # noqa: E402
+from ai_limits import panel, render, ring  # noqa: E402
 from ai_limits.common import ENV, HOME, NotConfigured, Unavailable, write_private_json  # noqa: E402
 
 os.environ.update(ENV)
@@ -121,11 +128,16 @@ def parse_args(argv):
     parser.add_argument("--show")
     parser.add_argument("--prices", action="store_true")
     parser.add_argument("--set-price", nargs="+")
+    parser.add_argument("--gauge")
+    parser.add_argument("--ring")
+    parser.add_argument("--no-image", action="store_true")
     args, _ = parser.parse_known_args(argv)
     if args.config == "" or args.cache == "":
         parser.error("empty path")
     if args.show == "":
         parser.error("--show takes highest or PROVIDER:LIMIT")
+    if args.gauge == "" or args.ring == "":
+        parser.error("--gauge takes on or off; --ring takes PROVIDER:GROUP")
     return args
 
 
@@ -251,8 +263,8 @@ def _change_config_locked(path, create, change):
     return True
 
 
-def _set_enabled_locked(path, changes, create):
-    """set_enabled without taking the lock (the caller holds it). Returns whether the file was written."""
+def _enabled_change(changes):
+    """The config edit of set_enabled, for _change_config_locked: change(data) -> whether anything changed."""
     def change(data):
         if not isinstance(data.get("providers"), list):
             data["providers"] = []
@@ -274,7 +286,37 @@ def _set_enabled_locked(path, changes, create):
                 entry["enabled"] = on
             changed = True
         return changed
-    return _change_config_locked(path, create, change)
+    return change
+
+
+def _gauge_change(on):
+    """`menu_bar_gauge`: a missing key (or anything but false) means shown, so showing it then writes nothing."""
+    def change(data):
+        if (data.get("menu_bar_gauge") is not False) == on:
+            return False
+        data["menu_bar_gauge"] = on
+        return True
+    return change
+
+
+def _groups_change(chosen):
+    """`ring_group`: {provider: group} for the choices in ring.GROUPS; the default needs no entry."""
+    def change(data):
+        current, changed = ring.groups(data.get("ring_group")), False
+        for provider, group in chosen.items():
+            if group not in ring.GROUPS.get(provider, ()) or current.get(provider) == group:
+                continue
+            if not isinstance(data.get("ring_group"), dict):
+                data["ring_group"] = {}
+            data["ring_group"][provider] = group
+            changed = True
+        return changed
+    return change
+
+
+def _set_enabled_locked(path, changes, create):
+    """set_enabled without taking the lock (the caller holds it). Returns whether the file was written."""
+    return _change_config_locked(path, create, _enabled_change(changes))
 
 
 def set_enabled(path, changes, create, lock_seconds=None):
@@ -315,6 +357,30 @@ def set_menu_bar(path, value, create):
             return False
         data["menu_bar"] = value
         return True
+    target = os.path.realpath(path)
+    with _folder_lock(os.path.dirname(target), LOCK_SECONDS):
+        return _change_config_locked(path, create, change)
+
+
+def parse_gauge(value):
+    """--gauge value -> True (on) or False (off); anything else is refused before the config file is opened."""
+    if value not in ("on", "off"):
+        raise ArgumentError("--gauge takes on or off")
+    return value == "on"
+
+
+def parse_ring(value):
+    """--ring value -> (provider, group) from ring.GROUPS, e.g. "gemini:3p"; anything else is refused before the
+    config file is opened."""
+    provider, colon, group = value.partition(":")
+    if not colon or group not in ring.GROUPS.get(provider, ()):
+        raise ArgumentError("--ring takes PROVIDER:GROUP, e.g. gemini:3p")
+    return provider, group
+
+
+def set_setting(path, change, create):
+    """--gauge and --ring: one config edit with the same lock and writer as set_enabled. Returns whether the file
+    was written."""
     target = os.path.realpath(path)
     with _folder_lock(os.path.dirname(target), LOCK_SECONDS):
         return _change_config_locked(path, create, change)
@@ -548,11 +614,17 @@ def choose(path, cache, create):
             for name in NAMES:
                 on = entries.get(name, {}).get("enabled") is True
                 rows.append((name, render.HEADERS[name], on, render.NOT_SET_UP if on and name in not_set_up else ""))
-            code, out, _ = panel.show(rows)
-            chosen = panel.parse(code, out, NAMES)
-            if chosen is None:
+            code, out, _ = panel.show(rows, gauge=config.get("menu_bar_gauge") is not False,
+                                      groups=ring.groups(config.get("ring_group")))
+            answer = panel.parse(code, out, NAMES)
+            if answer is None:
                 return False
-            return _set_enabled_locked(path, chosen, create)
+
+            def change(data):
+                edits = (_enabled_change(answer["providers"]), _gauge_change(answer["gauge"]),
+                         _groups_change(answer["groups"]))
+                return any([edit(data) for edit in edits])  # every edit runs
+            return _change_config_locked(path, create, change)
     except Busy:
         return False  # a panel is already open (or a --toggle is running)
 
@@ -573,6 +645,12 @@ def _number(x, default, low, high):
     if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x):
         return default
     return min(max(float(x), low), high)
+
+
+def menu_bar_strip(rings, gauge, cache):
+    """The drawn menu bar strip (ring.strip) or None. A separate name so the tests can replace it: load_main() makes
+    it return None, so an in-process test never starts osascript."""
+    return ring.strip(rings, gauge, cache)
 
 
 def call(name, settings, forced_failures):
@@ -597,6 +675,15 @@ def main(argv=None):
         # the click and its refresh both use the default cache folder; --cache only matters for tests and terminals.
         mark_keep_values(cache)
         return  # nothing is printed: the click's refresh=true re-runs the plugin for the new menu
+    if args.gauge is not None:
+        set_setting(config_path, _gauge_change(parse_gauge(args.gauge)), create=not args.config)  # may refuse
+        mark_keep_values(cache)
+        return  # nothing is printed
+    if args.ring is not None:
+        provider, group = parse_ring(args.ring)  # may refuse
+        set_setting(config_path, _groups_change({provider: group}), create=not args.config)
+        mark_keep_values(cache)
+        return  # nothing is printed
     if args.prices:
         written = choose_prices(config_path, cache, create=not args.config)
         mark_keep_values(cache, ("foundry",) if written else ())  # Foundry's totals need the new prices
@@ -671,8 +758,16 @@ def main(argv=None):
         save_state(cache, missing)
     shown = [(n, results[n]) for n in order if results.get(n)]
     providers = [(n, entries.get(n, {}).get("enabled") is True) for n in NAMES]
-    print(render.menu(shown, time.time(), True, config_path, config_error, providers, LAUNCHER,
-                      config_path if args.config else None, config.get("menu_bar")))
+    now = time.time()
+    gauge = config.get("menu_bar_gauge") is not False
+    rings, strip = [], None
+    with contextlib.suppress(Exception):  # the menu never depends on the strip
+        rings = ring.specs(shown, ring.groups(config.get("ring_group")), now)
+        if not args.no_image:
+            top, _ = render.headline(shown, now, render.menu_bar_choice(config.get("menu_bar")))
+            strip = menu_bar_strip(rings, (gauge, top), cache)
+    print(render.menu(shown, now, True, config_path, config_error, providers, LAUNCHER,
+                      config_path if args.config else None, config.get("menu_bar"), rings, strip, gauge))
 
 
 def safe_main():
