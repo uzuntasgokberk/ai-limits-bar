@@ -1044,7 +1044,8 @@ class Providers(unittest.TestCase):
 def gemini_summary():
     """RetrieveUserQuotaSummary as observed on one Google AI Pro account with every limit untouched (Nov 2026): the
     same keys, value types and order (weekly before 5h; remainingFraction the int 1; resetTime on the Gemini buckets
-    only). The texts of the descriptions and the times are made up."""
+    only: the 3p windows had not started yet). The texts of the descriptions and the times are made up. After light
+    use the same account answered as in gemini_summary_used()."""
     return {"response": {"groups": [
         {"displayName": "Gemini Models", "description": "Example group description.", "buckets": [
             {"bucketId": "gemini-weekly", "displayName": "Weekly Limit Remaining", "window": "weekly",
@@ -1056,6 +1057,25 @@ def gemini_summary():
              "remainingFraction": 1},
             {"bucketId": "3p-5h", "displayName": "Five Hour Limit Remaining", "window": "5h",
              "remainingFraction": 1}]}],
+        "description": "Example summary description."}}
+
+
+def gemini_summary_used():
+    """RetrieveUserQuotaSummary as observed on the same account after one short message to a Gemini model and one to
+    a Claude model (Nov 2026): every bucket has a float remainingFraction below 1, a resetTime and its own
+    `description`. The fractions are of the observed kind (0.9894 and 0.9566 were seen); the texts and times are made
+    up."""
+    def bucket(bucket_id, window, fraction, reset):
+        return {"bucketId": bucket_id, "displayName": "Weekly Limit Remaining" if window == "weekly"
+                else "Five Hour Limit Remaining", "description": "Example bucket description.", "window": window,
+                "remainingFraction": fraction, "resetTime": reset}
+    return {"response": {"groups": [
+        {"displayName": "Gemini Models", "description": "Example group description.", "buckets": [
+            bucket("gemini-weekly", "weekly", 0.9894, "2031-05-30T08:00:00Z"),
+            bucket("gemini-5h", "5h", 0.9566, "2031-05-26T13:00:00Z")]},
+        {"displayName": "Claude and GPT models", "description": "Example group description.", "buckets": [
+            bucket("3p-weekly", "weekly", 0.9917, "2031-05-30T09:30:00Z"),
+            bucket("3p-5h", "5h", 0.9701, "2031-05-26T14:30:00Z")]}],
         "description": "Example summary description."}}
 
 
@@ -1103,7 +1123,7 @@ class GeminiQuotaSummary(unittest.TestCase):
         self.assertEqual([x["percent"] for x in rows], [0.0] * 4)
         self.assertEqual(rows[0]["resets"], common.to_epoch("2031-05-26T13:00:00Z"))
         self.assertEqual(rows[1]["resets"], common.to_epoch("2031-05-30T08:00:00Z"))
-        self.assertEqual([rows[2]["resets"], rows[3]["resets"]], [None, None])  # the 3p buckets had no resetTime
+        self.assertEqual([rows[2]["resets"], rows[3]["resets"]], [None, None])  # 3p windows had not started yet
         self.assertEqual([(x["group"], x["window"]) for x in rows],
                          [("gemini", "5h"), ("gemini", "weekly"), ("3p", "5h"), ("3p", "weekly")])
         self.assertEqual(details, ["Plan: Example Plan"])  # GetUserStatus adds only the plan line, no model rows
@@ -1120,8 +1140,30 @@ class GeminiQuotaSummary(unittest.TestCase):
             self.assertEqual(headers, {"Connect-Protocol-Version": "1", "X-Codeium-Csrf-Token": "demo-csrf-token"})
         self.assertTrue(gemini.SUMMARY_PATH.startswith("/exa.language_server_pb.LanguageServerService/"))
 
-    def test_partial_and_exhausted_limits_assumed_shape(self):
-        """Assumed shape, not observed: a fraction below 1 and an explicit 0."""
+    def test_observed_partly_used_summary(self):
+        """Observed shape, not assumed (second probe, after light use): float fractions below 1, a resetTime on all
+        four buckets including 3p, and a `description` on each bucket, which is ignored."""
+        rows, details, _ = self.read(gemini_summary_used(), gemini_status())
+        self.assertEqual([x["label"] for x in rows], SUMMARY_LABELS)
+        for x, fraction in zip(rows, (0.9566, 0.9894, 0.9701, 0.9917)):
+            self.assertAlmostEqual(x["percent"], (1 - fraction) * 100)
+        self.assertEqual([x["resets"] for x in rows],
+                         [common.to_epoch(t) for t in ("2031-05-26T13:00:00Z", "2031-05-30T08:00:00Z",
+                                                       "2031-05-26T14:30:00Z", "2031-05-30T09:30:00Z")])
+        self.assertEqual([(x["group"], x["window"]) for x in rows],
+                         [("gemini", "5h"), ("gemini", "weekly"), ("3p", "5h"), ("3p", "weekly")])
+        self.assertEqual(details, ["Plan: Example Plan"])  # no description text reaches the menu
+        r = render.normalize(gemini.result("GEMINI", rows=rows, details=details))
+        lines = menu_lines(render.menu([("gemini", r)], NOW))
+        for label, shown in zip(SUMMARY_LABELS, ("4%", "1%", "3%", "1%")):
+            line = next(x for x in lines if x.startswith(label + " "))
+            self.assertRegex(line.split(" | ")[0], rf" +{shown}$")
+            self.assertIn("↻", lines[lines.index(line) + 1])  # every window has a reset line now
+        self.assertNotIn("Example bucket description", "\n".join(lines))
+
+    def test_exhausted_and_out_of_range_limits_assumed_shape(self):
+        """Assumed shape, not observed: an explicit 0 (exhausted) and values outside 0..1. A fraction below 1 is
+        observed (test_observed_partly_used_summary); 0.35 here only checks the arithmetic."""
         rows, _, _ = self.read(self.summary_with(
             {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0, "resetTime": "2031-05-26T13:00:00Z"},
             {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.35}), gemini_status())

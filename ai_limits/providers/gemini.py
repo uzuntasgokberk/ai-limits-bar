@@ -180,9 +180,10 @@ def _unique(label, used):
 def summary_rows(d):
     """RetrieveUserQuotaSummary -> (rows, details), or None when it is not that shape or has no usable value.
     Shape (observed Nov 2026): {response: {groups: [{displayName, description, buckets: [{bucketId, displayName,
-    window, remainingFraction, resetTime?}]}], description}}; remainingFraction arrived as the int 1, resetTime was
-    missing on some buckets. A bucket without a numeric remainingFraction (e.g. only remainingAmount) or with
-    `disabled` gets a detail line instead of a row: it is never shown as 0% used."""
+    description, window, remainingFraction, resetTime?}]}], description}}. A window that has not started yet (no
+    usage in it) came as the int 1 without resetTime; once used, as a float below 1 (e.g. 0.9894) with resetTime.
+    An exhausted window (0) was not observed. A bucket without a numeric remainingFraction (e.g. only
+    remainingAmount) or with `disabled` gets a detail line instead of a row: it is never shown as 0% used."""
     response = d.get("response") if isinstance(d, dict) else None
     groups = response.get("groups") if isinstance(response, dict) else None
     if not isinstance(groups, list):
