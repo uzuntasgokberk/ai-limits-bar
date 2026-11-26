@@ -13,8 +13,12 @@ Logos: the middle of a ring is a mark from two folders, by fixed file names (nev
 the user's own files in LOGO_DIR (`claude.svg`, `codex-light.png` ...) win over the project's own drawings shipped in
 SHIPPED_DIR (`claude.pdf`, `codex-light.pdf` ...). For each menu bar variant (light, dark) the names tried are
 `<provider>-<variant>.*`, then `<provider>.*`. A file must be a regular file (not a link) in a folder that is not a link,
-owned by the user (a shipped one also by root), not writable by group or others, of 1 byte to LOGO_MAX_BYTES; anything
-else is skipped. The provider's initials are the last fallback.
+owned by the user (a shipped one also by root), not writable by group or others, of 1 byte to LOGO_MAX_BYTES; the file
+is opened (no link is followed) and checked through its descriptor. A `.png` must also start with a PNG header whose
+width and height are 1 to LOGO_MAX_PIXELS: AppKit decodes whatever bitmap format such a file holds, at whatever
+picture size (an `.svg` or `.pdf` name is drawn only as that type, so those get no content check). Anything else is
+skipped; the provider's initials are the last fallback. The script opens the file again by its path (`arguments`
+passes only the fixed names in the two folders), so the checks hold as long as nobody else can write to the folder.
 """
 import base64
 import binascii
@@ -41,8 +45,12 @@ SHIPPED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logos")
 SHIPPED_TYPES = ("pdf",)
 VARIANTS = ("light", "dark")
 LOGO_MAX_BYTES = 512 * 1024
+LOGO_MAX_PIXELS = 2048  # width and height of a .png logo: a small file can say a picture that takes gigabytes to decode
 # Shown in the middle of a ring without a usable logo file: fixed, never from provider data.
 INITIALS = {"claude": "Cl", "codex": "Cx", "gemini": "Ge", "copilot": "Cp"}
+# The only file names a logo path may have: <provider>[-light|-dark].<type>
+_LOGO_NAME = re.compile(r"(?:%s)(?:-(?:%s))?\.(?:%s)" % tuple("|".join(map(re.escape, x))
+                                                             for x in (INITIALS, VARIANTS, LOGO_TYPES)))
 SINGLE_LIMIT = {"copilot"}  # one limit: one continuous arc
 # Providers whose ring follows one of several quota groups: the choices (first = default) and their fixed labels.
 GROUPS = {"gemini": ("gemini", "3p")}
@@ -240,10 +248,20 @@ def _private(st, owners):
     return st.st_uid in owners and not st.st_mode & 0o022
 
 
+def _png_header(fd):
+    """True if the file starts with the PNG signature and an IHDR chunk of 1 to LOGO_MAX_PIXELS in width and height."""
+    head = os.read(fd, 24)
+    if len(head) != 24 or head[:8] != _PNG_SIGNATURE or head[8:16] != b"\x00\x00\x00\rIHDR":
+        return False
+    width, height = struct.unpack(">II", head[16:24])
+    return 1 <= width <= LOGO_MAX_PIXELS and 1 <= height <= LOGO_MAX_PIXELS
+
+
 def _logo(folder, name, types, owners):
     """(path, mtime_ns, size) of folder/<name>.<type> (the first type that exists and passes), or None: the folder
     and the file must not be symlinks, must be owned by one of `owners` and not writable by group or others, and the
-    file must be a regular file of 1 byte to LOGO_MAX_BYTES."""
+    file must be a regular file of 1 byte to LOGO_MAX_BYTES, a `.png` with a PNG header (_png_header). The file is
+    opened first and checked through its descriptor (no symlink is followed, a FIFO can't block)."""
     try:
         st = os.lstat(folder)
     except OSError:
@@ -253,11 +271,18 @@ def _logo(folder, name, types, owners):
     for ext in types:
         path = os.path.join(folder, f"{name}.{ext}")
         try:
-            st = os.lstat(path)
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except OSError:
             continue
-        if stat.S_ISREG(st.st_mode) and _private(st, owners) and 0 < st.st_size <= LOGO_MAX_BYTES:
-            return path, st.st_mtime_ns, st.st_size
+        try:
+            st = os.fstat(fd)
+            if (stat.S_ISREG(st.st_mode) and _private(st, owners) and 0 < st.st_size <= LOGO_MAX_BYTES
+                    and (ext != "png" or _png_header(fd))):
+                return path, st.st_mtime_ns, st.st_size
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
     return None
 
 
@@ -313,7 +338,8 @@ def arguments(values):
         if shape not in ("1", "2") or initials not in INITIALS.values():
             raise ValueError("bad ring")
         for logo in (light, dark):
-            if logo is not None and os.path.dirname(logo[0]) not in (LOGO_DIR, SHIPPED_DIR):
+            if logo is not None and (os.path.dirname(logo[0]) not in (LOGO_DIR, SHIPPED_DIR)
+                                     or not _LOGO_NAME.fullmatch(os.path.basename(logo[0]))):
                 raise ValueError("bad logo path")
         for value, lvl in ((right, right_level), (left, left_level)):
             if not _VALUE.fullmatch(value) or (value and int(value) > 100) or lvl not in LEVELS.values():
