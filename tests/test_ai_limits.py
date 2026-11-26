@@ -1041,6 +1041,347 @@ class Providers(unittest.TestCase):
         self.assertIsNone(foundry.estimate({"ephemeral1hInputTokens": 5}, prices))  # unpriced type
 
 
+def gemini_summary():
+    """RetrieveUserQuotaSummary as observed on one Google AI Pro account with every limit untouched (Nov 2026): the
+    same keys, value types and order (weekly before 5h; remainingFraction the int 1; resetTime on the Gemini buckets
+    only). The texts of the descriptions and the times are made up."""
+    return {"response": {"groups": [
+        {"displayName": "Gemini Models", "description": "Example group description.", "buckets": [
+            {"bucketId": "gemini-weekly", "displayName": "Weekly Limit Remaining", "window": "weekly",
+             "remainingFraction": 1, "resetTime": "2031-05-30T08:00:00Z"},
+            {"bucketId": "gemini-5h", "displayName": "Five Hour Limit Remaining", "window": "5h",
+             "remainingFraction": 1, "resetTime": "2031-05-26T13:00:00Z"}]},
+        {"displayName": "Claude and GPT models", "description": "Example group description.", "buckets": [
+            {"bucketId": "3p-weekly", "displayName": "Weekly Limit Remaining", "window": "weekly",
+             "remainingFraction": 1},
+            {"bucketId": "3p-5h", "displayName": "Five Hour Limit Remaining", "window": "5h",
+             "remainingFraction": 1}]}],
+        "description": "Example summary description."}}
+
+
+def gemini_status():
+    """GetUserStatus in the shape the per-model rows have always read (made-up values)."""
+    return {"userStatus": {"userTier": {"id": "demo-tier", "name": "Example Plan"},
+                           "cascadeModelConfigData": {"clientModelConfigs": [
+                               {"label": "Gemini Demo Pro", "quotaInfo": {"remainingFraction": 0.35,
+                                                                          "resetTime": "2031-05-28T00:00:00Z"}},
+                               {"label": "Example Model (Thinking)",
+                                "quotaInfo": {"remainingFraction": 1, "resetTime": "2031-06-01T10:00:00Z"}}]}}}
+
+
+SUMMARY_LABELS = ["Gemini 5-hour", "Gemini Weekly", "Claude GPT 5-hour", "Claude GPT Weekly"]
+
+
+class GeminiQuotaSummary(unittest.TestCase):
+    """Antigravity's quota summary (two groups with a 5-hour and a weekly window) and the fallback to the per-model
+    rows. Tests whose shape was not observed on a real account say so ("assumed shape")."""
+
+    def read(self, summary=None, status=None):
+        """antigravity() against a fake local server: `summary` and `status` are the answers to the two requests
+        (an exception instance is raised instead). Returns (rows, details, calls)."""
+        calls = []
+
+        def fake(port, path, headers, body, timeout=8):
+            calls.append((path, headers, body))
+            answer = summary if path == gemini.SUMMARY_PATH else status if path == gemini.STATUS_PATH else None
+            if answer is None:
+                raise AssertionError(f"unexpected request {path}")
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        with mock.patch.object(gemini, "localhost_json", fake):
+            rows, details = gemini.antigravity(1234, "demo-csrf-token")
+        return rows, details, calls
+
+    def summary_with(self, *buckets, display="Gemini Models"):
+        return {"response": {"groups": [{"displayName": display, "buckets": list(buckets)}]}}
+
+    def test_observed_summary_gives_four_rows(self):
+        rows, details, calls = self.read(gemini_summary(), gemini_status())
+        self.assertEqual([x["label"] for x in rows], SUMMARY_LABELS)  # per group 5-hour first, though sent second
+        self.assertEqual([x["percent"] for x in rows], [0.0] * 4)
+        self.assertEqual(rows[0]["resets"], common.to_epoch("2031-05-26T13:00:00Z"))
+        self.assertEqual(rows[1]["resets"], common.to_epoch("2031-05-30T08:00:00Z"))
+        self.assertEqual([rows[2]["resets"], rows[3]["resets"]], [None, None])  # the 3p buckets had no resetTime
+        self.assertEqual([(x["group"], x["window"]) for x in rows],
+                         [("gemini", "5h"), ("gemini", "weekly"), ("3p", "5h"), ("3p", "weekly")])
+        self.assertEqual(details, ["Plan: Example Plan"])  # GetUserStatus adds only the plan line, no model rows
+        for label in SUMMARY_LABELS:
+            self.assertTrue(render.CHOICE_LABEL.fullmatch(label), label)
+        self.assertEqual(gemini.KIND.pattern, render.KIND.pattern)  # else normalize would drop the machine fields
+
+    def test_summary_request_comes_first_with_an_empty_body(self):
+        _, _, calls = self.read(gemini_summary(), gemini_status())
+        self.assertEqual([c[0] for c in calls], [gemini.SUMMARY_PATH, gemini.STATUS_PATH])
+        self.assertEqual(calls[0][2], {})  # never forceRefresh
+        self.assertEqual(calls[1][2], {"metadata": gemini.META})
+        for _, headers, _ in calls:
+            self.assertEqual(headers, {"Connect-Protocol-Version": "1", "X-Codeium-Csrf-Token": "demo-csrf-token"})
+        self.assertTrue(gemini.SUMMARY_PATH.startswith("/exa.language_server_pb.LanguageServerService/"))
+
+    def test_partial_and_exhausted_limits_assumed_shape(self):
+        """Assumed shape, not observed: a fraction below 1 and an explicit 0."""
+        rows, _, _ = self.read(self.summary_with(
+            {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0, "resetTime": "2031-05-26T13:00:00Z"},
+            {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.35}), gemini_status())
+        self.assertEqual([x["label"] for x in rows], ["Gemini 5-hour", "Gemini Weekly"])
+        self.assertAlmostEqual(rows[0]["percent"], 100.0)
+        self.assertAlmostEqual(rows[1]["percent"], 65.0)
+        rows, _, _ = self.read(self.summary_with({"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 1.7},
+                                                 {"bucketId": "gemini-weekly", "window": "weekly",
+                                                  "remainingFraction": -0.5}), gemini_status())
+        self.assertEqual([x["percent"] for x in rows], [0.0, 100.0])  # clamped
+
+    def test_limit_without_a_value_is_a_detail_line_not_zero_assumed_shape(self):
+        """Assumed shape, not observed: only remainingAmount, no remaining value at all, or disabled."""
+        rows, details, _ = self.read(self.summary_with(
+            {"bucketId": "gemini-5h", "window": "5h", "remainingAmount": "40"},
+            {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.5},
+            display="Gemini Models"), gemini_status())
+        self.assertEqual([x["label"] for x in rows], ["Gemini Weekly"])
+        self.assertEqual(details, ["Gemini 5-hour: no value reported", "Plan: Example Plan"])
+        summary = gemini_summary()
+        groups = summary["response"]["groups"]
+        del groups[1]["buckets"][0]["remainingFraction"]  # 3p-weekly: no value at all
+        groups[1]["buckets"][1]["disabled"] = True  # 3p-5h: off
+        groups[1]["buckets"][1]["remainingFraction"] = "0.5"  # text, not a number
+        rows, details, _ = self.read(summary, gemini_status())
+        self.assertEqual([x["label"] for x in rows], ["Gemini 5-hour", "Gemini Weekly"])
+        self.assertEqual(details, ["Claude GPT 5-hour: no value reported", "Claude GPT Weekly: no value reported",
+                                   "Plan: Example Plan"])
+        for bad in (True, None, float("nan"), float("inf"), [0.5], {"v": 1}):
+            rows, details, _ = self.read(self.summary_with(
+                {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": bad},
+                {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 1}), gemini_status())
+            self.assertEqual([x["label"] for x in rows], ["Gemini Weekly"], repr(bad))
+            self.assertIn("Gemini 5-hour: no value reported", details, repr(bad))
+
+    def test_unknown_prefix_and_window_get_safe_labels_assumed_shape(self):
+        """Assumed shape, not observed: group and window names the code does not know."""
+        cases = [
+            ({"bucketId": "img-daily", "window": "daily"}, "Image tools", "Image tools Daily"),
+            ({"bucketId": "img-daily", "window": "daily"}, "Image Models", "Image Daily"),
+            ({"bucketId": "x-5h", "window": "5h"}, "Ünïcode | bash=/bin/sh \"q\" (beta) $x",
+             "Unicode bash bin sh q b 5-hour"),
+            ({"bucketId": "gemini-monthly", "window": "monthly"}, "ignored", "Gemini Monthly"),
+            ({"bucketId": "3p-5h"}, "ignored", "Claude GPT 5-hour"),  # no window: the bucketId's last part
+            ({"bucketId": "odd", "window": "w" * 40}, "", "Odd " + "W" + "w" * 11),
+            ({"window": "5h"}, None, "Group 1 5-hour"),
+            ({"bucketId": "--", "window": "..."}, "-- . --", "Group 1 Limit"),
+            ({"bucketId": "z-5h", "window": "5h"}, "A" * 40, "A" * 23 + " 5-hour"),
+        ]
+        for bucket, display, label in cases:
+            group = {"buckets": [dict(bucket, remainingFraction=0.5)]}
+            if display is not None:
+                group["displayName"] = display
+            rows, _, _ = self.read({"response": {"groups": [group]}}, gemini_status())
+            self.assertEqual([x["label"] for x in rows], [label], (bucket, display))
+            self.assertTrue(render.CHOICE_LABEL.fullmatch(rows[0]["label"]), rows[0]["label"])
+            self.assertIsNotNone(render.choice_param("gemini", rows[0]["label"]))
+            self.assertLessEqual(len(rows[0]["label"]), 30)
+
+    def test_same_label_twice_is_numbered_assumed_shape(self):
+        """Assumed shape, not observed: two groups that would get the same label."""
+        summary = {"response": {"groups": [
+            {"displayName": "Extra", "buckets": [{"bucketId": "a-5h", "window": "5h", "remainingFraction": 1}]},
+            {"displayName": "Extra models", "buckets": [{"bucketId": "b-5h", "window": "5h",
+                                                          "remainingFraction": 0.5}]}]}}
+        rows, _, _ = self.read(summary, gemini_status())
+        self.assertEqual([x["label"] for x in rows], ["Extra 5-hour", "Extra 5-hour 2"])
+        self.assertEqual([x["group"] for x in rows], ["a", "b"])
+        self.assertTrue(all(render.CHOICE_LABEL.fullmatch(x["label"]) for x in rows))
+        many = {"response": {"groups": [{"displayName": "B" * 40, "buckets": [
+            {"bucketId": f"g{i}-5h", "window": "5h", "remainingFraction": 1}]} for i in range(12)]}}
+        rows, _, _ = self.read(many, gemini_status())
+        labels = [x["label"] for x in rows]
+        self.assertEqual(len(set(labels)), 12)  # numbered up to "... 12", still within 30 characters
+        self.assertTrue(all(render.CHOICE_LABEL.fullmatch(x) for x in labels), labels)
+
+    def test_machine_fields_only_take_short_lowercase_ids_assumed_shape(self):
+        """Assumed shape, not observed: ids that are not short lowercase tokens give no machine field."""
+        rows, _, _ = self.read(self.summary_with(
+            {"bucketId": "Gemini Pro-5H", "window": "5H", "remainingFraction": 1},
+            {"bucketId": "x" * 20 + "-weekly", "window": "weekly", "remainingFraction": 1}), gemini_status())
+        self.assertEqual([(x["label"], x["group"], x["window"]) for x in rows],
+                         [("Gemini Weekly", None, "weekly"), ("Gemini 5H", None, None)])  # known windows first
+        rows, _, _ = self.read(self.summary_with({"bucketId": "3p-5h", "remainingFraction": 1}), gemini_status())
+        self.assertEqual([(x["label"], x["group"], x["window"]) for x in rows], [("Claude GPT 5-hour", "3p", "5h")])
+
+    def test_long_group_labels_are_shown_whole(self):
+        r = render.normalize(self.summary_result())
+        lines = menu_lines(render.menu([("gemini", r), ("claude", res("CLAUDE", [row("5-hour", 12.0)]))], NOW))
+        bars = {}
+        for label in SUMMARY_LABELS + ["5-hour"]:
+            line = next(x for x in lines if x.startswith(label + " "))
+            bars[label] = min(i for i, c in enumerate(line) if c in "█░")
+        self.assertEqual(len(set(bars.values())), 1, bars)  # one bar column, after the longest label
+        self.assertEqual(bars["5-hour"], len("Claude GPT Weekly") + 2)
+        long_label = "Weekly " + "x" * 20  # longer than the column: cut, and the bar still lines up
+        lines = menu_lines(render.menu([("claude", res("CLAUDE", [row(long_label, 5.0), row("5-hour", 9.0)]))], NOW))
+        cut = next(x for x in lines if x.startswith("Weekly x"))
+        self.assertTrue(cut.startswith(long_label[:render.LABEL_MAX] + "  █") or
+                        cut.startswith(long_label[:render.LABEL_MAX] + "  ░"), cut)
+
+    def test_fallback_to_per_model_rows_assumed_shape(self):
+        """Assumed shapes, not observed: an empty, missing or odd summary, or one without any usable value. The
+        per-model rows from GetUserStatus come back exactly as before, with the plan line."""
+        with mock.patch.object(gemini, "localhost_json", lambda *a, **k: gemini_status()):
+            expected = gemini.model_rows(gemini_status()["userStatus"])
+        self.assertEqual([x["label"] for x in expected[0]], ["Demo Pro", "Example Model"])
+        no_value = self.summary_with({"bucketId": "gemini-5h", "window": "5h", "remainingAmount": "3"})
+        only_disabled = self.summary_with({"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 1,
+                                           "disabled": True})
+        for summary in ({}, {"response": {}}, {"response": {"groups": []}}, {"response": {"groups": "x"}},
+                        {"response": {"groups": [None, 5, "x"]}}, {"response": {"groups": [{"buckets": "x"}]}},
+                        {"response": {"groups": [{"buckets": [None, 1]}]}}, [], "text", None, no_value,
+                        only_disabled, {"response": []}, {"groups": gemini_summary()["response"]["groups"]}):
+            rows, details, _ = self.read({"unexpected": True} if summary is None else summary, gemini_status())
+            self.assertEqual((rows, details), expected, repr(summary)[:60])
+            self.assertIn("Plan: Example Plan", details)
+            self.assertEqual([(x["group"], x["window"]) for x in rows], [(None, None)] * 2)
+
+    def test_summary_failure_keeps_the_per_model_rows_assumed_shape(self):
+        """Assumed shape, not observed: what an older server or an account without a summary answers is unknown,
+        so any failure of the summary request falls back."""
+        expected = gemini.model_rows(gemini_status()["userStatus"])
+        for error in (common.NotConfigured("HTTP 404"), common.SessionExpired("HTTP 401"), RuntimeError("HTTP 500"),
+                      RuntimeError("request failed"), ValueError("x")):
+            rows, details, calls = self.read(error, gemini_status())
+            self.assertEqual((rows, details), expected, repr(error))
+            self.assertEqual(len(calls), 2)
+
+    def test_status_failure_costs_only_the_plan_line_assumed_shape(self):
+        """Assumed shape, not observed: the summary answers but GetUserStatus fails."""
+        for error in (RuntimeError("request failed"), common.SessionExpired("HTTP 401")):
+            rows, details, _ = self.read(gemini_summary(), error)
+            self.assertEqual([x["label"] for x in rows], SUMMARY_LABELS)
+            self.assertEqual(details, [])
+        rows, details, _ = self.read(gemini_summary(), {"userStatus": "odd"})
+        self.assertEqual(([x["label"] for x in rows], details), (SUMMARY_LABELS, []))
+
+    def test_both_requests_failing_falls_back_to_the_gemini_cli(self):
+        """Assumed shape, not observed: both local requests fail; read() then tries the Gemini CLI, as before."""
+        cli_rows = [row("demo-pro", percent=31.0)]
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("request failed")
+
+        with mock.patch.object(gemini, "hub", return_value=(1234, "demo-csrf-token")), \
+                mock.patch.object(gemini, "localhost_json", fail), \
+                mock.patch.object(gemini, "_gemini_cli", return_value=cli_rows):
+            r = gemini.read({})
+        self.assertEqual((r["rows"], r["details"]), (cli_rows, ["Source: Gemini CLI"]))
+
+    def test_read_returns_the_summary_rows(self):
+        def fake(port, path, headers, body, timeout=8):
+            return gemini_summary() if path == gemini.SUMMARY_PATH else gemini_status()
+
+        with mock.patch.object(gemini, "hub", return_value=(1234, "demo-csrf-token")), \
+                mock.patch.object(gemini, "localhost_json", fake):
+            r = gemini.read({})
+        self.assertEqual([x["label"] for x in r["rows"]], SUMMARY_LABELS)
+        self.assertEqual(r["details"], ["Plan: Example Plan", "Source: Antigravity"])
+
+    def summary_result(self):
+        rows, details, _ = self.read(gemini_summary(), gemini_status())
+        with mock.patch.object(time, "time", return_value=NOW):
+            return gemini.result("GEMINI", rows=rows, details=details + ["Source: Antigravity"])
+
+    def test_row_without_reset_time_renders_and_survives_the_cache(self):
+        r = render.normalize(self.summary_result())
+        text = render.menu([("gemini", r)], NOW)
+        lines = menu_lines(text)
+        line = next(x for x in lines if x.startswith("Claude GPT 5-hour"))
+        self.assertRegex(line, r"^Claude GPT 5-hour +░{10} +0% \|")
+        following = lines[lines.index(line) + 1]
+        self.assertTrue(following.startswith("Claude GPT Weekly"), following)  # no reset line in between
+        gemini_line = next(x for x in lines if x.startswith("Gemini 5-hour"))
+        self.assertIn("↻", lines[lines.index(gemini_line) + 1])  # the Gemini rows do have one
+        self.assertEqual(render.current_percent(r["rows"][2], NOW), 0.0)  # current, not stale
+        main = load_main()
+        with tempfile.TemporaryDirectory() as d:
+            main.cache_write(d, "gemini", r)
+            cached = main.cache_read(d, "gemini")
+        self.assertEqual(cached["rows"], r["rows"])
+        self.assertEqual([(x["group"], x["window"], x["resets"] is None) for x in cached["rows"]],
+                         [("gemini", "5h", False), ("gemini", "weekly", False), ("3p", "5h", True),
+                          ("3p", "weekly", True)])
+
+    def test_old_cache_entries_without_the_machine_fields_still_work(self):
+        old = {"title": "GEMINI", "status": "ok", "details": [], "note": None, "time": NOW - 60,
+               "rows": [{"label": "All models", "percent": 0.0, "value": None, "resets": NOW + 3600}]}
+        main = load_main()
+        with tempfile.TemporaryDirectory() as d:
+            common.write_private_json(d, "gemini.json", old)
+            cached = main.cache_read(d, "gemini")
+        self.assertEqual(cached["rows"], [{"label": "All models", "percent": 0.0, "value": None, "resets": NOW + 3600,
+                                           "window": None, "group": None}])
+        self.assertIn("All models", render.menu([("gemini", cached)], NOW))
+
+    def test_menu_bar_shows_lists_and_selects_the_four_rows(self):
+        r = render.normalize(self.summary_result())
+        launcher = "/Users/demo/ai-limits-bar/plugin/ai-limits.5m.sh"
+        state = [(n, True) for n in NAMES]
+        for limit in SUMMARY_LABELS:
+            text = render.menu([("gemini", r)], NOW, True, "/Users/demo/config.json", False, state, launcher, None,
+                               {"provider": "gemini", "limit": limit})
+            lines = menu_lines(text)
+            self.assertEqual(lines[0].split(" | ")[0], "0%")
+            self.assertTrue(swiftbar_params(lines[0])["tooltip"].startswith(f"Showing Gemini {limit} 0%"))
+            start = lines.index(render.CHOOSER_ITEM) + 1
+            entries = lines[start:start + 5]
+            self.assertEqual([x.split(" | ")[0] for x in entries],
+                             ["--Highest of all"] + [f"--Gemini · {x}" for x in SUMMARY_LABELS])
+            for entry, label in zip(entries[1:], SUMMARY_LABELS):
+                params = swiftbar_params(entry)
+                self.assertEqual(params["param2"], f"gemini:{label}")
+                self.assertEqual(params.get("checked") == "true", label == limit)
+            self.assertEqual(load_main().parse_choice(f"gemini:{limit}"), {"provider": "gemini", "limit": limit})
+
+    def test_old_pinned_gemini_line_is_not_available(self):
+        """Documented behaviour: a line pinned before (e.g. All models) no longer matches; no migration."""
+        r = render.normalize(self.summary_result())
+        text = render.menu([("gemini", r)], NOW, True, "/Users/demo/config.json", False, [(n, True) for n in NAMES],
+                           "/Users/demo/ai-limits-bar/plugin/ai-limits.5m.sh", None,
+                           {"provider": "gemini", "limit": "All models"})
+        self.assertEqual(menu_lines(text)[0].split(" | ")[0], "–")
+        self.assertIn("--Gemini · All models (not available) | checked=true", menu_lines(text))
+
+
+class WindowFields(unittest.TestCase):
+    """The machine-readable `window` and `group` of a row: set where the provider says which window a row is."""
+
+    def test_claude_rows(self):
+        limits = [{"kind": "session", "percent": 27}, {"kind": "weekly_all", "percent": 53},
+                  {"kind": "weekly_scoped", "percent": 68, "scope": {"model": {"display_name": "Opus"}}},
+                  {"kind": "new_kind", "percent": 5}]
+        self.assertEqual([(x["window"], x["group"]) for x in claude.rows_from_limits(limits)],
+                         [("5h", None), ("weekly", None), (None, None), (None, None)])
+        legacy = claude._legacy_rows({"five_hour": {"utilization": 3}, "seven_day": {"utilization": 4},
+                                      "seven_day_opus": {"utilization": 5}})
+        self.assertEqual([(x["label"], x["window"]) for x in legacy],
+                         [("5-hour", "5h"), ("Weekly", "weekly"), ("Weekly Opus", None)])
+
+    def test_codex_rows(self):
+        rows, _ = codex.parse({"rateLimits": {"primary": {"usedPercent": 23, "windowDurationMins": 300},
+                                              "secondary": {"usedPercent": 62, "windowDurationMins": 10080}}})
+        self.assertEqual([(x["window"], x["group"]) for x in rows], [("5h", None), ("weekly", None)])
+        self.assertEqual([codex.window_kind(m) for m in (300, 10080, 1440, None, 0)],
+                         ["5h", "weekly", None, None, None])
+
+    def test_normalize_keeps_only_short_lowercase_ids(self):
+        good = render.normalize({"rows": [{"label": "a", "percent": 1, "window": "5h", "group": "3p"}]})["rows"][0]
+        self.assertEqual((good["window"], good["group"]), ("5h", "3p"))
+        for bad in ("5H", "a b", "x" * 17, "-x", "../x", "", 5, True, None, ["5h"], "5h\n", "é"):
+            x = render.normalize({"rows": [{"label": "a", "window": bad, "group": bad}]})["rows"][0]
+            self.assertEqual((x["window"], x["group"]), (None, None), repr(bad))
+
+    def test_row_helper_defaults(self):
+        self.assertEqual(common.row("a", 1.0), {"label": "a", "percent": 1.0, "value": None, "resets": None,
+                                                "window": None, "group": None})
+
+
 class CodexChannel(unittest.TestCase):
     """The app-server reader and writer on plain pipes: codex is never started."""
 

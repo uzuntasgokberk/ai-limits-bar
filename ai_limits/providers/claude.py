@@ -19,6 +19,8 @@ URL = "https://api.anthropic.com/api/oauth/usage"
 KIND = {"session": "5-hour", "weekly_all": "Weekly"}
 LEGACY = {"five_hour": "5-hour", "seven_day": "Weekly", "seven_day_opus": "Weekly Opus",
           "seven_day_sonnet": "Weekly Sonnet", "seven_day_fable": "Weekly Fable"}
+# The row's machine-readable window (common.row): only the account's 5-hour and weekly limits, not model-specific ones.
+WINDOW = {"session": "5h", "weekly_all": "weekly", "five_hour": "5h", "seven_day": "weekly"}
 
 
 def _token():
@@ -58,7 +60,8 @@ def rows_from_limits(limits):
             label = f"Weekly {_model_name(limit) or 'model'}"
         else:
             label = str(kind or "Limit").replace("_", " ").capitalize()
-        rows.append(row(label, percent=float(limit["percent"]), resets=to_epoch(limit.get("resets_at"))))
+        rows.append(row(label, percent=float(limit["percent"]), resets=to_epoch(limit.get("resets_at")),
+                        window=WINDOW.get(kind) if isinstance(kind, str) else None))
     return rows
 
 
@@ -68,7 +71,8 @@ def _legacy_rows(d):
     for key, value in d.items():
         if isinstance(value, dict) and value.get("utilization") is not None:
             label = LEGACY.get(key) or key.replace("seven_day_", "Weekly ").replace("_", " ").capitalize()[:24]
-            rows.append(row(label, percent=float(value["utilization"]), resets=to_epoch(value.get("resets_at"))))
+            rows.append(row(label, percent=float(value["utilization"]), resets=to_epoch(value.get("resets_at")),
+                            window=WINDOW.get(key)))
     order = {"5-hour": 0, "Weekly": 1}
     rows.sort(key=lambda x: order.get(x["label"], 2))
     return rows

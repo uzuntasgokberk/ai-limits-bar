@@ -1,10 +1,15 @@
-"""Gemini: Antigravity (`agy` CLI or the Antigravity app) model quotas; Gemini CLI as a fallback.
+"""Gemini: Antigravity (`agy` CLI or the Antigravity app) usage limits; Gemini CLI as a fallback.
 
 Primary source: the running Antigravity language server. It writes its local port and a CSRF token to
-`~/.gemini/antigravity/daemon/hub_<port>.json` (mode 0600). This module only asks 127.0.0.1 for
-`GetUserStatus`; it never touches the Google account token, the server manages its own session. Each model's
-`quotaInfo` (remaining fraction, reset time) is read. Models sharing one pool are shown as one line.
-When Antigravity is not running (or its server does not answer), the Gemini CLI fallback is tried, then the
+`~/.gemini/antigravity/daemon/hub_<port>.json` (mode 0600). This module only asks 127.0.0.1, with two read
+requests; it never touches the Google account token, the server manages its own session (and fetches the
+numbers from Google itself):
+- `RetrieveUserQuotaSummary` (body `{}`, never `forceRefresh`): the quota groups of Antigravity's Usage screen,
+  e.g. Gemini models and Claude/GPT models, each with a 5-hour and a weekly window. Shown as one row per window.
+- `GetUserStatus`: the plan line; and, when the summary is missing, fails or has no usable value (an older
+  Antigravity, an account without it), each model's `quotaInfo` as before: models sharing one pool are one line.
+Each request has its own try, so a failed summary never costs the per-model rows.
+When Antigravity is not running (or neither request gives rows), the Gemini CLI fallback is tried, then the
 last values are shown with a note.
 
 Fallback: Gemini CLI (`~/.gemini/oauth_creds.json`, Code Assist quota endpoint), only while its saved token
@@ -12,10 +17,12 @@ is still valid. The token is never refreshed; an expired one is silently skipped
 """
 import glob
 import json
+import math
 import os
 import re
 import stat
 import time
+import unicodedata
 
 from ai_limits.common import (NotConfigured, SessionExpired, Unavailable, https_json, localhost_json, result, row,
                               to_epoch)
@@ -23,7 +30,15 @@ from ai_limits.common import (NotConfigured, SessionExpired, Unavailable, https_
 ANTIGRAVITY_DIR = os.path.expanduser("~/.gemini/antigravity")
 HUB = os.path.join(ANTIGRAVITY_DIR, "daemon", "hub_*.json")
 STATUS_PATH = "/exa.language_server_pb.LanguageServerService/GetUserStatus"
+SUMMARY_PATH = "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
+SUMMARY_TIMEOUT = 5  # seconds; with GetUserStatus's 8 this stays under the default 15-second provider timeout
 META = {"ideName": "antigravity", "extensionName": "antigravity", "locale": "en"}
+# Quota summary rows: label parts from stable ids, never from the server's display texts when the id is known.
+GROUPS = {"gemini": "Gemini", "3p": "Claude GPT"}  # bucketId prefix (observed: gemini-5h, 3p-weekly ...)
+WINDOWS = {"5h": "5-hour", "weekly": "Weekly"}  # bucket `window` (observed: "5h", "weekly")
+WINDOW_ORDER = {"5h": 0, "weekly": 1}  # per group: 5-hour first, like Claude and Codex
+LABEL_DROP = re.compile(r"[^A-Za-z0-9 ._-]+")  # what render.CHOICE_LABEL does not allow
+KIND = re.compile(r"[a-z0-9][a-z0-9_-]{0,15}")  # a row's `group` / `window` (render.KIND)
 CODE_ASSIST = "https://cloudcode-pa.googleapis.com/v1internal"
 CLI_CREDENTIALS = os.path.expanduser("~/.gemini/oauth_creds.json")
 CSRF = re.compile(r"[A-Za-z0-9_.:-]{8,200}")
@@ -68,10 +83,27 @@ def _short(label):
     return str(label or "model").replace(" (Thinking)", "").replace("Gemini ", "")[:22]
 
 
-def antigravity(port, csrf):
-    d = localhost_json(port, STATUS_PATH, {"Connect-Protocol-Version": "1", "X-Codeium-Csrf-Token": csrf},
-                       {"metadata": META})
-    status = d.get("userStatus") if isinstance(d.get("userStatus"), dict) else {}
+def _post(port, csrf, path, body, timeout=8):
+    return localhost_json(port, path, {"Connect-Protocol-Version": "1", "X-Codeium-Csrf-Token": csrf}, body,
+                          timeout=timeout)
+
+
+def _status(port, csrf):
+    """GetUserStatus -> its `userStatus` ({} if missing). Raises when the request fails."""
+    d = _post(port, csrf, STATUS_PATH, {"metadata": META})
+    return d.get("userStatus") if isinstance(d.get("userStatus"), dict) else {}
+
+
+def _plan(status):
+    tier = status.get("userTier") if isinstance(status.get("userTier"), dict) else {}
+    if tier.get("name") or tier.get("id"):
+        return [f"Plan: {str(tier.get('name') or tier.get('id'))[:40]}"]
+    return []
+
+
+def model_rows(status):
+    """GetUserStatus's per-model rows (the shape before the quota summary): each model's `quotaInfo`, models sharing
+    one pool (same fraction and reset time) as one line; plus the plan line."""
     models = (status.get("cascadeModelConfigData") or {}).get("clientModelConfigs") or []
     pools = {}
     for m in models if isinstance(models, list) else []:
@@ -91,9 +123,103 @@ def antigravity(port, csrf):
         rows.append(row(label, percent=max(0.0, min(100.0, (1 - left) * 100)), resets=to_epoch(resets)))
         if len(names) > 1:
             details.append(f"{label} share one quota: " + ", ".join(names))
-    tier = status.get("userTier") if isinstance(status.get("userTier"), dict) else {}
-    if tier.get("name") or tier.get("id"):
-        details.append(f"Plan: {str(tier.get('name') or tier.get('id'))[:40]}")
+    return rows, details + _plan(status)
+
+
+def _fraction(x):
+    """remainingFraction as a finite number, or None (missing, text, bool, NaN)."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x):
+        return None
+    return float(x)
+
+
+def _label_text(text, limit):
+    """Text reduced to what render.CHOICE_LABEL allows: accents folded (é -> e), other characters replaced by a
+    space, spaces collapsed, starting with a letter or digit, at most `limit` characters."""
+    folded = unicodedata.normalize("NFKD", str(text or "")).encode("ascii", "ignore").decode("ascii")
+    s = " ".join(LABEL_DROP.sub(" ", folded).split()).lstrip(" ._-")
+    return s[:limit].rstrip()
+
+
+def _window(bucket):
+    """The bucket's window ("5h", "weekly" ...): its `window`, else the last part of its bucketId."""
+    w = bucket.get("window")
+    if isinstance(w, str) and w:
+        return w
+    b = bucket.get("bucketId")
+    return b.rsplit("-", 1)[1] if isinstance(b, str) and "-" in b else ""
+
+
+def _group_key(bucket, window):
+    """bucketId without its window: "gemini-5h" -> "gemini", "3p-weekly" -> "3p"."""
+    b = bucket.get("bucketId") if isinstance(bucket.get("bucketId"), str) else ""
+    if window and b.endswith("-" + window):
+        return b[:-len(window) - 1]
+    return b.rsplit("-", 1)[0]
+
+
+def _summary_label(group, key, window, index):
+    """'Gemini 5-hour', 'Claude GPT Weekly'. Unknown ids: the group's own name without a trailing 'models' (else the
+    id, else 'Group N') and the window id as it is. Always passes render.CHOICE_LABEL (30 characters)."""
+    name = re.sub(r"(?i)\s*\bmodels?$", "", _label_text(group.get("displayName"), 60))
+    name = GROUPS.get(key) or name or _label_text(key, 20).capitalize() or f"Group {index + 1}"
+    when = WINDOWS.get(window) or _label_text(window, 12)
+    when = when[:1].upper() + when[1:] if when else "Limit"
+    return f"{name[:29 - len(when)].rstrip()} {when}"
+
+
+def _unique(label, used):
+    out, n = label, 2
+    while out in used:
+        out = f"{label[:28 - len(str(n))].rstrip()} {n}"
+        n += 1
+    used.add(out)
+    return out
+
+
+def summary_rows(d):
+    """RetrieveUserQuotaSummary -> (rows, details), or None when it is not that shape or has no usable value.
+    Shape (observed Nov 2026): {response: {groups: [{displayName, description, buckets: [{bucketId, displayName,
+    window, remainingFraction, resetTime?}]}], description}}; remainingFraction arrived as the int 1, resetTime was
+    missing on some buckets. A bucket without a numeric remainingFraction (e.g. only remainingAmount) or with
+    `disabled` gets a detail line instead of a row: it is never shown as 0% used."""
+    response = d.get("response") if isinstance(d, dict) else None
+    groups = response.get("groups") if isinstance(response, dict) else None
+    if not isinstance(groups, list):
+        return None
+    rows, details, used = [], [], set()
+    for i, group in enumerate(groups):
+        buckets = group.get("buckets") if isinstance(group, dict) else None
+        buckets = [b for b in buckets if isinstance(b, dict)] if isinstance(buckets, list) else []
+        windows = [_window(b) for b in buckets]
+        for window, bucket in sorted(zip(windows, buckets), key=lambda x: WINDOW_ORDER.get(x[0], 2)):
+            key = _group_key(bucket, window)
+            label = _summary_label(group, key, window, i)
+            fraction = _fraction(bucket.get("remainingFraction"))
+            if fraction is None or bucket.get("disabled") is True:
+                details.append(f"{label}: no value reported")
+                continue
+            rows.append(row(_unique(label, used), percent=max(0.0, min(100.0, (1 - fraction) * 100)),
+                            resets=to_epoch(bucket.get("resetTime")), window=window if KIND.fullmatch(window) else None,
+                            group=key if KIND.fullmatch(key) else None))
+    return (rows, details) if rows else None
+
+
+def antigravity(port, csrf):
+    """-> (rows, details). The quota summary's rows when it has any (GetUserStatus then adds only the plan line);
+    otherwise GetUserStatus's per-model rows, exactly as before. Raises only when GetUserStatus is needed for the
+    rows and fails, so read() can try the Gemini CLI."""
+    try:
+        summary = summary_rows(_post(port, csrf, SUMMARY_PATH, {}, timeout=SUMMARY_TIMEOUT))
+    except Exception:
+        summary = None  # older Antigravity, account without a summary, unreadable answer: per-model rows below
+    if summary is None:
+        return model_rows(_status(port, csrf))
+    rows, details = summary
+    try:
+        details = details + _plan(_status(port, csrf))
+    except Exception:
+        pass  # the plan line is optional; the summary's rows stay
     return rows, details
 
 

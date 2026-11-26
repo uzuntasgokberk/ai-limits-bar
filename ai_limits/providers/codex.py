@@ -37,6 +37,12 @@ def window_name(minutes):
     return f"{minutes / 60:.0f}-hour" if minutes < 2880 else f"{minutes / 1440:.0f}-day"
 
 
+def window_kind(minutes):
+    """The row's machine-readable window (common.row): "5h", "weekly", or None for any other length."""
+    name = window_name(minutes) if minutes else None
+    return {"5-hour": "5h", "Weekly": "weekly"}.get(name)
+
+
 def message(method, msg_id=None, params=None):
     """One JSON-RPC line: a request (with an id) from `REQUESTS` or a notification (no id) from
     `NOTIFICATIONS`. Anything else raises, before a single byte is written."""
@@ -138,7 +144,7 @@ def parse(r):
         w = rl.get(key)
         if isinstance(w, dict) and w.get("usedPercent") is not None:
             rows.append(row(window_name(w.get("windowDurationMins")), percent=float(w["usedPercent"]),
-                            resets=to_epoch(w.get("resetsAt"))))
+                            resets=to_epoch(w.get("resetsAt")), window=window_kind(w.get("windowDurationMins"))))
     if not rows:
         raise RuntimeError("expected fields missing")
     details = []
@@ -185,7 +191,7 @@ def _fallback():
             w = (rl or {}).get(key)
             if isinstance(w, dict) and w.get("used_percent") is not None:
                 rows.append(row(window_name(w.get("window_minutes")), percent=float(w["used_percent"]),
-                                resets=to_epoch(w.get("resets_at"))))
+                                resets=to_epoch(w.get("resets_at")), window=window_kind(w.get("window_minutes"))))
         if rows:
             r = result("CODEX (GPT)", rows=rows)
             r["time"] = os.path.getmtime(path)

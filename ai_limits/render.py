@@ -44,6 +44,9 @@ HIGHEST_ITEM = "Highest of all"
 # Row labels that may go into a click parameter: ASCII letters and digits first, then also space . _ - (no quote,
 # backslash, colon, pipe, `$`, parentheses, control or format characters), at most 30 characters (normalize's limit).
 CHOICE_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,29}")
+# A row's `window` / `group` (see common.row): never shown, only compared.
+KIND = re.compile(r"[a-z0-9][a-z0-9_-]{0,15}")
+LABEL_MAX = 18  # characters of a row label shown in the menu (e.g. "Claude GPT Weekly"); the column adds 2 spaces
 
 
 def header(key, href=None, suffix=""):
@@ -107,6 +110,11 @@ def _count(x, high=999):
     return x if isinstance(x, int) and not isinstance(x, bool) and 0 <= x <= high else None
 
 
+def _kind(x):
+    """A row's machine-readable `window` or `group`: a short lowercase id such as "5h", "weekly" or "3p"; else None."""
+    return x if isinstance(x, str) and KIND.fullmatch(x) else None
+
+
 def normalize(r):
     """Brings a provider result or a cached result into a safe shape; None if it is not a result at all.
     One broken value (NaN, a time given as text, a missing field) can therefore not break the whole menu.
@@ -117,7 +125,8 @@ def normalize(r):
     for x in r.get("rows") if isinstance(r.get("rows"), list) else []:
         if isinstance(x, dict):
             rows.append({"label": _text(x.get("label", ""), 30) or "", "percent": _number(x.get("percent"), 0, 1000),
-                         "value": _text(x.get("value"), 200), "resets": _epoch(x.get("resets"))})
+                         "value": _text(x.get("value"), 200), "resets": _epoch(x.get("resets")),
+                         "window": _kind(x.get("window")), "group": _kind(x.get("group"))})
     details = r.get("details") if isinstance(r.get("details"), list) else []
     debug = r.get("debug") if isinstance(r.get("debug"), list) else []
     return {"title": _text(r.get("title"), 30) or "?",
@@ -185,10 +194,10 @@ def _params(*parts):
 
 
 def label_width(results):
-    """Label column sized to the longest label in the menu (10..18 characters + 2 spaces), so long labels
-    such as 'Weekly Sonnet' never touch the bar and every row lines up in Menlo on any screen."""
-    lengths = [len(clean(x.get("label", ""), 16)) for _, r in results if r for x in r.get("rows", [])]
-    return max(10, min(18, max(lengths, default=8) + 2))
+    """Label column sized to the longest label in the menu (8..LABEL_MAX characters + 2 spaces), so long labels
+    such as 'Claude GPT Weekly' never touch the bar and every row lines up in Menlo on any screen."""
+    lengths = [len(clean(x.get("label", ""), LABEL_MAX)) for _, r in results if r for x in r.get("rows", [])]
+    return max(10, min(LABEL_MAX + 2, max(lengths, default=8) + 2))
 
 
 def unpriced_text(count, clickable=False):
@@ -207,7 +216,7 @@ def section(key, r, now, width=DEFAULT_WIDTH, prices_action=None):
         out.append(f"{clean(r['note'])}{_params('size=12', f'color={note_color}', href)}")
     pad = " " * width
     for x in r.get("rows", []):
-        label = clean(x["label"], 16).ljust(width)
+        label = clean(x["label"], LABEL_MAX).ljust(width)
         p = current_percent(x, now)
         if x.get("percent") is not None:
             body = f"{label}unknown" if p is None else f"{label}{bar(p)} {p:>3.0f}%"

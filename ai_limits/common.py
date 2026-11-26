@@ -199,9 +199,11 @@ def result(title, status="ok", rows=None, details=None, note=None):
             "note": note, "time": time.time()}
 
 
-def row(label, percent=None, value=None, resets=None):
-    """One menu line: a percentage bar and/or a value, and an optional reset time."""
-    return {"label": label, "percent": percent, "value": value, "resets": resets}
+def row(label, percent=None, value=None, resets=None, window=None, group=None):
+    """One menu line: a percentage bar and/or a value, and an optional reset time. `window` ("5h", "weekly") and
+    `group` (e.g. Gemini's "gemini" / "3p") say which limit the row is, for code that must not parse the label;
+    None where the provider doesn't say."""
+    return {"label": label, "percent": percent, "value": value, "resets": resets, "window": window, "group": group}
 
 
 def short_number(n):
