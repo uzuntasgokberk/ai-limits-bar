@@ -887,6 +887,65 @@ class Common(unittest.TestCase):
         with loopback_server(body=b" " * (common.MAX_BODY - 2) + b"{}") as fits:
             self.assertEqual(common.localhost_json(fits.server_port, "/x", {}, {}), {})
 
+    def assert_not_json(self, server):
+        """The server's answer is refused with the fixed message, an exact RuntimeError without a chained cause."""
+        with self.assertRaises(RuntimeError) as caught:
+            common.localhost_json(server.server_port, "/x", {}, {})
+        self.assertIs(type(caught.exception), RuntimeError)  # RecursionError is a RuntimeError too
+        self.assertEqual(str(caught.exception), "response is not JSON")
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertTrue(caught.exception.__suppress_context__)
+
+    def test_integer_over_the_digit_limit_is_not_json(self):
+        digits = "7" * (common.MAX_INT_DIGITS + 1)
+        bodies = {"bare": digits, "negative": "-" + digits,
+                  "nested": '{"response": {"groups": [{"name": "demo", "used": ' + digits + "}]}}",
+                  "in a list": "[1, 2.5, -" + digits + "]"}
+        with loopback_server() as server:
+            for what, text in bodies.items():
+                with self.subTest(what):
+                    server.reply = (200, {}, text.encode())
+                    self.assert_not_json(server)
+
+    def test_integer_at_the_digit_limit_is_read(self):
+        digits = "7" * common.MAX_INT_DIGITS
+        with loopback_server() as server:
+            for text in (digits, "-" + digits):  # the sign is not a digit
+                server.reply = (200, {}, text.encode())
+                value = common.localhost_json(server.server_port, "/x", {}, {})
+                self.assertIs(type(value), int)
+                self.assertTrue(value == int(text), text[:8])
+            server.reply = (200, {}, ('{"response": {"groups": [' + digits + "]}}").encode())
+            value = common.localhost_json(server.server_port, "/x", {}, {})["response"]["groups"][0]
+            self.assertTrue(type(value) is int and value == int(digits))
+
+    def test_ordinary_numbers_are_read_as_before(self):
+        fraction = "0." + "1" * 5000
+        whole = "1" * 5000 + ".0"  # over the digit limit, but a float: read as before (inf), never converted as an int
+        texts = ["0", "42", "-7", "1234567890123456789012", "0.25", "-12.5", "1e3", "-2.5E-3", "1E+2", fraction, whole]
+        expected = [0, 42, -7, 1234567890123456789012, 0.25, -12.5, 1000.0, -0.0025, 100.0, float(fraction),
+                    float(whole)]
+        with loopback_server(body=('{"values": [' + ", ".join(texts) + "]}").encode()) as server:
+            values = common.localhost_json(server.server_port, "/x", {}, {})["values"]
+        self.assertEqual([type(v) for v in values], [int] * 4 + [float] * 7)
+        self.assertEqual(values, expected)
+
+    def test_1_mb_integer_is_refused_quickly(self):
+        with loopback_server(body=b"9" * common.MAX_BODY) as server:  # took over 7 s to convert on Python 3.9
+            start = time.monotonic()
+            self.assert_not_json(server)
+            seconds = time.monotonic() - start
+        self.assertLess(seconds, 1.0)
+
+    def test_deep_nesting_is_read_or_is_not_json(self):
+        with loopback_server(body=b"[" * 100000 + b"]" * 100000) as server:
+            try:
+                value = common.localhost_json(server.server_port, "/x", {}, {})
+            except RuntimeError:
+                self.assert_not_json(server)  # too deep for this Python: the fixed error, never a RecursionError
+            else:
+                self.assertIs(type(value), list)  # (never printed or compared: that would recurse as deep)
+
     def test_to_epoch(self):
         import calendar
         expected = float(calendar.timegm((2031, 5, 17, 6, 41, 23)))

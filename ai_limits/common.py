@@ -28,6 +28,8 @@ HOME = _USER.pw_dir
 SEARCH_DIRS = ["/opt/homebrew/bin", "/usr/local/bin", os.path.join(HOME, ".local", "bin"), "/usr/bin", "/bin"]
 SECURITY = "/usr/bin/security"
 MAX_BODY = 1_000_000
+# The limit newer Pythons have built in; Python 3.9 has none and converts a 1 MB integer in seconds.
+MAX_INT_DIGITS = 4300
 
 
 def clean_env():
@@ -123,6 +125,13 @@ def local_opener():
 _LOCAL_OPENER = local_opener()
 
 
+def _bounded_int(text):
+    """`parse_int` for an answer: an integer literal of more than MAX_INT_DIGITS digits is not converted."""
+    if len(text) - text.startswith("-") > MAX_INT_DIGITS:
+        raise ValueError("integer too long")
+    return int(text)
+
+
 def _read_json(request, timeout, opener=_OPENER):
     try:
         with opener.open(request, timeout=timeout) as response:
@@ -142,8 +151,8 @@ def _read_json(request, timeout, opener=_OPENER):
     if len(body) > MAX_BODY:
         raise RuntimeError("response too large")
     try:
-        return json.loads(body)
-    except ValueError:
+        return json.loads(body, parse_int=_bounded_int)
+    except (ValueError, RecursionError):  # also nesting too deep for this Python
         raise RuntimeError("response is not JSON") from None
 
 
