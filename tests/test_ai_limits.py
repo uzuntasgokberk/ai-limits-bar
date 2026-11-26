@@ -1267,6 +1267,140 @@ class GeminiQuotaSummary(unittest.TestCase):
         rows, _, _ = self.read(self.summary_with({"bucketId": "3p-5h", "remainingFraction": 1}), gemini_status())
         self.assertEqual([(x["label"], x["group"], x["window"]) for x in rows], [("Claude GPT 5-hour", "3p", "5h")])
 
+    def assert_well_formed(self, rows, details):
+        """What any summary must give, however large the answer: few rows and lines, and unique labels the menu
+        accepts."""
+        self.assertLessEqual(len(rows) + len(details), gemini.MAX_GROUPS * gemini.MAX_BUCKETS)
+        labels = [x["label"] for x in rows]
+        self.assertEqual(len(set(labels)), len(labels), labels)
+        for x in rows:
+            self.assertTrue(render.CHOICE_LABEL.fullmatch(x["label"]), x["label"])
+            for field in ("window", "group"):
+                self.assertTrue(x[field] is None or render.KIND.fullmatch(x[field]), x[field])
+        for line in details:
+            self.assertLessEqual(len(line), 50)  # a label of at most 30 characters and ": no value reported"
+
+    def test_thousands_of_buckets_give_only_the_first_rows_assumed_shape(self):
+        """Assumed shape, not observed: one group with far more buckets than a real answer (which has two). Only its
+        first MAX_BUCKETS buckets are looked at; the cut comes before the sorting."""
+        same = {"bucketId": "x-5h", "window": "5h", "remainingFraction": 0.5}
+        weekly = {"bucketId": "x-weekly", "window": "weekly", "remainingFraction": 0.25}
+        numbered = ["Extra 5-hour"] + [f"Extra 5-hour {n}" for n in range(2, gemini.MAX_BUCKETS + 1)]
+        rows, details = gemini.summary_rows(self.summary_with(*[dict(same) for _ in range(4000)], display="Extra"))
+        self.assertEqual(([x["label"] for x in rows], details), (numbered, []))
+        self.assert_well_formed(rows, details)
+        buckets = [dict(weekly) for _ in range(gemini.MAX_BUCKETS)] + [dict(same) for _ in range(4000)]
+        rows, details = gemini.summary_rows(self.summary_with(*buckets, display="Extra"))
+        self.assertEqual([x["window"] for x in rows], ["weekly"] * gemini.MAX_BUCKETS)  # 5-hour ones: after the cut
+        self.assert_well_formed(rows, details)
+        buckets = [dict(same)] + [{"bucketId": "x-5h", "window": "5h"} for _ in range(4000)]  # no value: a line each
+        rows, details = gemini.summary_rows(self.summary_with(*buckets, display="Extra"))
+        self.assertEqual(([x["label"] for x in rows], details),
+                         (["Extra 5-hour"], ["Extra 5-hour: no value reported"] * (gemini.MAX_BUCKETS - 1)))
+        self.assert_well_formed(rows, details)
+        buckets = [None, 5, "x", []] * 1000 + [dict(weekly), dict(same)]  # only dictionaries count as buckets
+        rows, details = gemini.summary_rows(self.summary_with(*buckets, display="Extra"))
+        self.assertEqual(([x["label"] for x in rows], details), (["Extra 5-hour", "Extra Weekly"], []))
+        # The largest answer common.localhost_json lets through (about 1 MB of JSON). Numbering 16,000 equal labels
+        # one by one took about 20 seconds, longer than the provider's whole time limit.
+        summary = self.summary_with(*[dict(same) for _ in range(16000)], display="Extra")
+        start = time.monotonic()
+        rows, details = gemini.summary_rows(summary)
+        self.assertLess(time.monotonic() - start, 2.0)
+        self.assertEqual(([x["label"] for x in rows], details), (numbered, []))
+        with mock.patch.object(gemini, "hub", return_value=(1234, "demo-csrf-token")), \
+                mock.patch.object(gemini, "localhost_json", lambda port, path, *a, **k: summary
+                                  if path == gemini.SUMMARY_PATH else gemini_status()):
+            r = render.normalize(gemini.read({}))
+        self.assertEqual([x["label"] for x in r["rows"]], numbered[:8])
+        self.assertEqual(r["details"], ["Plan: Example Plan", "Source: Antigravity"])
+
+    def test_hundreds_of_groups_give_only_the_first_rows_assumed_shape(self):
+        """Assumed shape, not observed: far more groups than a real answer (which has two). Only the first MAX_GROUPS
+        items of the list are looked at, whatever they are."""
+        def group(i):
+            return {"displayName": f"Pool {i} models", "buckets": [
+                {"bucketId": f"p{i}-weekly", "window": "weekly", "remainingFraction": 1},
+                {"bucketId": f"p{i}-5h", "window": "5h", "remainingFraction": 0.5}]}
+
+        groups = [group(i) for i in range(500)]
+        rows, details = gemini.summary_rows({"response": {"groups": groups}})
+        self.assertEqual([(x["label"], x["group"], x["window"]) for x in rows],
+                         [(f"Pool {i} {name}", f"p{i}", window) for i in range(gemini.MAX_GROUPS)
+                          for name, window in (("5-hour", "5h"), ("Weekly", "weekly"))])
+        self.assertEqual(details, [])
+        self.assert_well_formed(rows, details)
+        odd = ([None, 5, "x", [], {}, {"buckets": "x"}] * gemini.MAX_GROUPS)[:gemini.MAX_GROUPS]  # these count too
+        self.assertIsNone(gemini.summary_rows({"response": {"groups": odd + groups}}))  # per-model rows instead
+        rows, details = gemini.summary_rows({"response": {"groups": odd[1:] + groups}})
+        self.assertEqual([x["label"] for x in rows], ["Pool 0 5-hour", "Pool 0 Weekly"])
+        # Many groups with many buckets that all get the same label: every kept row has its own number.
+        same = {"bucketId": "x-5h", "window": "5h", "remainingFraction": 0.5}
+        groups = [{"displayName": "Extra", "buckets": [dict(same) for _ in range(40)]} for _ in range(40)]
+        rows, details = gemini.summary_rows({"response": {"groups": groups}})
+        count = gemini.MAX_GROUPS * gemini.MAX_BUCKETS
+        self.assertEqual([x["label"] for x in rows],
+                         ["Extra 5-hour"] + [f"Extra 5-hour {n}" for n in range(2, count + 1)])
+        self.assert_well_formed(rows, details)
+
+    def test_huge_texts_are_cut_before_any_work_assumed_shape(self):
+        """Assumed shape, not observed: a name or id of hundreds of thousands of characters, or a list, dictionary
+        or number where a name belongs. Only the first TEXT_MAX characters of a text are looked at, and a value
+        that is not text is no name at all. `gemini.unicodedata` is replaced by a recording stand-in for each call."""
+        huge = 300_000
+
+        def folded(summary):
+            """summary_rows(summary) and the lengths of the texts it handed to unicodedata.normalize."""
+            stand_in = mock.Mock(wraps=unicodedata)
+            with mock.patch.object(gemini, "unicodedata", stand_in):
+                rows, details = gemini.summary_rows(summary)
+            return rows, details, [len(c.args[1]) for c in stand_in.normalize.call_args_list]
+
+        daily = {"bucketId": "img-daily", "window": "daily"}
+        cases = [
+            ({"bucketId": "z-5h", "window": "5h"}, "N" * huge, ("N" * 23 + " 5-hour", "z", "5h")),
+            ({"bucketId": "z-5h", "window": "5h"}, "é" * huge, ("e" * 23 + " 5-hour", "z", "5h")),
+            ({"bucketId": "b" * huge + "-5h", "window": "5h"}, "", ("B" + "b" * 19 + " 5-hour", None, "5h")),
+            # An id is cut like any text: the window at the end of an overlong bucketId is not seen.
+            ({"bucketId": "b" * huge + "-5h"}, "Extra", ("Extra Limit", None, None)),
+            ({"bucketId": "odd", "window": "w" * huge}, "", ("Odd W" + "w" * 11, "odd", None)),
+            ({"bucketId": "-" * huge, "window": "." * huge}, " " * huge, ("Group 1 Limit", None, None)),
+            (daily, ["Image tools"], ("Img Daily", "img", "daily")),
+            (daily, [["Image tools"] * 1000] * 300, ("Img Daily", "img", "daily")),
+            (daily, {"name": {"text": ["Image tools"] * huge}}, ("Img Daily", "img", "daily")),
+            (daily, 12345, ("Img Daily", "img", "daily")),
+        ]
+        for bucket, display, expected in cases:
+            summary = {"response": {"groups": [{"displayName": display,
+                                                "buckets": [dict(bucket, remainingFraction=0.5)]}]}}
+            rows, details, lengths = folded(summary)
+            self.assertEqual([(x["label"], x["group"], x["window"]) for x in rows], [expected], repr(display)[:40])
+            self.assert_well_formed(rows, details)
+            self.assertTrue(lengths)  # the stand-in was asked
+            self.assertLessEqual(max(lengths), gemini.TEXT_MAX, repr(display)[:40])
+        # Many buckets under one huge name: the work per bucket does not grow with the name.
+        buckets = [{"bucketId": f"z{i}-w{i}", "window": f"w{i}", "remainingFraction": 0.5} for i in range(200)]
+        rows, details, lengths = folded(self.summary_with(*buckets, display="N" * huge))
+        self.assertEqual([x["label"] for x in rows], ["N" * 27 + f" W{i}" for i in range(gemini.MAX_BUCKETS)])
+        self.assert_well_formed(rows, details)
+        self.assertLessEqual(sum(lengths), gemini.MAX_BUCKETS * 3 * gemini.TEXT_MAX)
+        self.assertIs(gemini.unicodedata, unicodedata)  # no stand-in is left behind
+
+    def test_huge_reset_time_is_cut_assumed_shape(self):
+        """Assumed shape, not observed: a resetTime that is a huge text, a list or a dictionary. to_epoch gets a
+        number as it is, the first TEXT_MAX characters of a text and nothing else."""
+        resets = ["2" * 300_000, [["2031-05-26T13:00:00Z"] * 1000] * 300, {"time": "2031-05-26T13:00:00Z"},
+                  1_900_000_000, "2031-05-26T13:00:00Z"]
+        seen = []
+        with mock.patch.object(gemini, "to_epoch", wraps=common.to_epoch) as to_epoch:
+            for reset in resets:
+                rows, _ = gemini.summary_rows(self.summary_with(
+                    {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.5, "resetTime": reset}))
+                seen.append(rows[0]["resets"])
+        self.assertEqual([c.args[0] for c in to_epoch.call_args_list],
+                         ["2" * gemini.TEXT_MAX, None, None, 1_900_000_000, "2031-05-26T13:00:00Z"])
+        self.assertEqual(seen, [None, None, None, 1_900_000_000.0, common.to_epoch("2031-05-26T13:00:00Z")])
+
     def test_long_group_labels_are_shown_whole(self):
         r = render.normalize(self.summary_result())
         lines = menu_lines(render.menu([("gemini", r), ("claude", res("CLAUDE", [row("5-hour", 12.0)]))], NOW))

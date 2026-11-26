@@ -16,6 +16,7 @@ Fallback: Gemini CLI (`~/.gemini/oauth_creds.json`, Code Assist quota endpoint),
 is still valid. The token is never refreshed; an expired one is silently skipped.
 """
 import glob
+import itertools
 import json
 import math
 import os
@@ -39,6 +40,10 @@ WINDOWS = {"5h": "5-hour", "weekly": "Weekly"}  # bucket `window` (observed: "5h
 WINDOW_ORDER = {"5h": 0, "weekly": 1}  # per group: 5-hour first, like Claude and Codex
 LABEL_DROP = re.compile(r"[^A-Za-z0-9 ._-]+")  # what render.CHOICE_LABEL does not allow
 KIND = re.compile(r"[a-z0-9][a-z0-9_-]{0,15}")  # a row's `group` / `window` (render.KIND)
+# A real answer has 2 groups with 2 buckets each, but it is external text of up to 1 MB: only this much is looked at.
+MAX_GROUPS = 12  # the first groups (render.normalize keeps 12 rows)
+MAX_BUCKETS = 8  # the first buckets of each group
+TEXT_MAX = 200  # the first characters of a displayName, bucketId, window or resetTime (labels take 30, KIND 16)
 CODE_ASSIST = "https://cloudcode-pa.googleapis.com/v1internal"
 CLI_CREDENTIALS = os.path.expanduser("~/.gemini/oauth_creds.json")
 CSRF = re.compile(r"[A-Za-z0-9_.:-]{8,200}")
@@ -133,26 +138,34 @@ def _fraction(x):
     return float(x)
 
 
+def _cut(x):
+    """The first TEXT_MAX characters of a text from the server; "" for anything else (a number, a list ...), so a
+    huge value is never turned into text or read to its end."""
+    return x[:TEXT_MAX] if isinstance(x, str) else ""
+
+
 def _label_text(text, limit):
     """Text reduced to what render.CHOICE_LABEL allows: accents folded (é -> e), other characters replaced by a
-    space, spaces collapsed, starting with a letter or digit, at most `limit` characters."""
-    folded = unicodedata.normalize("NFKD", str(text or "")).encode("ascii", "ignore").decode("ascii")
+    space, spaces collapsed, starting with a letter or digit, at most `limit` characters. Only the first TEXT_MAX
+    characters are looked at; a value that is not text gives ""."""
+    folded = unicodedata.normalize("NFKD", _cut(text)).encode("ascii", "ignore").decode("ascii")
     s = " ".join(LABEL_DROP.sub(" ", folded).split()).lstrip(" ._-")
     return s[:limit].rstrip()
 
 
 def _window(bucket):
-    """The bucket's window ("5h", "weekly" ...): its `window`, else the last part of its bucketId."""
-    w = bucket.get("window")
-    if isinstance(w, str) and w:
+    """The bucket's window ("5h", "weekly" ...): its `window`, else the last part of its bucketId. Both are cut to
+    TEXT_MAX characters first."""
+    w = _cut(bucket.get("window"))
+    if w:
         return w
-    b = bucket.get("bucketId")
-    return b.rsplit("-", 1)[1] if isinstance(b, str) and "-" in b else ""
+    b = _cut(bucket.get("bucketId"))
+    return b.rsplit("-", 1)[1] if "-" in b else ""
 
 
 def _group_key(bucket, window):
     """bucketId without its window: "gemini-5h" -> "gemini", "3p-weekly" -> "3p"."""
-    b = bucket.get("bucketId") if isinstance(bucket.get("bucketId"), str) else ""
+    b = _cut(bucket.get("bucketId"))
     if window and b.endswith("-" + window):
         return b[:-len(window) - 1]
     return b.rsplit("-", 1)[0]
@@ -177,21 +190,29 @@ def _unique(label, used):
     return out
 
 
+def _reset(x):
+    """A bucket's resetTime as to_epoch gets it: a number as it is, the first characters of a text, else None."""
+    return x if isinstance(x, (int, float)) else _cut(x) or None
+
+
 def summary_rows(d):
     """RetrieveUserQuotaSummary -> (rows, details), or None when it is not that shape or has no usable value.
     Shape (observed Nov 2026): {response: {groups: [{displayName, description, buckets: [{bucketId, displayName,
     description, window, remainingFraction, resetTime?}]}], description}}. A window that has not started yet (no
     usage in it) came as the int 1 without resetTime; once used, as a float below 1 (e.g. 0.9894) with resetTime.
     An exhausted window (0) was not observed. A bucket without a numeric remainingFraction (e.g. only
-    remainingAmount) or with `disabled` gets a detail line instead of a row: it is never shown as 0% used."""
+    remainingAmount) or with `disabled` gets a detail line instead of a row: it is never shown as 0% used.
+    Only the first MAX_GROUPS items of `groups`, the first MAX_BUCKETS buckets of each and the first TEXT_MAX
+    characters of each text are looked at; the rest of the answer is ignored."""
     response = d.get("response") if isinstance(d, dict) else None
     groups = response.get("groups") if isinstance(response, dict) else None
     if not isinstance(groups, list):
         return None
     rows, details, used = [], [], set()
-    for i, group in enumerate(groups):
+    for i, group in enumerate(groups[:MAX_GROUPS]):
         buckets = group.get("buckets") if isinstance(group, dict) else None
-        buckets = [b for b in buckets if isinstance(b, dict)] if isinstance(buckets, list) else []
+        buckets = (b for b in buckets if isinstance(b, dict)) if isinstance(buckets, list) else ()
+        buckets = list(itertools.islice(buckets, MAX_BUCKETS))  # cut before sorting
         windows = [_window(b) for b in buckets]
         for window, bucket in sorted(zip(windows, buckets), key=lambda x: WINDOW_ORDER.get(x[0], 2)):
             key = _group_key(bucket, window)
@@ -201,7 +222,8 @@ def summary_rows(d):
                 details.append(f"{label}: no value reported")
                 continue
             rows.append(row(_unique(label, used), percent=max(0.0, min(100.0, (1 - fraction) * 100)),
-                            resets=to_epoch(bucket.get("resetTime")), window=window if KIND.fullmatch(window) else None,
+                            resets=to_epoch(_reset(bucket.get("resetTime"))),
+                            window=window if KIND.fullmatch(window) else None,
                             group=key if KIND.fullmatch(key) else None))
     return (rows, details) if rows else None
 
