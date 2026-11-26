@@ -61,18 +61,19 @@ _B64 = re.compile(r"[A-Za-z0-9+/]+={0,2}")
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _PNG_END = b"\x00\x00\x00\x00IEND\xaeB`\x82"
 
-# Geometry (from the design: centreline radius 36, stroke 3 = radius / 12, arcs of 164 degrees with a 16-degree gap
-# at the top and the bottom, butt ends, logo 1.556 x radius high), scaled so the ring's outer diameter (DIAMETER, 20
-# points in the 22-point image) equals the drawn height of the gauge symbol; the stroke is the design's radius / 12
-# but at least 1 point, so the track stays visible on a non-Retina screen. A single-limit ring is one arc of 344
-# degrees with its 16-degree gap at the top, running clockwise from the gap.
+# Geometry: the design's arcs of 164 degrees with a 16-degree gap at the top and the bottom and butt ends; sized for
+# the optical weight of the gauge next to them (a thin ring with a mark inside reads smaller than a solid glyph of the
+# same diameter): the gauge's visible circle is GAUGE_D (20 points), a ring fills the image height (RING_D, 22) with
+# a 1.5-point stroke, and its mark is as large as the ring allows with MARK_GAP (1.25 points) clear of the arc (the
+# longer side of the mark; a wide mark keeps its aspect). A single-limit ring is one arc of 344 degrees with its
+# 16-degree gap at the top, running clockwise from the gap.
 # Numbers instead of AppKit constant names: the JavaScript bridge does not export all of them.
 SCRIPT = r"""
 ObjC.import('AppKit');
 
-var H = 22, SCALE = 2, DIAMETER = 20, SPAN = 164, HALF_GAP = 8;
-var STROKE = Math.max(DIAMETER / 25, 1);  // outer diameter = 2r + r/12 = 25r/12, so the design's stroke is D / 25
-var R = (DIAMETER - STROKE) / 2, LOGO_H = 1.556 * R, RING = DIAMETER, RING_SPACE = 6, GAUGE_SPACE = 8, PAD = 1;
+var H = 22, SCALE = 2, GAUGE_D = 20, RING_D = 22, SPAN = 164, HALF_GAP = 8, STROKE = 1.5, MARK_GAP = 1.25;
+var R = (RING_D - STROKE) / 2, MARK = 2 * (R - STROKE / 2 - MARK_GAP);  // 16.5: the mark's longer side
+var RING = RING_D, RING_SPACE = 6, GAUGE_SPACE = 8, PAD = 1;
 var GAUGE_INK = 16.75 / 20;  // the gauge symbol's visible circle in its image (13 pt, large scale: 16.75 of 20)
 var VARIANTS = [{fg: [0.12, 0.12, 0.12], track: 0.28}, {fg: [0.949, 0.949, 0.949], track: 0.3}];  // light, dark bar
 var LEVEL = {o: [0.910, 0.639, 0.239], r: [0.898, 0.282, 0.302]};  // render.ORANGE, render.RED
@@ -122,21 +123,21 @@ function drawRing(x, ring, variant) {
   var alpha = (right || left) ? 1 : 0.4;  // no current value: track only, the middle dimmed
   var logo = loadLogo(variant.dark ? ring.logoDark : ring.logoLight);
   if (logo) {
-    var w = LOGO_H * logo.size.width / logo.size.height, h = LOGO_H;
-    if (w > LOGO_H * 1.15) { w = LOGO_H * 1.15; h = w * logo.size.height / logo.size.width; }
+    var aspect = logo.size.width / logo.size.height;
+    var w = aspect >= 1 ? MARK : MARK * aspect, h = aspect >= 1 ? MARK / aspect : MARK;
     logo.drawInRectFromRectOperationFraction($.NSMakeRect(cx - w / 2, cy - h / 2, w, h), $.NSMakeRect(0, 0, 0, 0),
                                              2, alpha);  // source over
   } else {
-    var font = $.NSFont.boldSystemFontOfSize(R * 0.95);
+    var font = $.NSFont.boldSystemFontOfSize(MARK * 0.6);
     var attrs = $.NSDictionary.dictionaryWithObjectsForKeys($([font, rgb(fg, alpha)]), $(['NSFont', 'NSColor']));
     var text = $(ring.initials), size = text.sizeWithAttributes(attrs);
     text.drawAtPointWithAttributes($.NSMakePoint(cx - size.width / 2, cy - size.height / 2), attrs);
   }
 }
 
-function gaugeRect(symbol, x) {  // the symbol drawn so that its visible circle is DIAMETER high, centred
-  var side = DIAMETER / GAUGE_INK, w = side * symbol.size.width / symbol.size.height;
-  return $.NSMakeRect(x - (w - DIAMETER) / 2, (H - side) / 2, w, side);
+function gaugeRect(symbol, x) {  // the symbol drawn so that its visible circle is GAUGE_D high, centred
+  var side = GAUGE_D / GAUGE_INK, w = side * symbol.size.width / symbol.size.height;
+  return $.NSMakeRect(x - (w - GAUGE_D) / 2, (H - side) / 2, w, side);
 }
 
 function gaugeSymbol(name, color) {
@@ -164,7 +165,7 @@ function drawStrip(W, gauge, rings, variant) {
     var symbol = gaugeSymbol(gauge.symbol, rgb(variant.fg, 1));
     if (symbol) {
       symbol.drawInRect(gaugeRect(symbol, x));
-      x += DIAMETER + 3;
+      x += GAUGE_D + 3;
     }
     var color = gauge.level === 'n' ? rgb(variant.fg, 1) : rgb(LEVEL[gauge.level], 1);
     var attrs = $.NSDictionary.dictionaryWithObjectsForKeys($([$.NSFont.menuBarFontOfSize(0), color]),
@@ -193,7 +194,7 @@ function run(argv) {
   if (gauge.shown) {
     var symbol = gaugeSymbol(gauge.symbol, $.NSColor.blackColor);
     var attrs = $.NSDictionary.dictionaryWithObjectsForKeys($([$.NSFont.menuBarFontOfSize(0)]), $(['NSFont']));
-    W += (symbol ? DIAMETER + 3 : 0) + $(gauge.text).sizeWithAttributes(attrs).width
+    W += (symbol ? GAUGE_D + 3 : 0) + $(gauge.text).sizeWithAttributes(attrs).width
          + (rings.length ? GAUGE_SPACE : 0);
   }
   W = Math.ceil(W);
