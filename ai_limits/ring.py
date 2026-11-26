@@ -1,5 +1,6 @@
 """The menu bar strip: the gauge and its percentage, then one ring per provider (right arc: 5-hour usage, left arc:
-weekly usage), drawn as one PNG image per menu bar appearance and passed to SwiftBar as `image=<light>,<dark>`.
+weekly usage; one continuous arc for a provider with a single limit), drawn as one PNG image per menu bar appearance
+and passed to SwiftBar as `image=<light>,<dark>`.
 
 Drawing: a fixed JavaScript-for-Automation script (`SCRIPT`) run by /usr/bin/osascript without a shell and with
 the fixed environment, like the panels in panel.py. Nothing is ever put into the script text: every value is an
@@ -8,10 +9,12 @@ lines of base64, each a PNG of the expected height within the size caps (`parse`
 the timeout means no strip, and the menu bar shows the gauge and percentage as text instead (render.menu).
 The images are cached in the cache folder by their input values: a run with the same values starts no process.
 
-Logos: the repository ships no company marks. A ring shows the provider's initials, or the user's own logo file
-from LOGO_DIR, named after the provider (`claude.svg`, `codex-dark.png` ...): a regular file owned by the user that
-others can't write, at most LOGO_MAX_BYTES. The names are fixed here, never taken from provider data or config;
-anything else is ignored and the initials are drawn.
+Logos: the middle of a ring is a mark from two folders, by fixed file names (never from provider data or config):
+the user's own files in LOGO_DIR (`claude.svg`, `codex-light.png` ...) win over the project's own drawings shipped in
+SHIPPED_DIR (`claude.pdf`, `codex-light.pdf` ...). For each menu bar variant (light, dark) the names tried are
+`<provider>-<variant>.*`, then `<provider>.*`. A file must be a regular file (not a link) in a folder that is not a link,
+owned by the user (a shipped one also by root), not writable by group or others, of 1 byte to LOGO_MAX_BYTES; anything
+else is skipped. The provider's initials are the last fallback.
 """
 import base64
 import binascii
@@ -31,10 +34,16 @@ TIMEOUT = 5  # seconds; a drawing takes about 0.15 s
 CACHE_FILE = "menu-bar-image.json"
 LOGO_DIR = os.path.join(HOME, "Library", "Application Support", "ai-limits-bar", "logos")
 LOGO_TYPES = ("svg", "pdf", "png")
+# The project's own drawings of the marks, as vector PDFs (NSImage reads PDF on every macOS; their SVG sources and the
+# converter are in logos/source/). Drawn for a dark menu bar; `-light` files are the light-bar versions of marks that
+# would vanish there (white or light grey).
+SHIPPED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logos")
+SHIPPED_TYPES = ("pdf",)
+VARIANTS = ("light", "dark")
 LOGO_MAX_BYTES = 512 * 1024
-# Shown in the middle of a ring without a logo file: fixed, never from provider data.
+# Shown in the middle of a ring without a usable logo file: fixed, never from provider data.
 INITIALS = {"claude": "Cl", "codex": "Cx", "gemini": "Ge", "copilot": "Cp"}
-SINGLE_LIMIT = {"copilot"}  # one limit: its value fills both arcs
+SINGLE_LIMIT = {"copilot"}  # one limit: one continuous arc
 # Providers whose ring follows one of several quota groups: the choices (first = default) and their fixed labels.
 GROUPS = {"gemini": ("gemini", "3p")}
 GROUP_LABELS = {"gemini": {"gemini": "Gemini models", "3p": "Claude and GPT models"}}
@@ -53,14 +62,18 @@ _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _PNG_END = b"\x00\x00\x00\x00IEND\xaeB`\x82"
 
 # Geometry (from the design: centreline radius 36, stroke 3 = radius / 12, arcs of 164 degrees with a 16-degree gap
-# at the top and the bottom, butt ends, logo 1.556 x radius high), scaled to an 18-point ring in a 22-point menu
-# bar; the stroke is kept at 1 point at least so the track stays visible on a non-Retina screen.
+# at the top and the bottom, butt ends, logo 1.556 x radius high), scaled so the ring's outer diameter (DIAMETER, 20
+# points in the 22-point image) equals the drawn height of the gauge symbol; the stroke is the design's radius / 12
+# but at least 1 point, so the track stays visible on a non-Retina screen. A single-limit ring is one arc of 344
+# degrees with its 16-degree gap at the top, running clockwise from the gap.
 # Numbers instead of AppKit constant names: the JavaScript bridge does not export all of them.
 SCRIPT = r"""
 ObjC.import('AppKit');
 
-var H = 22, SCALE = 2, R = 8.5, STROKE = Math.max(8.5 / 12, 1), SPAN = 164, HALF_GAP = 8;
-var LOGO_H = 1.556 * R, RING = 2 * R + STROKE, RING_SPACE = 5, GAUGE_SPACE = 7, PAD = 1;
+var H = 22, SCALE = 2, DIAMETER = 20, SPAN = 164, HALF_GAP = 8;
+var STROKE = Math.max(DIAMETER / 25, 1);  // outer diameter = 2r + r/12 = 25r/12, so the design's stroke is D / 25
+var R = (DIAMETER - STROKE) / 2, LOGO_H = 1.556 * R, RING = DIAMETER, RING_SPACE = 6, GAUGE_SPACE = 8, PAD = 1;
+var GAUGE_INK = 16.75 / 20;  // the gauge symbol's visible circle in its image (13 pt, large scale: 16.75 of 20)
 var VARIANTS = [{fg: [0.12, 0.12, 0.12], track: 0.28}, {fg: [0.949, 0.949, 0.949], track: 0.3}];  // light, dark bar
 var LEVEL = {o: [0.910, 0.639, 0.239], r: [0.898, 0.282, 0.302]};  // render.ORANGE, render.RED
 
@@ -75,10 +88,10 @@ function arc(cx, cy, start, end, clockwise, color) {
   p.stroke;
 }
 
-function used(value, level, fg) {  // -> [degrees, colour] or null
+function used(value, level, fg, span) {  // -> [degrees, colour] or null
   if (value === '') return null;
   var v = Math.max(0, Math.min(100, Number(value)));
-  return [SPAN * v / 100, level === 'n' ? rgb(fg, 1) : rgb(LEVEL[level], 1)];
+  return [span * v / 100, level === 'n' ? rgb(fg, 1) : rgb(LEVEL[level], 1)];
 }
 
 function loadLogo(path) {
@@ -92,12 +105,20 @@ function loadLogo(path) {
 
 function drawRing(x, ring, variant) {
   var cx = x + RING / 2, cy = H / 2, fg = variant.fg;
-  var track = rgb(fg, variant.track);
-  arc(cx, cy, -90 + HALF_GAP, 90 - HALF_GAP, false, track);   // right: 5-hour, from the bottom up
-  arc(cx, cy, 270 - HALF_GAP, 90 + HALF_GAP, true, track);    // left: weekly, from the bottom up
-  var right = used(ring.right, ring.rightLevel, fg), left = used(ring.left, ring.leftLevel, fg);
-  if (right && right[0] > 0) arc(cx, cy, -90 + HALF_GAP, -90 + HALF_GAP + right[0], false, right[1]);
-  if (left && left[0] > 0) arc(cx, cy, 270 - HALF_GAP, 270 - HALF_GAP - left[0], true, left[1]);
+  var track = rgb(fg, variant.track), right, left = null;
+  if (ring.shape === '1') {  // one limit: one arc, clockwise from the gap at the top
+    var span = 360 - 2 * HALF_GAP;
+    arc(cx, cy, 90 - HALF_GAP, 90 + HALF_GAP - 360, true, track);
+    right = used(ring.right, ring.rightLevel, fg, span);
+    if (right && right[0] > 0) arc(cx, cy, 90 - HALF_GAP, 90 - HALF_GAP - right[0], true, right[1]);
+  } else {
+    arc(cx, cy, -90 + HALF_GAP, 90 - HALF_GAP, false, track);   // right: 5-hour, from the bottom up
+    arc(cx, cy, 270 - HALF_GAP, 90 + HALF_GAP, true, track);    // left: weekly, from the bottom up
+    right = used(ring.right, ring.rightLevel, fg, SPAN);
+    left = used(ring.left, ring.leftLevel, fg, SPAN);
+    if (right && right[0] > 0) arc(cx, cy, -90 + HALF_GAP, -90 + HALF_GAP + right[0], false, right[1]);
+    if (left && left[0] > 0) arc(cx, cy, 270 - HALF_GAP, 270 - HALF_GAP - left[0], true, left[1]);
+  }
   var alpha = (right || left) ? 1 : 0.4;  // no current value: track only, the middle dimmed
   var logo = loadLogo(variant.dark ? ring.logoDark : ring.logoLight);
   if (logo) {
@@ -111,6 +132,11 @@ function drawRing(x, ring, variant) {
     var text = $(ring.initials), size = text.sizeWithAttributes(attrs);
     text.drawAtPointWithAttributes($.NSMakePoint(cx - size.width / 2, cy - size.height / 2), attrs);
   }
+}
+
+function gaugeRect(symbol, x) {  // the symbol drawn so that its visible circle is DIAMETER high, centred
+  var side = DIAMETER / GAUGE_INK, w = side * symbol.size.width / symbol.size.height;
+  return $.NSMakeRect(x - (w - DIAMETER) / 2, (H - side) / 2, w, side);
 }
 
 function gaugeSymbol(name, color) {
@@ -137,9 +163,8 @@ function drawStrip(W, gauge, rings, variant) {
   if (gauge.shown) {
     var symbol = gaugeSymbol(gauge.symbol, rgb(variant.fg, 1));
     if (symbol) {
-      var s = symbol.size;
-      symbol.drawInRect($.NSMakeRect(x, (H - s.height) / 2, s.width, s.height));
-      x += s.width + 3;
+      symbol.drawInRect(gaugeRect(symbol, x));
+      x += DIAMETER + 3;
     }
     var color = gauge.level === 'n' ? rgb(variant.fg, 1) : rgb(LEVEL[gauge.level], 1);
     var attrs = $.NSDictionary.dictionaryWithObjectsForKeys($([$.NSFont.menuBarFontOfSize(0), color]),
@@ -158,17 +183,17 @@ function run(argv) {
   if (argv.length < 6 || argv[0] !== 'strip') return '';
   var gauge = {shown: argv[1] === '1', symbol: argv[2], text: argv[3], level: argv[4]};
   var count = Number(argv[5]);
-  if (argv.length !== 6 + 7 * count) return '';
+  if (argv.length !== 6 + 8 * count) return '';
   var rings = [];
-  for (var i = 6; i < argv.length; i += 7) {
-    rings.push({initials: argv[i], logoLight: argv[i + 1], logoDark: argv[i + 2], right: argv[i + 3],
-                rightLevel: argv[i + 4], left: argv[i + 5], leftLevel: argv[i + 6]});
+  for (var i = 6; i < argv.length; i += 8) {
+    rings.push({shape: argv[i], initials: argv[i + 1], logoLight: argv[i + 2], logoDark: argv[i + 3],
+                right: argv[i + 4], rightLevel: argv[i + 5], left: argv[i + 6], leftLevel: argv[i + 7]});
   }
   var W = PAD * 2 + rings.length * RING + Math.max(0, rings.length - 1) * RING_SPACE;
   if (gauge.shown) {
     var symbol = gaugeSymbol(gauge.symbol, $.NSColor.blackColor);
     var attrs = $.NSDictionary.dictionaryWithObjectsForKeys($([$.NSFont.menuBarFontOfSize(0)]), $(['NSFont']));
-    W += (symbol ? symbol.size.width + 3 : 0) + $(gauge.text).sizeWithAttributes(attrs).width
+    W += (symbol ? DIAMETER + 3 : 0) + $(gauge.text).sizeWithAttributes(attrs).width
          + (rings.length ? GAUGE_SPACE : 0);
   }
   W = Math.ceil(W);
@@ -210,36 +235,44 @@ def specs(results, chosen, now):
     return out[:MAX_RINGS]
 
 
-def _logo(name):
-    """(path, mtime_ns, size) of LOGO_DIR/<name>.<svg|pdf|png> (the first that exists), or None: the folder and the
-    file must not be symlinks, must be owned by this user and not writable by group or others, and the file must be
-    a regular file of 1 byte to LOGO_MAX_BYTES. A file that exists but fails a check means no logo (no next type)."""
+def _private(st, owners):
+    return st.st_uid in owners and not st.st_mode & 0o022
+
+
+def _logo(folder, name, types, owners):
+    """(path, mtime_ns, size) of folder/<name>.<type> (the first type that exists and passes), or None: the folder
+    and the file must not be symlinks, must be owned by one of `owners` and not writable by group or others, and the
+    file must be a regular file of 1 byte to LOGO_MAX_BYTES."""
     try:
-        folder = os.lstat(LOGO_DIR)
-        if not stat.S_ISDIR(folder.st_mode) or folder.st_uid != os.getuid() or folder.st_mode & 0o022:
-            return None
+        st = os.lstat(folder)
     except OSError:
         return None
-    for ext in LOGO_TYPES:
-        path = os.path.join(LOGO_DIR, f"{name}.{ext}")
+    if not stat.S_ISDIR(st.st_mode) or not _private(st, owners):
+        return None
+    for ext in types:
+        path = os.path.join(folder, f"{name}.{ext}")
         try:
             st = os.lstat(path)
         except OSError:
             continue
-        if (stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o022
-                and 0 < st.st_size <= LOGO_MAX_BYTES):
+        if stat.S_ISREG(st.st_mode) and _private(st, owners) and 0 < st.st_size <= LOGO_MAX_BYTES:
             return path, st.st_mtime_ns, st.st_size
-        return None
     return None
 
 
 def logos(provider):
-    """(light, dark) logo files of a provider, each (path, mtime_ns, size) or None. The dark menu bar uses
-    `<provider>-dark.*` if there is one, else the same file as the light one."""
+    """(light, dark): the logo file for each menu bar variant, (path, mtime_ns, size) or None (initials). Tried in
+    order: the user's `<provider>-<variant>.*` and `<provider>.*`, then the shipped ones."""
     if provider not in INITIALS:
         return None, None
-    light = _logo(provider)
-    return light, _logo(f"{provider}-dark") or light
+    user, shipped = {os.getuid()}, {os.getuid(), 0}
+    out = []
+    for variant in VARIANTS:
+        out.append(_logo(LOGO_DIR, f"{provider}-{variant}", LOGO_TYPES, user)
+                   or _logo(LOGO_DIR, provider, LOGO_TYPES, user)
+                   or _logo(SHIPPED_DIR, f"{provider}-{variant}", SHIPPED_TYPES, shipped)
+                   or _logo(SHIPPED_DIR, provider, SHIPPED_TYPES, shipped))
+    return out[0], out[1]
 
 
 def _value(percent):
@@ -259,13 +292,13 @@ def inputs(gauge, rings):
     out = {"gauge": [bool(shown), render.icon(percent), text, _level(percent)], "rings": []}
     for spec in rings[:MAX_RINGS]:
         light, dark = logos(spec["key"])
-        out["rings"].append([INITIALS[spec["key"]], light, dark, _value(spec["right"]), _level(spec["right"]),
-                             _value(spec["left"]), _level(spec["left"])])
+        out["rings"].append(["1" if spec.get("single") else "2", INITIALS[spec["key"]], light, dark,
+                             _value(spec["right"]), _level(spec["right"]), _value(spec["left"]), _level(spec["left"])])
     return out
 
 
 def arguments(values):
-    """osascript's argument list for `inputs()`: the fixed script, then "strip", the gauge and seven strings per
+    """osascript's argument list for `inputs()`: the fixed script, then "strip", the gauge and eight strings per
     ring. Every value is checked first; anything unexpected raises ValueError and nothing is run."""
     shown, symbol, text, level = values["gauge"]
     if symbol not in GAUGE_SYMBOLS or not _GAUGE_TEXT.fullmatch(text) or level not in LEVELS.values():
@@ -275,16 +308,17 @@ def arguments(values):
         raise ValueError("too many rings")
     argv = [OSASCRIPT, "-l", "JavaScript", "-e", SCRIPT, "strip", "1" if shown else "0", symbol, text, level,
             str(len(rings))]
-    for initials, light, dark, right, right_level, left, left_level in rings:
-        if initials not in INITIALS.values():
-            raise ValueError("bad initials")
+    for shape, initials, light, dark, right, right_level, left, left_level in rings:
+        if shape not in ("1", "2") or initials not in INITIALS.values():
+            raise ValueError("bad ring")
         for logo in (light, dark):
-            if logo is not None and os.path.dirname(logo[0]) != LOGO_DIR:
+            if logo is not None and os.path.dirname(logo[0]) not in (LOGO_DIR, SHIPPED_DIR):
                 raise ValueError("bad logo path")
         for value, lvl in ((right, right_level), (left, left_level)):
             if not _VALUE.fullmatch(value) or (value and int(value) > 100) or lvl not in LEVELS.values():
                 raise ValueError("bad arc")
-        argv += [initials, light[0] if light else "", dark[0] if dark else "", right, right_level, left, left_level]
+        argv += [shape, initials, light[0] if light else "", dark[0] if dark else "", right, right_level, left,
+                 left_level]
     return argv
 
 

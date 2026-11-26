@@ -26,7 +26,9 @@ is a command-line argument, which a link can't set (SwiftBar passes none, except
   --debug        print the traceback to stderr if the menu could not be built at all
   --choose       show the "Providers…" panel (checkboxes; Save writes them all at once) and print nothing. SwiftBar
                  waits for it, then re-runs the plugin, but only after exit code 0, which safe_main guarantees.
-                 A second --choose while a panel is open exits at once.
+                 A second --choose while a panel is open exits at once. Like --show, it then leaves the marker (also
+                 after Cancel or no change), so that refresh shows the values already read and reads only a provider
+                 that has none (one just switched on that was never read), not forced.
   --toggle NAME  turn one provider on or off in the config file and print nothing (for the terminal).
   --show highest|PROVIDER:LIMIT
                  set what the menu bar number shows (`menu_bar` in the config file) and print nothing: the highest
@@ -92,7 +94,7 @@ LAUNCHER = os.path.join(ROOT, "plugin", "ai-limits.5m.sh")  # run by the "Provid
 LOCK_SECONDS = 3.0  # --toggle waits at most this long for another change (or an open panel) to finish
 STATE_FILE = "providers-state.json"  # in the cache folder: providers the last menu run found not set up
 STATE_MAX_AGE = 3600.0  # seconds; an older state file gives no "not set up" notes
-KEEP_FILE = "keep-values.json"  # in the cache folder: written by --show and --prices, lets the next --refresh run
+KEEP_FILE = "keep-values.json"  # in the cache folder: written by --choose, --show, --gauge, --ring and --prices, lets the next --refresh run
 KEEP_SECONDS = 10.0  # skip re-reading (all providers, or all but those it names); an older marker counts for nothing
 MAX_PRICE_ROWS = 15  # deployments in the prices window; the others are set with --set-price
 PRICE_HEADINGS = dict(zip(foundry.PRICE_KEYS, ("Input", "Output", "Cache read", "Write 5m", "Write 1h")))
@@ -537,8 +539,9 @@ def choose_prices(path, cache, create):
 
 
 def mark_keep_values(cache, read=()):
-    """After --show or --prices: SwiftBar re-runs the plugin as a menu-click refresh, which the launcher turns into
-    --refresh, but the click needs no new data, or new data from one provider only (Foundry after a price change:
+    """After --choose, --show, --gauge, --ring or --prices: SwiftBar re-runs the plugin as a menu-click refresh
+    (--choose, --show, --prices), which the launcher turns into --refresh, but the click needs no new data, or new
+    data from one provider only (Foundry after a price change:
     its cached section was computed with the old prices). {"time": now} in the cache folder, plus {"read": [names]}
     if `read` names any, makes that one run use the values already read for every other provider. An error here
     only means the refresh is forced, as before."""
@@ -664,7 +667,10 @@ def main(argv=None):
     config_path = os.path.abspath(args.config) if args.config else CONFIG
     cache = os.path.abspath(args.cache) if args.cache else CACHE
     if args.choose:
-        choose(config_path, cache, create=not args.config)
+        try:
+            choose(config_path, cache, create=not args.config)
+        finally:  # also after Cancel, no change or an error: the refresh after the click reads no provider again
+            mark_keep_values(cache)
         return  # nothing is printed: the click's refresh=true re-runs the plugin for the new menu
     if args.toggle is not None:
         toggle(config_path, args.toggle, create=not args.config)

@@ -27,6 +27,7 @@ import os
 import pwd
 import re
 import select
+import shutil
 import stat
 import subprocess
 import sys
@@ -1535,6 +1536,9 @@ class RingDrawing(unittest.TestCase):
         self.specs = ring.specs(ring_results(), ring.groups(None), NOW)
         self.pair = (b64(make_png(296)), b64(make_png(296)))
         self.calls = []
+        patch = mock.patch.object(ring, "SHIPPED_DIR", os.path.join(folder.name, "no-shipped-logos"))
+        patch.start()  # the shipped marks are tested in RingLogos; here every ring shows its initials
+        self.addCleanup(patch.stop)
 
     def fake_run(self, answer=None):
         def fake(argv, timeout):
@@ -1545,30 +1549,34 @@ class RingDrawing(unittest.TestCase):
     def test_inputs_round_and_classify_the_values(self):
         values = ring.inputs((True, 94.4), self.specs)
         self.assertEqual(values["gauge"], [True, render.icon(94.4), "94%", "r"])
-        self.assertEqual(values["rings"][0], ["Cl", None, None, "31", "n", "57", "n"])
-        self.assertEqual(values["rings"][1][3:], ["82", "o", "40", "n"])  # orange from 75%
-        self.assertEqual(values["rings"][2][3:], ["12", "n", "94", "r"])  # red from 90%
+        self.assertEqual(values["rings"][0], ["2", "Cl", None, None, "31", "n", "57", "n"])
+        self.assertEqual(values["rings"][1][4:], ["82", "o", "40", "n"])  # orange from 75%
+        self.assertEqual(values["rings"][2][4:], ["12", "n", "94", "r"])  # red from 90%
+        self.assertEqual(values["rings"][3], ["1", "Cp", None, None, "26", "n", "26", "n"])  # one limit: one arc
         self.assertEqual(ring.inputs((False, None), [dict(self.specs[0], right=None, left=150.0)]),
                          {"gauge": [False, render.icon(None), "–", "n"],
-                          "rings": [["Cl", None, None, "", "n", "100", "r"]]})
+                          "rings": [["2", "Cl", None, None, "", "n", "100", "r"]]})
 
     def test_script_is_fixed_and_values_are_arguments(self):
         argv = ring.arguments(ring.inputs((True, 94.0), self.specs))
         self.assertEqual(argv[:5], ["/usr/bin/osascript", "-l", "JavaScript", "-e", ring.SCRIPT])
         self.assertEqual(argv[5:11], ["strip", "1", render.icon(94.0), "94%", "r", "4"])
-        self.assertEqual(argv[11:18], ["Cl", "", "", "31", "n", "57", "n"])
-        self.assertEqual(len(argv), 11 + 4 * 7)
+        self.assertEqual(argv[11:19], ["2", "Cl", "", "", "31", "n", "57", "n"])
+        self.assertEqual(argv[-8:], ["1", "Cp", "", "", "26", "n", "26", "n"])
+        self.assertEqual(len(argv), 11 + 4 * 8)
         self.assertNotIn("argv[", ring.SCRIPT.split("function run(argv)")[0])  # no code before run()
         good = ring.inputs((True, 50.0), self.specs[:1])
         bad_values = [("gauge", [True, "evil.symbol", "50%", "n"]), ("gauge", [True, render.icon(50), "50%'", "n"]),
                       ("gauge", [True, render.icon(50), "50%", "x"]),
-                      ("rings", [["Zz", None, None, "1", "n", "2", "n"]]),
-                      ("rings", [["Cl", ("/tmp/claude.svg", 1, 1), None, "1", "n", "2", "n"]]),
-                      ("rings", [["Cl", None, None, "101", "n", "2", "n"]]),
-                      ("rings", [["Cl", None, None, "5.5", "n", "2", "n"]]),
-                      ("rings", [["Cl", None, None, "1", "n", "-2", "n"]]),
-                      ("rings", [["Cl", None, None, "1", "x", "2", "n"]]),
-                      ("rings", [["Cl", None, None, "1", "n", "2", "n"]] * (ring.MAX_RINGS + 1))]
+                      ("rings", [["2", "Zz", None, None, "1", "n", "2", "n"]]),
+                      ("rings", [["3", "Cl", None, None, "1", "n", "2", "n"]]),
+                      ("rings", [["2", "Cl", ("/tmp/claude.svg", 1, 1), None, "1", "n", "2", "n"]]),
+                      ("rings", [["2", "Cl", None, (ring.SHIPPED_DIR + "x/claude.pdf", 1, 1), "1", "n", "2", "n"]]),
+                      ("rings", [["2", "Cl", None, None, "101", "n", "2", "n"]]),
+                      ("rings", [["2", "Cl", None, None, "5.5", "n", "2", "n"]]),
+                      ("rings", [["2", "Cl", None, None, "1", "n", "-2", "n"]]),
+                      ("rings", [["2", "Cl", None, None, "1", "x", "2", "n"]]),
+                      ("rings", [["2", "Cl", None, None, "1", "n", "2", "n"]] * (ring.MAX_RINGS + 1))]
         for key, value in bad_values:
             with self.assertRaises(ValueError, msg=repr(value)):
                 ring.arguments(dict(good, **{key: value}))
@@ -1629,14 +1637,19 @@ class RingDrawing(unittest.TestCase):
             self.assertIsNone(ring.strip(self.specs, (False, None), self.cache))  # failure: no strip
 
 
+SHIPPED = os.path.join(ROOT, "ai_limits", "logos")
+
+
 class RingLogos(unittest.TestCase):
-    """The user's own logo files: fixed names in one folder, strict file checks, initials otherwise."""
+    """The marks in the middle of a ring: the user's own files win over the shipped drawings, by fixed names and
+    strict file checks; initials are the last fallback."""
 
     def setUp(self):
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         self.dir = os.path.join(folder.name, "logos")
         os.mkdir(self.dir, 0o700)
+        self.none = os.path.join(folder.name, "no-shipped-logos")
         patch = mock.patch.object(ring, "LOGO_DIR", self.dir)
         patch.start()
         self.addCleanup(patch.stop)
@@ -1648,58 +1661,95 @@ class RingLogos(unittest.TestCase):
         os.chmod(path, mode)
         return path
 
-    def test_no_folder_or_no_file_means_initials(self):
-        self.assertEqual(ring.logos("claude"), (None, None))
-        with mock.patch.object(ring, "LOGO_DIR", os.path.join(self.dir, "missing")):
-            self.assertEqual(ring.logos("claude"), (None, None))
-        self.assertEqual(ring.logos("foundry"), (None, None))  # no ring, no logo
+    @staticmethod
+    def paths(provider):
+        return tuple(x[0] if x else None for x in ring.logos(provider))
+
+    def test_shipped_marks_and_their_light_versions(self):
+        self.assertEqual(ring.SHIPPED_DIR, SHIPPED)
+        self.assertEqual(self.paths("claude"), (f"{SHIPPED}/claude.pdf", f"{SHIPPED}/claude.pdf"))  # coloured: both
+        self.assertEqual(self.paths("gemini"), (f"{SHIPPED}/gemini.pdf", f"{SHIPPED}/gemini.pdf"))
+        for name in ("codex", "copilot"):  # white or light grey on a dark bar: a dark version for a light bar
+            self.assertEqual(self.paths(name), (f"{SHIPPED}/{name}-light.pdf", f"{SHIPPED}/{name}.pdf"))
+        self.assertEqual(ring.logos("foundry"), (None, None))  # no ring, no mark
+        self.assertEqual(ring.logos("cursor"), (None, None))  # shipped for later, but not a provider yet
         self.assertEqual(ring.logos("../claude"), (None, None))
+        with mock.patch.object(ring, "SHIPPED_DIR", self.none):
+            self.assertEqual(ring.logos("claude"), (None, None))  # nothing anywhere: initials
 
-    def test_fixed_names_and_type_order(self):
-        png = self.put("claude.png")
-        self.assertEqual(ring.logos("claude")[0][0], png)
+    def test_shipped_files_are_plain_vector_drawings(self):
+        names = {f"{n}{v}" for n in ("claude", "codex", "gemini", "copilot", "cursor") for v in ("", "-light")}
+        names -= {"claude-light", "gemini-light"}
+        self.assertEqual({f[:-4] for f in os.listdir(SHIPPED) if f.endswith(".pdf")}, names)
+        source = os.path.join(SHIPPED, "source")
+        self.assertEqual({f[:-4] for f in os.listdir(source) if f.endswith(".svg")}, names)
+        for name in names:
+            with open(os.path.join(SHIPPED, f"{name}.pdf"), "rb") as f:
+                pdf = f.read()
+            self.assertTrue(pdf.startswith(b"%PDF-"), name)
+            self.assertLess(len(pdf), 16 * 1024, name)
+            self.assertNotRegex(pdf, rb"/Subtype\s*/Image|/JavaScript|/JS\b|/URI|/Launch|/EmbeddedFile|/AA\b", name)
+            with open(os.path.join(source, f"{name}.svg"), encoding="utf-8") as f:
+                svg = f.read()
+            self.assertEqual(set(re.findall(r"<([A-Za-z][\w:-]*)", svg)), {"svg", "g", "path"}, name)
+            self.assertNotRegex(svg, r"(?i)script|href|url\(|style|data:|<image|foreignObject|\bon\w+=", name)
+            self.assertLess(len(svg), 4096, name)
+
+    def test_user_files_win_over_the_shipped_ones(self):
         svg = self.put("claude.svg")
-        light, dark = ring.logos("claude")
-        self.assertEqual((light[0], dark[0]), (svg, svg))  # svg first; the dark bar uses the same file
-        dark_file = self.put("claude-dark.pdf")
-        self.assertEqual(ring.logos("claude")[1][0], dark_file)
-        self.put("Claude.svg.bak")
-        self.assertEqual(ring.logos("codex"), (None, None))
+        self.assertEqual(self.paths("claude"), (svg, svg))
+        dark = self.put("claude-dark.png")
+        self.assertEqual(self.paths("claude"), (svg, dark))
+        png = self.put("codex.png")
+        self.assertEqual(self.paths("codex"), (png, png))  # the user's one file wins over the shipped light version
+        light = self.put("codex-light.pdf")
+        self.assertEqual(self.paths("codex"), (light, png))
+        self.put("gemini.svg.bak")
+        self.assertEqual(self.paths("gemini"), (f"{SHIPPED}/gemini.pdf",) * 2)
 
-    def test_files_that_fail_a_check_are_ignored(self):
+    def test_type_order_and_files_that_fail_a_check(self):
+        self.put("claude.pdf")
         target = self.put("elsewhere.svg")
         os.symlink(target, os.path.join(self.dir, "claude.svg"))
-        self.assertEqual(ring.logos("claude"), (None, None))  # a symlink: not followed, no next type
+        self.assertEqual(self.paths("claude"), (os.path.join(self.dir, "claude.pdf"),) * 2)  # the link is skipped
         self.put("codex.svg", mode=0o620)
-        self.put("codex.png")
-        self.assertEqual(ring.logos("codex"), (None, None))  # group-writable
+        self.assertEqual(self.paths("codex"), (f"{SHIPPED}/codex-light.pdf", f"{SHIPPED}/codex.pdf"))  # group-writable
         self.put("gemini.svg", mode=0o602)
-        self.assertEqual(ring.logos("gemini"), (None, None))  # writable by others
         self.put("copilot.svg", data=b"")
-        self.assertEqual(ring.logos("copilot"), (None, None))  # empty
+        self.assertEqual(self.paths("gemini"), (f"{SHIPPED}/gemini.pdf",) * 2)  # writable by others: shipped one
+        self.assertEqual(self.paths("copilot")[1], f"{SHIPPED}/copilot.pdf")  # empty
         os.remove(os.path.join(self.dir, "copilot.svg"))
         self.put("copilot.svg", data=b"x" * 11)
-        with mock.patch.object(ring, "LOGO_MAX_BYTES", 10):
+        with mock.patch.object(ring, "LOGO_MAX_BYTES", 10), mock.patch.object(ring, "SHIPPED_DIR", self.none):
             self.assertEqual(ring.logos("copilot"), (None, None))  # over the size cap
-        os.mkfifo(os.path.join(self.dir, "claude-dark.svg"), 0o600)
-        with mock.patch("os.getuid", return_value=os.getuid() + 1):
-            self.assertEqual(ring.logos("copilot"), (None, None))  # owned by someone else
+        os.mkfifo(os.path.join(self.dir, "copilot-dark.svg"), 0o600)
+        with mock.patch.object(ring, "SHIPPED_DIR", self.none):
+            self.assertEqual(self.paths("copilot"), (os.path.join(self.dir, "copilot.svg"),) * 2)  # FIFO skipped
+            with mock.patch("os.getuid", return_value=os.getuid() + 1):
+                self.assertEqual(ring.logos("copilot"), (None, None))  # owned by someone else
 
-    def test_folder_must_be_private(self):
+    def test_folders_must_be_private(self):
         self.put("claude.svg")
         os.chmod(self.dir, 0o777)
-        self.assertEqual(ring.logos("claude"), (None, None))
+        self.assertEqual(self.paths("claude"), (f"{SHIPPED}/claude.pdf",) * 2)
         os.chmod(self.dir, 0o700)
         link = self.dir + "-link"
         os.symlink(self.dir, link)
         with mock.patch.object(ring, "LOGO_DIR", link):
-            self.assertEqual(ring.logos("claude"), (None, None))
+            self.assertEqual(self.paths("claude"), (f"{SHIPPED}/claude.pdf",) * 2)
+        copy = os.path.join(os.path.dirname(self.dir), "shipped-copy")
+        shutil.copytree(SHIPPED, copy)
+        os.chmod(copy, 0o777)
+        with mock.patch.object(ring, "SHIPPED_DIR", copy), mock.patch.object(ring, "LOGO_DIR", self.none):
+            self.assertEqual(ring.logos("claude"), (None, None))  # a shipped folder others can write: not used
 
     def test_logo_paths_reach_the_script_and_the_cache_key(self):
         path = self.put("claude.svg")
         specs = ring.specs(ring_results(), ring.groups(None), NOW)
         values = ring.inputs((True, 50.0), specs)
-        self.assertEqual(ring.arguments(values)[11:14], ["Cl", path, path])
+        argv = ring.arguments(values)
+        self.assertEqual(argv[11:15], ["2", "Cl", path, path])
+        self.assertEqual(argv[19:23], ["2", "Cx", f"{SHIPPED}/codex-light.pdf", f"{SHIPPED}/codex.pdf"])
         before = ring._key(values)
         os.utime(path, ns=(1, 1))
         self.assertNotEqual(ring._key(ring.inputs((True, 50.0), specs)), before)  # a changed file is drawn again
@@ -3353,6 +3403,87 @@ class Choose(unittest.TestCase):
         self.assertEqual([p["enabled"] for p in json.loads(text)["providers"]], [True, True, False, True, False])
         self.assertEqual(stat.S_IMODE(os.stat(self.config).st_mode), 0o600)
         self.assertEqual(self.shown[0][2][2], True)  # the panel showed the example's state
+
+
+class ChooseRefresh(unittest.TestCase):
+    """The refresh SwiftBar runs right after Providers… Save or Cancel: it shows the values already read and reads
+    only a provider that has none. The panel and the providers are fakes; temp --config and --cache only."""
+
+    def setUp(self):
+        self.main = load_main()
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.dir = os.path.join(folder.name, "settings")
+        os.mkdir(self.dir)
+        self.cache = os.path.join(folder.name, "cache")
+        self.config = os.path.join(self.dir, "config.json")
+        with open(self.config, "w") as f:
+            json.dump({"providers": [{"name": n, "enabled": n in ("claude", "codex")} for n in NAMES]}, f)
+        for name in ("claude", "codex", "copilot"):  # read an hour ago; Gemini was never read
+            common.write_private_json(self.cache, f"{name}.json", dict(
+                res(name.upper(), [common.row("5-hour", 21.0, window="5h")]), time=time.time() - 3600))
+        self.reads = []
+
+        def call(name, settings, forced):
+            self.reads.append((name, settings["force"]))
+            return dict(res(name.upper(), [common.row("5-hour", 63.0, window="5h")]), time=time.time())
+        self.main.call = call
+
+    def save_then_refresh(self, answer):
+        """--choose with the fake panel's answer, then the --refresh SwiftBar runs after the click; its menu."""
+        out = io.StringIO()
+        with mock.patch.object(panel, "show", return_value=answer), contextlib.redirect_stdout(out):
+            self.main.main(["--choose", "--config", self.config, "--cache", self.cache])
+            self.main.main(["--refresh", "--config", self.config, "--cache", self.cache])
+        return out.getvalue()
+
+    @staticmethod
+    def answer(on, gauge="on", group="gemini"):
+        lines = "".join(f"{n}={'on' if n in on else 'off'}\n" for n in NAMES)
+        return 0, f"{lines}gauge={gauge}\nring_gemini={group}\n", ""
+
+    def config_data(self):
+        with open(self.config) as f:
+            return json.load(f)
+
+    def test_changing_only_the_settings_reads_nothing(self):
+        menu = self.save_then_refresh(self.answer({"claude", "codex"}, gauge="off", group="3p"))
+        self.assertEqual(self.reads, [])
+        self.assertEqual((self.config_data()["menu_bar_gauge"], self.config_data()["ring_group"]),
+                         (False, {"gemini": "3p"}))
+        self.assertIn("21%", menu)  # the values already read, an hour old
+        self.assertNotIn("63%", menu)
+
+    def test_switching_a_provider_off_reads_nothing_and_removes_it(self):
+        menu = self.save_then_refresh(self.answer({"claude"}))
+        self.assertEqual(self.reads, [])
+        sections = [x.split(" | ")[0] for x in top_level(menu)]
+        self.assertIn("Claude", sections)
+        self.assertNotIn("Codex (GPT)", sections)  # gone at once
+
+    def test_switching_on_a_never_read_provider_reads_only_that_one(self):
+        menu = self.save_then_refresh(self.answer({"claude", "codex", "gemini"}))
+        self.assertEqual(self.reads, [("gemini", False)])  # not forced; the others come from the cache
+        self.assertIn("Gemini", [x.split(" | ")[0] for x in top_level(menu)])
+
+    def test_switching_on_a_provider_with_old_values_shows_them_at_once(self):
+        menu = self.save_then_refresh(self.answer({"claude", "codex", "copilot"}))
+        self.assertEqual(self.reads, [])  # its last values until its next scheduled read
+        self.assertIn("GitHub Copilot", [x.split(" | ")[0] for x in top_level(menu)])
+
+    def test_cancel_or_a_failed_panel_reads_nothing(self):
+        before = self.config_data()
+        for answer in ((0, "cancel\n", ""), (1, "", ""), (0, "garbage", "")):
+            self.reads.clear()
+            self.save_then_refresh(answer)
+            self.assertEqual(self.reads, [], answer)
+            self.assertEqual(self.config_data(), before)
+
+    def test_without_the_marker_a_refresh_still_reads_everything(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.main.main(["--refresh", "--config", self.config, "--cache", self.cache])
+        self.assertEqual(sorted(self.reads), [("claude", True), ("codex", True)])  # Refresh now: forced, as before
 
 
 class SetPrice(unittest.TestCase):
