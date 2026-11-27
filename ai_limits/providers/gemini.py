@@ -17,7 +17,6 @@ is still valid. The token is never refreshed; an expired one is silently skipped
 """
 import glob
 import itertools
-import json
 import math
 import os
 import re
@@ -25,8 +24,8 @@ import stat
 import time
 import unicodedata
 
-from ai_limits.common import (NotConfigured, SessionExpired, Unavailable, https_json, localhost_json, result, row,
-                              to_epoch)
+from ai_limits.common import (NotConfigured, SessionExpired, Unavailable, https_json, loads, localhost_json, result,
+                              row, to_epoch)
 
 ANTIGRAVITY_DIR = os.path.expanduser("~/.gemini/antigravity")
 HUB = os.path.join(ANTIGRAVITY_DIR, "daemon", "hub_*.json")
@@ -64,7 +63,7 @@ def _read_hub_file(path):
         st = os.fstat(f.fileno())
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
             return None
-        return json.loads(f.read(65536))
+        return loads(f.read(65536))
 
 
 def hub():
@@ -250,7 +249,7 @@ def _gemini_cli():
     """Gemini CLI fallback, only while the saved token is valid; otherwise None (no refresh)."""
     try:
         with open(CLI_CREDENTIALS, encoding="utf-8") as f:
-            k = json.load(f) or {}
+            k = loads(f.read()) or {}
     except (OSError, ValueError):
         return None
     token, expires = k.get("access_token"), k.get("expiry_date")

@@ -30,8 +30,8 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 
-from ai_limits.common import (NotConfigured, SessionExpired, find_tool, read_json, result, row, run, short_number,
-                              write_private_json)
+from ai_limits.common import (NotConfigured, SessionExpired, find_tool, loads, read_json, result, row, run,
+                              short_number, write_private_json)
 
 METRICS = ["InputTokens", "OutputTokens", "cacheReadInputTokens", "ephemeral5mInputTokens", "ephemeral1hInputTokens"]
 # Price key -> metric. For Anthropic deployments InputTokens is taken to exclude cache reads and writes (Anthropic's
@@ -157,7 +157,7 @@ def _az(az, argv, timeout=40):
         if "429" in err or "Too Many Requests" in err:
             raise Throttled()
         raise RuntimeError("az failed")
-    return json.loads(out) if out.strip() else None
+    return loads(out) if out.strip() else None
 
 
 # ---- periods --------------------------------------------------------------------------------------------

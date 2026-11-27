@@ -129,6 +129,12 @@ def row(label, percent=None, value=None, resets=None):
     return {"label": label, "percent": percent, "value": value, "resets": resets}
 
 
+def long_ints():
+    """Integer literals common.loads refuses: one digit over common.MAX_INT_DIGITS, and 1 MB (Python 3.9 took over
+    7 s to convert it)."""
+    return ["7" * (common.MAX_INT_DIGITS + 1), "7" * common.MAX_BODY]
+
+
 # ---- SwiftBar's menu parser, ported ------------------------------------------------------------------------
 
 LINE_BREAKS = re.compile("[\n\x0b\x0c\r\x85\u2028\u2029]")
@@ -946,6 +952,60 @@ class Common(unittest.TestCase):
             else:
                 self.assertIs(type(value), list)  # (never printed or compared: that would recurse as deep)
 
+    def assert_loads_refuses(self, text):
+        """common.loads raises a ValueError (json.JSONDecodeError is one), never another type."""
+        with self.assertRaises(Exception) as caught:
+            common.loads(text)
+        self.assertIsInstance(caught.exception, ValueError)
+        return caught.exception
+
+    def test_loads_refuses_text_that_is_not_json(self):
+        for text in ("{not json", "", "[1, 2", '{"a": 1} extra', b"{not json", b"\xff\xfe{"):
+            with self.subTest(text):
+                self.assert_loads_refuses(text)
+
+    def test_loads_refuses_an_integer_over_the_digit_limit(self):
+        digits = "7" * (common.MAX_INT_DIGITS + 1)
+        texts = {"bare": digits, "negative": "-" + digits,
+                 "nested": '{"response": {"groups": [{"name": "demo", "used": ' + digits + "}]}}",
+                 "in a list": "[1, 2.5, -" + digits + "]"}
+        for what, text in texts.items():
+            for value in (text, text.encode()):
+                with self.subTest(what, type=type(value).__name__):
+                    self.assert_loads_refuses(value)
+
+    def test_loads_reads_ordinary_values_as_before(self):
+        digits = "7" * common.MAX_INT_DIGITS
+        text = ('{"a": [0, 42, -7, ' + digits + ", -" + digits + ', 0.25, -12.5, 1e3, -2.5E-3, "x", true, null], '
+                '"b": {"c": "d\\u00e9"}}')
+        expected = {"a": [0, 42, -7, int(digits), -int(digits), 0.25, -12.5, 1000.0, -0.0025, "x", True, None],
+                    "b": {"c": "dé"}}
+        for value in (text, text.encode(), text.encode("utf-16")):  # bytes as json.loads takes them
+            with self.subTest(type=type(value).__name__):
+                found = common.loads(value)
+                self.assertTrue(found == expected)  # (not assertEqual: a failure would print 4300 digits)
+                self.assertEqual([type(v) for v in found["a"]], [type(v) for v in expected["a"]])
+        self.assertEqual(common.loads("1" * 5000 + ".0"), float("inf"))  # a float, never converted as an int
+
+    def test_loads_refuses_a_1_mb_integer_quickly(self):
+        start = time.monotonic()
+        for text in (b"9" * common.MAX_BODY, '{"n": -' + "9" * common.MAX_BODY + "}"):
+            self.assert_loads_refuses(text)
+        self.assertLess(time.monotonic() - start, 1.0)
+
+    def test_loads_deep_nesting_is_read_or_refused(self):
+        text = "[" * 100000 + "]" * 100000
+        for value in (text, text.encode()):
+            try:
+                found = common.loads(value)
+            except Exception as e:  # too deep for this Python: a fixed ValueError, never a RecursionError
+                self.assertIs(type(e), ValueError)
+                self.assertEqual(str(e), "nested too deep")
+                self.assertIsNone(e.__cause__)
+                self.assertTrue(e.__suppress_context__)
+            else:
+                self.assertIs(type(found), list)
+
     def test_to_epoch(self):
         import calendar
         expected = float(calendar.timegm((2031, 5, 17, 6, 41, 23)))
@@ -1118,6 +1178,136 @@ class Providers(unittest.TestCase):
                   "ephemeral5mInputTokens": 300000}
         self.assertAlmostEqual(foundry.estimate(tokens, prices), 0.008 + 1.75 + 0.75 + 0.9)
         self.assertIsNone(foundry.estimate({"ephemeral1hInputTokens": 5}, prices))  # unpriced type
+
+    # Text from other tools with one integer over common.MAX_INT_DIGITS (otherwise valid JSON) ends exactly where text
+    # that is not JSON ends. Python 3.9 used to convert it (and a 1 MB one took over 7 s).
+
+    def test_codex_session_record_with_too_long_an_integer_is_skipped_like_one_that_is_not_json(self):
+        record = ('{"type": "event_msg", "payload": {"rate_limits": {"primary": {"used_percent": %s, '
+                  '"window_minutes": 300, "resets_at": 1800003600}, "demo_count": %s}}}')
+        bad = {"not JSON": (record % (88, 7))[:-1],
+               "nested too deep": '{"rate_limits": ' + "[" * 5000 + "]" * 5000 + "}"}
+        bad.update((f"{len(digits)} digits", record % (88, digits)) for digits in long_ints())
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(codex, "SESSIONS", d):
+            folder = os.path.join(d, "2031", "05", "26")
+            os.makedirs(folder)
+            path = os.path.join(folder, "rollout-demo.jsonl")
+            for what, newest in [("valid", record % (88, 7))] + list(bad.items()):
+                with self.subTest(what):
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(record % (12, 7) + "\n" + newest + "\n")
+                    start = time.monotonic()
+                    r = codex._fallback()
+                    self.assertLess(time.monotonic() - start, 1.0)
+                    self.assertEqual([x["percent"] for x in r["rows"]], [88.0 if what == "valid" else 12.0])
+
+    def test_copilot_output_with_too_long_an_integer_fails_like_output_that_is_not_json(self):
+        answer = ('{"quota_reset_date_utc": "2032-02-01T00:00:00.000Z", "demo_id": %s, '
+                  '"quota_snapshots": {"premium_interactions": {"entitlement": 300, "remaining": 120}}}')
+        with mock.patch.object(copilot, "find_tool", return_value="/opt/demo/gh"):
+            with mock.patch.object(copilot, "run", return_value=(0, answer % 7, "")):
+                self.assertEqual(copilot.read({})["rows"][0]["value"], "180 / 300")
+            for what, out in [("not JSON", "{not json")] + [(f"{len(d)} digits", answer % d) for d in long_ints()]:
+                with self.subTest(what), mock.patch.object(copilot, "run", return_value=(0, out, "")):
+                    start = time.monotonic()
+                    with self.assertRaises(ValueError):  # main shows its fixed "Couldn't read"
+                        copilot.read({})
+                    self.assertLess(time.monotonic() - start, 1.0)
+
+    def test_claude_keychain_item_with_too_long_an_integer_fails_like_one_that_is_not_json(self):
+        item = '{"claudeAiOauth": {"accessToken": "demo-token", "expiresAt": 4102444800000, "demoCount": %s}}'
+        calls = []
+
+        def fake_https(url, headers, **kwargs):
+            calls.append(url)
+            return {"limits": [{"kind": "session", "percent": 5}]}
+        with mock.patch.object(claude, "https_json", fake_https):
+            with mock.patch.object(claude, "run", return_value=(0, item % 7, "")):
+                self.assertEqual(claude.read({})["rows"][0]["percent"], 5.0)
+            self.assertEqual(len(calls), 1)
+            calls.clear()
+            for what, out in [("not JSON", "{not json")] + [(f"{len(d)} digits", item % d) for d in long_ints()]:
+                with self.subTest(what), mock.patch.object(claude, "run", return_value=(0, out, "")):
+                    start = time.monotonic()
+                    with self.assertRaises(ValueError):  # main shows its fixed "Couldn't read"
+                        claude.read({})
+                    self.assertLess(time.monotonic() - start, 1.0)
+        self.assertEqual(calls, [])  # the token never went out
+
+    def test_claude_stats_file_with_too_long_an_integer_is_ignored_like_one_that_is_not_json(self):
+        stats = '{"dailyModelTokens": [{"date": "%s", "tokensByModel": {"claude-demo": 1200}}], "demoCount": %s}'
+        expired = '{"claudeAiOauth": {"accessToken": "demo-token", "expiresAt": 1000}}'
+        real_open = open
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "stats-cache.json")
+
+            def fake_open(file, *args, **kwargs):
+                """claude._fallback's file, redirected: ~/.claude is never opened."""
+                if not str(file).endswith(os.path.join(".claude", "stats-cache.json")):
+                    raise AssertionError(f"unexpected open in claude: {file}")
+                return real_open(path, *args, **kwargs)
+            with mock.patch.object(claude, "open", fake_open, create=True), \
+                    mock.patch.object(claude, "run", return_value=(0, expired, "")):
+                today = datetime.now().strftime("%Y-%m-%d")  # claude uses the local date too
+                bad = [("not JSON", "{not json")] + [(f"{len(x)} digits", stats % (today, x)) for x in long_ints()]
+                for what, text in [("valid", stats % (today, 7))] + bad:
+                    with self.subTest(what):
+                        with real_open(path, "w", encoding="utf-8") as f:
+                            f.write(text)
+                        start = time.monotonic()
+                        r = claude.read({})
+                        self.assertLess(time.monotonic() - start, 1.0)
+                        self.assertEqual((r["status"], r["note"]),
+                                         ("expired", "Session expired: open Claude Code once"))
+                        self.assertEqual(r["details"], ["Today demo: 1.2K tokens"] if what == "valid"
+                                         else ["No local record for today"])
+
+    def test_gemini_hub_file_with_too_long_an_integer_is_skipped_like_one_that_is_not_json(self):
+        hub = '{"pid": %d, "httpPort": %d, "csrfToken": "abcdefgh12", "demoCount": %s}'
+        digits = "7" * (common.MAX_INT_DIGITS + 1)  # only the first 64 KB are read
+        bad = {"not JSON": (hub % (os.getpid(), 2222, 7))[:-1],
+               f"{len(digits)} digits": hub % (os.getpid(), 2222, digits),
+               "nested too deep": "[" * 30000 + "]" * 30000}
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(gemini, "HUB", os.path.join(d, "hub_*.json")):
+            older, newest = os.path.join(d, "hub_1111.json"), os.path.join(d, "hub_2222.json")
+            for path, text, when in ((older, hub % (os.getpid(), 1111, 7), NOW - 60),
+                                     (newest, hub % (os.getpid(), 2222, 7), NOW)):
+                with open(path, "w") as f:
+                    f.write(text)
+                os.chmod(path, 0o600)
+                os.utime(path, (when, when))
+            self.assertEqual(gemini.hub(), (2222, "abcdefgh12"))
+            for what, text in bad.items():
+                with self.subTest(what):
+                    with open(newest, "w") as f:
+                        f.write(text)
+                    os.utime(newest, (NOW, NOW))
+                    self.assertEqual(gemini.hub(), (1111, "abcdefgh12"))  # the newest file is skipped
+
+    def test_gemini_cli_credentials_with_too_long_an_integer_are_ignored_like_ones_that_are_not_json(self):
+        creds = '{"access_token": "demo-token", "expiry_date": 4102444800000, "demoCount": %s}'
+        calls = []
+
+        def fake_https(url, headers, timeout=10, body=None):
+            calls.append(url)
+            return {"buckets": [{"modelId": "gemini-demo", "remainingFraction": 0.5}]}
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "oauth_creds.json")
+            with mock.patch.object(gemini, "CLI_CREDENTIALS", path), \
+                    mock.patch.object(gemini, "https_json", fake_https):
+                with open(path, "w") as f:
+                    f.write(creds % 7)
+                self.assertEqual([x["label"] for x in gemini._gemini_cli()], ["demo"])
+                self.assertEqual(len(calls), 2)
+                calls.clear()
+                for what, text in [("not JSON", "{not json")] + [(f"{len(x)} digits", creds % x) for x in long_ints()]:
+                    with self.subTest(what):
+                        with open(path, "w") as f:
+                            f.write(text)
+                        start = time.monotonic()
+                        self.assertIsNone(gemini._gemini_cli())
+                        self.assertLess(time.monotonic() - start, 1.0)
+        self.assertEqual(calls, [])  # the token never went out
 
 
 def gemini_summary():
@@ -2519,6 +2709,21 @@ class CodexChannel(unittest.TestCase):
                          [(1, "initialize"), (None, "initialized"), (2, "account/rateLimits/read")])
         self.assertNotIn("id", sent[1])
 
+    def test_a_line_with_too_long_an_integer_is_skipped_like_one_that_is_not_json(self):
+        digits = b"7" * (common.MAX_INT_DIGITS + 1)  # small enough for the pipe's buffer, like the deep nesting
+        good = b'{"id": 1, "result": {"ok": true}}\n'
+        for what, bad in (("valid", b'{"id": 1, "result": {"n": 7}}'), ("not JSON", b'{"id": 1, "result": {"n": 7'),
+                          ("digits", b'{"id": 1, "result": {"n": ' + digits + b"}}"),
+                          ("nested too deep", b"[" * 5000 + b"]" * 5000)):
+            with self.subTest(what):
+                ch, to_us, _ = self.channel()
+                os.write(to_us, bad + b"\n" + good)
+                start = time.monotonic()
+                found = ch.wait(1)
+                self.assertLess(time.monotonic() - start, 1.0)
+                self.assertTrue(found == ({"id": 1, "result": {"n": 7}} if what == "valid" else
+                                          {"id": 1, "result": {"ok": True}}), what)
+
 
 FAKE_CODEX = """#!{python} -I
 import json, sys
@@ -2844,6 +3049,21 @@ class FoundrySpend(unittest.TestCase):
             self.history(d, resource_id=resource)
             merged = common.read_json(os.path.join(d, foundry.HISTORY_FILE))["tokens"]
         self.assertEqual(merged, {"my-deployment": {"2031-04": {"OutputTokens": 7}, "2031-08": {"OutputTokens": 9}}})
+
+    def test_az_output_with_too_long_an_integer_fails_like_output_that_is_not_json(self):
+        answer = '{"id": "/subscriptions/demo", "demoCount": %s}'
+        with mock.patch.object(foundry, "run", return_value=(0, answer % 7, "")):
+            self.assertEqual(foundry._az("/opt/demo/az", ["account", "show"]),
+                             {"id": "/subscriptions/demo", "demoCount": 7})
+        with mock.patch.object(foundry, "find_tool", return_value="/opt/demo/az"):
+            for what, out in [("not JSON", "{not json")] + [(f"{len(d)} digits", answer % d) for d in long_ints()]:
+                with self.subTest(what), mock.patch.object(foundry, "run", return_value=(0, out, "")):
+                    start = time.monotonic()
+                    with self.assertRaises(ValueError):  # the history and token reads catch it as any failure
+                        foundry._az("/opt/demo/az", ["account", "show"])
+                    with self.assertRaises(ValueError):  # main shows its fixed "Couldn't read"
+                        foundry.read({"resource_group": "demo-rg"})
+                    self.assertLess(time.monotonic() - start, 1.0)
 
     def test_saved_time_stamps(self):
         for bad in ("yesterday", None, True, float("nan"), float("inf"), 1e30, -5):

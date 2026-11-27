@@ -7,12 +7,11 @@ whenever it runs.
 
 Fallback when the token is expired: today's token counts from `~/.claude/stats-cache.json` (no percentages).
 """
-import json
 import os
 import time
 from datetime import date
 
-from ai_limits.common import (SECURITY, NotConfigured, SessionExpired, https_json, result, row, run, shape,
+from ai_limits.common import (SECURITY, NotConfigured, SessionExpired, https_json, loads, result, row, run, shape,
                               shape_key, short_number, to_epoch)
 
 URL = "https://api.anthropic.com/api/oauth/usage"
@@ -29,7 +28,7 @@ def _token():
         raise NotConfigured("no Claude Code credentials")
     if code != 0:
         raise RuntimeError("Keychain item could not be read")
-    entry = (json.loads(out) or {}).get("claudeAiOauth") or {}
+    entry = (loads(out) or {}).get("claudeAiOauth") or {}
     token, expires = entry.get("accessToken"), entry.get("expiresAt")
     if not token:
         raise NotConfigured("no token")
@@ -136,7 +135,7 @@ def _fallback():
     details = []
     try:
         with open(os.path.expanduser("~/.claude/stats-cache.json"), encoding="utf-8") as f:
-            d = json.load(f)
+            d = loads(f.read())
         today = date.today().isoformat()
         day = next((x for x in d.get("dailyModelTokens", []) if x.get("date") == today), None)
         if day:

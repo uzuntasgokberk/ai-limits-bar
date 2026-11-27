@@ -53,7 +53,7 @@ The documented limits are not vulnerabilities: the endpoints are unofficial and 
   - HTTPS only for remote services.
   - Requests to `127.0.0.1` bypass every proxy (environment variables and macOS system settings).
   - Redirects are never followed (urllib would forward the `Authorization` header).
-  - Response bodies are capped at 1 MB. An answer with a whole number of more than 4300 digits, or nested too deep to read, is unreadable: it is refused, not converted. Codex's output is capped at 5 MB per exchange, under one deadline.
+  - Response bodies are capped at 1 MB. An answer with a whole number of more than 4300 digits, or nested too deep to read, is unreadable: it is refused, not converted. The same number and nesting rule applies to what the other tools print and to the other tools' files that the plugin reads. Codex's output is capped at 5 MB per exchange, under one deadline.
   - Error messages are replaced with fixed text, so headers can't leak through exceptions.
 - **Menu output.**
   - SwiftBar turns ` | key=value` into actions (`bash=`, `href=` …), `--` into submenus and `---` into separators. Every external string therefore has `|` replaced and control, format and line-separator characters removed (including U+2028/U+2029/U+0085), runs of dashes collapsed, and leading dashes and combining marks removed.

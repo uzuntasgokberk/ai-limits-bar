@@ -132,6 +132,15 @@ def _bounded_int(text):
     return int(text)
 
 
+def loads(text):
+    """json.loads (str or bytes) for external text: an answer, another tool's output or file. Text that is not JSON,
+    an integer of more than MAX_INT_DIGITS digits and nesting too deep for this Python all raise ValueError."""
+    try:
+        return json.loads(text, parse_int=_bounded_int)
+    except RecursionError:
+        raise ValueError("nested too deep") from None
+
+
 def _read_json(request, timeout, opener=_OPENER):
     try:
         with opener.open(request, timeout=timeout) as response:
@@ -151,8 +160,8 @@ def _read_json(request, timeout, opener=_OPENER):
     if len(body) > MAX_BODY:
         raise RuntimeError("response too large")
     try:
-        return json.loads(body, parse_int=_bounded_int)
-    except (ValueError, RecursionError):  # also nesting too deep for this Python
+        return loads(body)
+    except ValueError:  # also an integer too long or nesting too deep (see loads)
         raise RuntimeError("response is not JSON") from None
 
 

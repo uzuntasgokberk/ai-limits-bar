@@ -17,7 +17,7 @@ import select
 import subprocess
 import time
 
-from ai_limits.common import ENV, NotConfigured, SessionExpired, find_tool, result, row, to_epoch
+from ai_limits.common import ENV, NotConfigured, SessionExpired, find_tool, loads, result, row, to_epoch
 
 SESSIONS = os.path.expanduser("~/.codex/sessions")
 # Read-only allow-list: nothing else can be sent.
@@ -89,7 +89,7 @@ class Channel:
                 if len(line) > self.max_line:
                     raise RuntimeError("codex message too long")
                 try:
-                    d = json.loads(line)
+                    d = loads(line)
                 except ValueError:
                     continue
                 if isinstance(d, dict) and d.get("id") == msg_id:
@@ -183,7 +183,7 @@ def _fallback():
         if '"rate_limits"' not in line:
             continue
         try:
-            rl = _find_rate_limits(json.loads(line))
+            rl = _find_rate_limits(loads(line))
         except ValueError:
             continue
         rows = []
