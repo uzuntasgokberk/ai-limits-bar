@@ -17,7 +17,7 @@ import select
 import subprocess
 import time
 
-from ai_limits.common import ENV, NotConfigured, SessionExpired, find_tool, result, row, to_epoch
+from ai_limits.common import ENV, NotConfigured, SessionExpired, find_tool, loads, result, row, to_epoch
 
 SESSIONS = os.path.expanduser("~/.codex/sessions")
 # Read-only allow-list: nothing else can be sent.
@@ -35,6 +35,12 @@ def window_name(minutes):
     if abs(minutes - 10080) < 60:
         return "Weekly"
     return f"{minutes / 60:.0f}-hour" if minutes < 2880 else f"{minutes / 1440:.0f}-day"
+
+
+def window_kind(minutes):
+    """The row's machine-readable window (common.row): "5h", "weekly", or None for any other length."""
+    name = window_name(minutes) if minutes else None
+    return {"5-hour": "5h", "Weekly": "weekly"}.get(name)
 
 
 def message(method, msg_id=None, params=None):
@@ -83,7 +89,7 @@ class Channel:
                 if len(line) > self.max_line:
                     raise RuntimeError("codex message too long")
                 try:
-                    d = json.loads(line)
+                    d = loads(line)
                 except ValueError:
                     continue
                 if isinstance(d, dict) and d.get("id") == msg_id:
@@ -138,7 +144,7 @@ def parse(r):
         w = rl.get(key)
         if isinstance(w, dict) and w.get("usedPercent") is not None:
             rows.append(row(window_name(w.get("windowDurationMins")), percent=float(w["usedPercent"]),
-                            resets=to_epoch(w.get("resetsAt"))))
+                            resets=to_epoch(w.get("resetsAt")), window=window_kind(w.get("windowDurationMins"))))
     if not rows:
         raise RuntimeError("expected fields missing")
     details = []
@@ -177,7 +183,7 @@ def _fallback():
         if '"rate_limits"' not in line:
             continue
         try:
-            rl = _find_rate_limits(json.loads(line))
+            rl = _find_rate_limits(loads(line))
         except ValueError:
             continue
         rows = []
@@ -185,7 +191,7 @@ def _fallback():
             w = (rl or {}).get(key)
             if isinstance(w, dict) and w.get("used_percent") is not None:
                 rows.append(row(window_name(w.get("window_minutes")), percent=float(w["used_percent"]),
-                                resets=to_epoch(w.get("resets_at"))))
+                                resets=to_epoch(w.get("resets_at")), window=window_kind(w.get("window_minutes"))))
         if rows:
             r = result("CODEX (GPT)", rows=rows)
             r["time"] = os.path.getmtime(path)

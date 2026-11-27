@@ -28,6 +28,8 @@ HOME = _USER.pw_dir
 SEARCH_DIRS = ["/opt/homebrew/bin", "/usr/local/bin", os.path.join(HOME, ".local", "bin"), "/usr/bin", "/bin"]
 SECURITY = "/usr/bin/security"
 MAX_BODY = 1_000_000
+# The limit newer Pythons have built in; Python 3.9 has none and converts a 1 MB integer in seconds.
+MAX_INT_DIGITS = 4300
 
 
 def clean_env():
@@ -123,6 +125,22 @@ def local_opener():
 _LOCAL_OPENER = local_opener()
 
 
+def _bounded_int(text):
+    """`parse_int` for an answer: an integer literal of more than MAX_INT_DIGITS digits is not converted."""
+    if len(text) - text.startswith("-") > MAX_INT_DIGITS:
+        raise ValueError("integer too long")
+    return int(text)
+
+
+def loads(text):
+    """json.loads (str or bytes) for external text: an answer, another tool's output or file. Text that is not JSON,
+    an integer of more than MAX_INT_DIGITS digits and nesting too deep for this Python all raise ValueError."""
+    try:
+        return json.loads(text, parse_int=_bounded_int)
+    except RecursionError:
+        raise ValueError("nested too deep") from None
+
+
 def _read_json(request, timeout, opener=_OPENER):
     try:
         with opener.open(request, timeout=timeout) as response:
@@ -142,8 +160,8 @@ def _read_json(request, timeout, opener=_OPENER):
     if len(body) > MAX_BODY:
         raise RuntimeError("response too large")
     try:
-        return json.loads(body)
-    except ValueError:
+        return loads(body)
+    except ValueError:  # also an integer too long or nesting too deep (see loads)
         raise RuntimeError("response is not JSON") from None
 
 
@@ -199,9 +217,11 @@ def result(title, status="ok", rows=None, details=None, note=None):
             "note": note, "time": time.time()}
 
 
-def row(label, percent=None, value=None, resets=None):
-    """One menu line: a percentage bar and/or a value, and an optional reset time."""
-    return {"label": label, "percent": percent, "value": value, "resets": resets}
+def row(label, percent=None, value=None, resets=None, window=None, group=None):
+    """One menu line: a percentage bar and/or a value, and an optional reset time. `window` ("5h", "weekly") and
+    `group` (e.g. Gemini's "gemini" / "3p") say which limit the row is, for code that must not parse the label;
+    None where the provider doesn't say."""
+    return {"label": label, "percent": percent, "value": value, "resets": resets, "window": window, "group": group}
 
 
 def short_number(n):

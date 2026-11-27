@@ -4,10 +4,9 @@ Source: `gh api copilot_internal/user`, the endpoint Copilot CLI reads too. The 
 this module never sees it. Hidden when gh is missing, not signed in, or the account has no Copilot.
 A 403 can also be a rate limit, so it keeps the cached values visible (Unavailable) instead of hiding them.
 """
-import json
 import re
 
-from ai_limits.common import NotConfigured, Unavailable, find_tool, result, row, run, to_epoch
+from ai_limits.common import NotConfigured, Unavailable, find_tool, loads, result, row, run, to_epoch
 
 
 def read(settings):
@@ -24,7 +23,7 @@ def read(settings):
         if status in ("401", "404") or any(s in err for s in ("auth login", "not logged", "Not Found")):
             raise NotConfigured("no Copilot access through gh")
         raise RuntimeError("gh api failed")
-    return parse(json.loads(out))
+    return parse(loads(out))
 
 
 def parse(d):

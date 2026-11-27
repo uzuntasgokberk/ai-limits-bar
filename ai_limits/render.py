@@ -44,6 +44,9 @@ HIGHEST_ITEM = "Highest of all"
 # Row labels that may go into a click parameter: ASCII letters and digits first, then also space . _ - (no quote,
 # backslash, colon, pipe, `$`, parentheses, control or format characters), at most 30 characters (normalize's limit).
 CHOICE_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,29}")
+# A row's `window` / `group` (see common.row): never shown, only compared.
+KIND = re.compile(r"[a-z0-9][a-z0-9_-]{0,15}")
+LABEL_MAX = 18  # characters of a row label shown in the menu (e.g. "Claude GPT Weekly"); the column adds 2 spaces
 
 
 def header(key, href=None, suffix=""):
@@ -107,6 +110,11 @@ def _count(x, high=999):
     return x if isinstance(x, int) and not isinstance(x, bool) and 0 <= x <= high else None
 
 
+def _kind(x):
+    """A row's machine-readable `window` or `group`: a short lowercase id such as "5h", "weekly" or "3p"; else None."""
+    return x if isinstance(x, str) and KIND.fullmatch(x) else None
+
+
 def normalize(r):
     """Brings a provider result or a cached result into a safe shape; None if it is not a result at all.
     One broken value (NaN, a time given as text, a missing field) can therefore not break the whole menu.
@@ -117,7 +125,8 @@ def normalize(r):
     for x in r.get("rows") if isinstance(r.get("rows"), list) else []:
         if isinstance(x, dict):
             rows.append({"label": _text(x.get("label", ""), 30) or "", "percent": _number(x.get("percent"), 0, 1000),
-                         "value": _text(x.get("value"), 200), "resets": _epoch(x.get("resets"))})
+                         "value": _text(x.get("value"), 200), "resets": _epoch(x.get("resets")),
+                         "window": _kind(x.get("window")), "group": _kind(x.get("group"))})
     details = r.get("details") if isinstance(r.get("details"), list) else []
     debug = r.get("debug") if isinstance(r.get("debug"), list) else []
     return {"title": _text(r.get("title"), 30) or "?",
@@ -185,10 +194,10 @@ def _params(*parts):
 
 
 def label_width(results):
-    """Label column sized to the longest label in the menu (10..18 characters + 2 spaces), so long labels
-    such as 'Weekly Sonnet' never touch the bar and every row lines up in Menlo on any screen."""
-    lengths = [len(clean(x.get("label", ""), 16)) for _, r in results if r for x in r.get("rows", [])]
-    return max(10, min(18, max(lengths, default=8) + 2))
+    """Label column sized to the longest label in the menu (8..LABEL_MAX characters + 2 spaces), so long labels
+    such as 'Claude GPT Weekly' never touch the bar and every row lines up in Menlo on any screen."""
+    lengths = [len(clean(x.get("label", ""), LABEL_MAX)) for _, r in results if r for x in r.get("rows", [])]
+    return max(10, min(LABEL_MAX + 2, max(lengths, default=8) + 2))
 
 
 def unpriced_text(count, clickable=False):
@@ -207,7 +216,7 @@ def section(key, r, now, width=DEFAULT_WIDTH, prices_action=None):
         out.append(f"{clean(r['note'])}{_params('size=12', f'color={note_color}', href)}")
     pad = " " * width
     for x in r.get("rows", []):
-        label = clean(x["label"], 16).ljust(width)
+        label = clean(x["label"], LABEL_MAX).ljust(width)
         p = current_percent(x, now)
         if x.get("percent") is not None:
             body = f"{label}unknown" if p is None else f"{label}{bar(p)} {p:>3.0f}%"
@@ -274,6 +283,40 @@ def headline(results, now, choice):
     if best is None:
         return None, None
     return best[0], f"Highest: {NAMES.get(best[1], best[1])} {best[2]} {best[0]:.0f}%"
+
+
+def _percent_text(p):
+    return "–" if p is None else f"{p:.0f}%"
+
+
+def ring_tooltip(results, rings, now):
+    """Tooltip parts with the ring strip, in the menu's order: a provider with a ring gives its 5-hour and weekly
+    percentage (one value for a single-limit provider, "–" where there is none), every other provider its summary.
+    rings: ring.specs() dicts."""
+    by_key = {x["key"]: x for x in rings}
+    parts = []
+    for k, r in results:
+        x = by_key.get(k)
+        if x is None:
+            parts.append(f"{NAMES.get(k, k)} {summary(r, now)}")
+        elif x.get("single"):
+            parts.append(f"{x['name']} {_percent_text(x['right'])}")
+        else:
+            parts.append(f"{x['name']} 5-hour {_percent_text(x['right'])}, weekly {_percent_text(x['left'])}")
+    return parts
+
+
+_BASE64 = re.compile(r"[A-Za-z0-9+/]{4,200000}={0,2}")
+
+
+def strip_param(strip):
+    """`image=<light>,<dark>` for SwiftBar (it picks the first on a light menu bar, the second on a dark one), or
+    None unless both are plain base64 text: nothing else may reach the menu bar line."""
+    if not isinstance(strip, (tuple, list)) or len(strip) != 2:
+        return None
+    if not all(isinstance(x, str) and _BASE64.fullmatch(x) for x in strip):
+        return None
+    return f"image={strip[0]},{strip[1]}"
 
 
 def summary(r, now):
@@ -407,27 +450,39 @@ def chooser_lines(results, choice, launcher_path, toggle_config=None, config_err
 
 
 def menu(results, now=None, refresh=False, settings_path=None, config_error=False, providers=None,
-         launcher_path=None, toggle_config=None, menu_bar=None):
+         launcher_path=None, toggle_config=None, menu_bar=None, rings=None, strip=None, gauge=True):
     """results: [(key, result)] in display order (hidden providers are simply not in the list).
     settings_path: the config file (absolute); config_error: it exists but could not be read.
     providers: [(key, enabled)] -> the "Providers…" item (see `providers_item`), the "Menu bar shows" submenu and
-    the all-off text; None -> none of them. menu_bar: the `menu_bar` setting (see `menu_bar_choice`)."""
+    the all-off text; None -> none of them. menu_bar: the `menu_bar` setting (see `menu_bar_choice`).
+    rings: ring.specs() (the tooltip then lists each ring's values); strip: ring.strip()'s (light, dark) images, the
+    menu bar item is then that image alone; without it (or if it is not plain base64) the gauge and percentage are
+    text, as before. gauge: the "Show gauge and percentage" setting; with it off and no ring, the text says "–"."""
     now = now or time.time()
     choice = menu_bar_choice(menu_bar)
     try:
         top, prefix = headline(results, now, choice)
-        parts = ([prefix] if prefix else []) + [f"{NAMES.get(k, k)} {summary(r, now)}" for k, r in results]
+        if rings:
+            parts = ([prefix] if prefix else []) + ring_tooltip(results, rings, now)
+        else:
+            parts = ([prefix] if prefix else []) + [f"{NAMES.get(k, k)} {summary(r, now)}" for k, r in results]
         tooltip = " · ".join(parts) or "No providers found"
     except Exception:
         top, tooltip = None, "unreadable"
-    c = color(top)
     try:
         width = label_width(results)
     except Exception:
         width = DEFAULT_WIDTH
-    lines = [f"{f'{top:.0f}%' if top is not None else '–'}"
-             f"{_params(f'sfimage={icon(top)}', f'color={c}' if c else None, f'tooltip={quoted(tooltip)}')}",
-             "---"]
+    image = strip_param(strip)
+    if image:
+        lines = [f"{_params(image, f'tooltip={quoted(tooltip, 400)}').lstrip()}", "---"]
+    else:
+        if not gauge and not rings:
+            top = None  # nothing else to show: the gauge with a dash, so the item never disappears
+        c = color(top)
+        lines = [f"{f'{top:.0f}%' if top is not None else '–'}"
+                 f"{_params(f'sfimage={icon(top)}', f'color={c}' if c else None, f'tooltip={quoted(tooltip, 400)}')}",
+                 "---"]
     # "Foundry prices…" (and the click on the section's "no price" line): only with a Foundry section, the
     # Providers… item's data, and a readable config.json.
     has_foundry = any(k == "foundry" for k, _ in results)

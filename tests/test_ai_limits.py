@@ -5,9 +5,10 @@ No test may reach a real provider. Two structural guards enforce it: setUpModule
 module reaches the outside (its subprocess, HTTP and tool-lookup functions, and the home-folder paths it reads) with
 a guard, and load_main() replaces main.call with one, so a test that wants provider data installs its own fake; a
 guard raises RealProviderRead, which no `except Exception` in the plugin can swallow. The windows' osascript call
-(panel.run) is guarded the same way; only the opt-in --gui tests put the real one back. Every run of the plugin as a
-process goes through run_launcher(), which skips all providers except those forced to fail and refuses the window
-switches.
+(panel.run) and the menu bar strip's drawing (ring.run) are guarded the same way; only the opt-in --gui tests put the
+real ones back. load_main() also makes main's menu_bar_strip return None, and the user's logo folder (ring.LOGO_DIR)
+points into the empty guard folder. Every run of the plugin as a process goes through run_launcher(), which skips
+all providers except those forced to fail, passes --no-image (no drawing) and refuses the window switches.
 The default run opens no window and needs no Keychain, network or ~/Library/Caches; it runs on any macOS with
 Python 3.9 or later (CI: GitHub's macOS runner, with the system Python and the latest Python). Time limits are
 generous for slow machines but always shorter than the wrong behaviour they rule out.
@@ -27,14 +28,17 @@ import pwd
 import re
 import select
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import tracemalloc
 import unicodedata
 import unittest
 import urllib.request
+import zlib
 from datetime import datetime, timezone
 from unittest import mock
 
@@ -42,7 +46,7 @@ sys.dont_write_bytecode = True  # keep __pycache__ out of the plugin folder
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from ai_limits import common, panel, render  # noqa: E402
+from ai_limits import common, panel, render, ring  # noqa: E402
 from ai_limits.providers import NAMES, claude, codex, copilot, foundry, gemini  # noqa: E402
 
 PLUGIN = os.path.join(ROOT, "plugin", "ai-limits.5m.sh")
@@ -67,7 +71,8 @@ def provider_guard(where):
 # and the guard is back when their patch ends). common's own functions stay real: the loopback tests use them.
 GUARDED_CALLS = [(claude, "run"), (claude, "https_json"), (codex, "find_tool"), (copilot, "run"),
                  (copilot, "find_tool"), (foundry, "run"), (foundry, "find_tool"), (gemini, "https_json"),
-                 (gemini, "localhost_json"), (panel, "run")]  # panel.run: a real window
+                 (gemini, "localhost_json"), (panel, "run"),  # panel.run: a real window
+                 (ring, "run")]  # ring.run: osascript drawing the menu bar strip
 _GUARD_HOME = tempfile.TemporaryDirectory()
 
 
@@ -81,7 +86,8 @@ def setUpModule():
     for module, name, path in [(gemini, "ANTIGRAVITY_DIR", os.path.join(empty, "antigravity")),
                                (gemini, "HUB", os.path.join(empty, "antigravity", "daemon", "hub_*.json")),
                                (gemini, "CLI_CREDENTIALS", os.path.join(empty, "oauth_creds.json")),
-                               (codex, "SESSIONS", os.path.join(empty, "sessions"))]:
+                               (codex, "SESSIONS", os.path.join(empty, "sessions")),
+                               (ring, "LOGO_DIR", os.path.join(empty, "logos"))]:
         mock.patch.object(module, name, path).start()
 
 
@@ -100,7 +106,7 @@ def run_launcher(args, *, config, cache, env=None, command=(PLUGIN,), allow_real
     for path in (config, cache):
         assert os.path.realpath(path).startswith(temp + os.sep), f"not a temporary path: {path}"
     assert not {"--choose", "--prices"} & set(args), "a window switch: test it in-process with a fake window"
-    argv = [*command, "--config", config, "--cache", cache, *args]
+    argv = [*command, "--config", config, "--cache", cache, *args, "--no-image"]
     if not allow_real_providers:
         failing = set()
         for i, arg in enumerate(args):
@@ -120,6 +126,12 @@ def res(title="X", rows=None, status="ok", **k):
 
 def row(label, percent=None, value=None, resets=None):
     return {"label": label, "percent": percent, "value": value, "resets": resets}
+
+
+def long_ints():
+    """Integer literals common.loads refuses: one digit over common.MAX_INT_DIGITS, and 1 MB (Python 3.9 took over
+    7 s to convert it)."""
+    return ["7" * (common.MAX_INT_DIGITS + 1), "7" * common.MAX_BODY]
 
 
 # ---- SwiftBar's menu parser, ported ------------------------------------------------------------------------
@@ -691,23 +703,36 @@ class Panel(unittest.TestCase):
         hostile = panel.arguments(nasty)
         self.assertEqual(plain[:5], ["/usr/bin/osascript", "-l", "JavaScript", "-e", panel.SCRIPT])
         self.assertIs(hostile[4], panel.SCRIPT)  # byte-identical whatever the input
-        self.assertEqual(hostile[5:], ["panel", "claude", "x'); $.NSTask.launch(); ('", "on", "\n\"\\`${x}",
-                                       "codex", "line\nbreak", "off", "' + run() + '"])
-        self.assertEqual(plain[5:9], ["panel", "claude", "Claude", "on"])
+        self.assertEqual(hostile[5:], ["panel", "on", "gemini", "claude", "x'); $.NSTask.launch(); ('", "on",
+                                       "\n\"\\`${x}", "codex", "line\nbreak", "off", "' + run() + '"])
+        self.assertEqual(plain[5:11], ["panel", "on", "gemini", "claude", "Claude", "on"])
         self.assertEqual(plain[-4:], ["copilot", "GitHub Copilot", "on", render.NOT_SET_UP])
+        self.assertEqual(panel.arguments(self.ROWS, gauge=False, groups={"gemini": "3p"})[5:8], ["panel", "off", "3p"])
         with self.assertRaises(ValueError):
             panel.arguments(self.ROWS, "anything")
+        for groups in ({"gemini": "evil"}, {"gemini": "3p\nx"}, {"gemini": ""}):
+            with self.assertRaises(ValueError):
+                panel.arguments(self.ROWS, groups=groups)  # only the fixed choices reach the script
         self.assertNotIn("argv[", panel.SCRIPT.split("function run(argv)")[0])  # no code before run()
 
     def test_output_is_parsed_strictly(self):
         names = ("claude", "codex", "copilot")
-        good = "claude=on\ncodex=off\ncopilot=on\n"
-        self.assertEqual(panel.parse(0, good, names), {"claude": True, "codex": False, "copilot": True})
-        self.assertEqual(panel.parse(0, good.rstrip("\n"), names), {"claude": True, "codex": False, "copilot": True})
+        providers = "claude=on\ncodex=off\ncopilot=on\n"
+        good = providers + "gauge=off\nring_gemini=3p\n"
+        expected = {"providers": {"claude": True, "codex": False, "copilot": True}, "gauge": False,
+                    "groups": {"gemini": "3p"}}
+        self.assertEqual(panel.parse(0, good, names), expected)
+        self.assertEqual(panel.parse(0, good.rstrip("\n"), names), expected)
+        self.assertEqual(panel.parse(0, providers + "gauge=on\nring_gemini=gemini\n", names)["gauge"], True)
         for code, out in [(1, good), (0, "cancel\n"), (0, ""), (0, "\n"), (0, "garbage"),
-                          (0, "claude=on\ncodex=off\n"),                                # missing key
+                          (0, "claude=on\ncodex=off\ngauge=on\nring_gemini=3p\n"),     # missing key
+                          (0, providers),                                                # no settings lines
+                          (0, providers + "gauge=on\n"), (0, providers + "ring_gemini=3p\n"),
+                          (0, providers + "ring_gemini=3p\ngauge=on\n"),                 # settings swapped
+                          (0, providers + "gauge=on\nring_gemini=evil\n"), (0, providers + "gauge=x\nring_gemini=3p\n"),
+                          (0, providers + "gauge=on\ngauge=on\nring_gemini=3p\n"),      # gauge twice
                           (0, good + "evil=on\n"), (0, good.replace("copilot", "gemini")),  # unknown key
-                          (0, good + "claude=off\n"),                                    # repeated key
+                          (0, "claude=off\n" + good),                                    # repeated key
                           (0, good.replace("off", "maybe")), (0, good.replace("=", " = ")),
                           (0, good.replace("\n", "\r\n")), (0, good + "\n"), (0, " " + good),
                           (0, good + "#active=true\n"), (0, None), (-9, "")]:
@@ -866,6 +891,119 @@ class Common(unittest.TestCase):
                 common.localhost_json(big.server_port, "/x", {}, {})
         with loopback_server(body=b" " * (common.MAX_BODY - 2) + b"{}") as fits:
             self.assertEqual(common.localhost_json(fits.server_port, "/x", {}, {}), {})
+
+    def assert_not_json(self, server):
+        """The server's answer is refused with the fixed message, an exact RuntimeError without a chained cause."""
+        with self.assertRaises(RuntimeError) as caught:
+            common.localhost_json(server.server_port, "/x", {}, {})
+        self.assertIs(type(caught.exception), RuntimeError)  # RecursionError is a RuntimeError too
+        self.assertEqual(str(caught.exception), "response is not JSON")
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertTrue(caught.exception.__suppress_context__)
+
+    def test_integer_over_the_digit_limit_is_not_json(self):
+        digits = "7" * (common.MAX_INT_DIGITS + 1)
+        bodies = {"bare": digits, "negative": "-" + digits,
+                  "nested": '{"response": {"groups": [{"name": "demo", "used": ' + digits + "}]}}",
+                  "in a list": "[1, 2.5, -" + digits + "]"}
+        with loopback_server() as server:
+            for what, text in bodies.items():
+                with self.subTest(what):
+                    server.reply = (200, {}, text.encode())
+                    self.assert_not_json(server)
+
+    def test_integer_at_the_digit_limit_is_read(self):
+        digits = "7" * common.MAX_INT_DIGITS
+        with loopback_server() as server:
+            for text in (digits, "-" + digits):  # the sign is not a digit
+                server.reply = (200, {}, text.encode())
+                value = common.localhost_json(server.server_port, "/x", {}, {})
+                self.assertIs(type(value), int)
+                self.assertTrue(value == int(text), text[:8])
+            server.reply = (200, {}, ('{"response": {"groups": [' + digits + "]}}").encode())
+            value = common.localhost_json(server.server_port, "/x", {}, {})["response"]["groups"][0]
+            self.assertTrue(type(value) is int and value == int(digits))
+
+    def test_ordinary_numbers_are_read_as_before(self):
+        fraction = "0." + "1" * 5000
+        whole = "1" * 5000 + ".0"  # over the digit limit, but a float: read as before (inf), never converted as an int
+        texts = ["0", "42", "-7", "1234567890123456789012", "0.25", "-12.5", "1e3", "-2.5E-3", "1E+2", fraction, whole]
+        expected = [0, 42, -7, 1234567890123456789012, 0.25, -12.5, 1000.0, -0.0025, 100.0, float(fraction),
+                    float(whole)]
+        with loopback_server(body=('{"values": [' + ", ".join(texts) + "]}").encode()) as server:
+            values = common.localhost_json(server.server_port, "/x", {}, {})["values"]
+        self.assertEqual([type(v) for v in values], [int] * 4 + [float] * 7)
+        self.assertEqual(values, expected)
+
+    def test_1_mb_integer_is_refused_quickly(self):
+        with loopback_server(body=b"9" * common.MAX_BODY) as server:  # took over 7 s to convert on Python 3.9
+            start = time.monotonic()
+            self.assert_not_json(server)
+            seconds = time.monotonic() - start
+        self.assertLess(seconds, 1.0)
+
+    def test_deep_nesting_is_read_or_is_not_json(self):
+        with loopback_server(body=b"[" * 100000 + b"]" * 100000) as server:
+            try:
+                value = common.localhost_json(server.server_port, "/x", {}, {})
+            except RuntimeError:
+                self.assert_not_json(server)  # too deep for this Python: the fixed error, never a RecursionError
+            else:
+                self.assertIs(type(value), list)  # (never printed or compared: that would recurse as deep)
+
+    def assert_loads_refuses(self, text):
+        """common.loads raises a ValueError (json.JSONDecodeError is one), never another type."""
+        with self.assertRaises(Exception) as caught:
+            common.loads(text)
+        self.assertIsInstance(caught.exception, ValueError)
+        return caught.exception
+
+    def test_loads_refuses_text_that_is_not_json(self):
+        for text in ("{not json", "", "[1, 2", '{"a": 1} extra', b"{not json", b"\xff\xfe{"):
+            with self.subTest(text):
+                self.assert_loads_refuses(text)
+
+    def test_loads_refuses_an_integer_over_the_digit_limit(self):
+        digits = "7" * (common.MAX_INT_DIGITS + 1)
+        texts = {"bare": digits, "negative": "-" + digits,
+                 "nested": '{"response": {"groups": [{"name": "demo", "used": ' + digits + "}]}}",
+                 "in a list": "[1, 2.5, -" + digits + "]"}
+        for what, text in texts.items():
+            for value in (text, text.encode()):
+                with self.subTest(what, type=type(value).__name__):
+                    self.assert_loads_refuses(value)
+
+    def test_loads_reads_ordinary_values_as_before(self):
+        digits = "7" * common.MAX_INT_DIGITS
+        text = ('{"a": [0, 42, -7, ' + digits + ", -" + digits + ', 0.25, -12.5, 1e3, -2.5E-3, "x", true, null], '
+                '"b": {"c": "d\\u00e9"}}')
+        expected = {"a": [0, 42, -7, int(digits), -int(digits), 0.25, -12.5, 1000.0, -0.0025, "x", True, None],
+                    "b": {"c": "dé"}}
+        for value in (text, text.encode(), text.encode("utf-16")):  # bytes as json.loads takes them
+            with self.subTest(type=type(value).__name__):
+                found = common.loads(value)
+                self.assertTrue(found == expected)  # (not assertEqual: a failure would print 4300 digits)
+                self.assertEqual([type(v) for v in found["a"]], [type(v) for v in expected["a"]])
+        self.assertEqual(common.loads("1" * 5000 + ".0"), float("inf"))  # a float, never converted as an int
+
+    def test_loads_refuses_a_1_mb_integer_quickly(self):
+        start = time.monotonic()
+        for text in (b"9" * common.MAX_BODY, '{"n": -' + "9" * common.MAX_BODY + "}"):
+            self.assert_loads_refuses(text)
+        self.assertLess(time.monotonic() - start, 1.0)
+
+    def test_loads_deep_nesting_is_read_or_refused(self):
+        text = "[" * 100000 + "]" * 100000
+        for value in (text, text.encode()):
+            try:
+                found = common.loads(value)
+            except Exception as e:  # too deep for this Python: a fixed ValueError, never a RecursionError
+                self.assertIs(type(e), ValueError)
+                self.assertEqual(str(e), "nested too deep")
+                self.assertIsNone(e.__cause__)
+                self.assertTrue(e.__suppress_context__)
+            else:
+                self.assertIs(type(found), list)
 
     def test_to_epoch(self):
         import calendar
@@ -1040,6 +1178,1455 @@ class Providers(unittest.TestCase):
         self.assertAlmostEqual(foundry.estimate(tokens, prices), 0.008 + 1.75 + 0.75 + 0.9)
         self.assertIsNone(foundry.estimate({"ephemeral1hInputTokens": 5}, prices))  # unpriced type
 
+    # Text from other tools with one integer over common.MAX_INT_DIGITS (otherwise valid JSON) ends exactly where text
+    # that is not JSON ends. Python 3.9 used to convert it (and a 1 MB one took over 7 s).
+
+    def test_codex_session_record_with_too_long_an_integer_is_skipped_like_one_that_is_not_json(self):
+        record = ('{"type": "event_msg", "payload": {"rate_limits": {"primary": {"used_percent": %s, '
+                  '"window_minutes": 300, "resets_at": 1800003600}, "demo_count": %s}}}')
+        bad = {"not JSON": (record % (88, 7))[:-1],
+               "nested too deep": '{"rate_limits": ' + "[" * 5000 + "]" * 5000 + "}"}
+        bad.update((f"{len(digits)} digits", record % (88, digits)) for digits in long_ints())
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(codex, "SESSIONS", d):
+            folder = os.path.join(d, "2031", "05", "26")
+            os.makedirs(folder)
+            path = os.path.join(folder, "rollout-demo.jsonl")
+            for what, newest in [("valid", record % (88, 7))] + list(bad.items()):
+                with self.subTest(what):
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(record % (12, 7) + "\n" + newest + "\n")
+                    start = time.monotonic()
+                    r = codex._fallback()
+                    self.assertLess(time.monotonic() - start, 1.0)
+                    self.assertEqual([x["percent"] for x in r["rows"]], [88.0 if what == "valid" else 12.0])
+
+    def test_copilot_output_with_too_long_an_integer_fails_like_output_that_is_not_json(self):
+        answer = ('{"quota_reset_date_utc": "2032-02-01T00:00:00.000Z", "demo_id": %s, '
+                  '"quota_snapshots": {"premium_interactions": {"entitlement": 300, "remaining": 120}}}')
+        with mock.patch.object(copilot, "find_tool", return_value="/opt/demo/gh"):
+            with mock.patch.object(copilot, "run", return_value=(0, answer % 7, "")):
+                self.assertEqual(copilot.read({})["rows"][0]["value"], "180 / 300")
+            for what, out in [("not JSON", "{not json")] + [(f"{len(d)} digits", answer % d) for d in long_ints()]:
+                with self.subTest(what), mock.patch.object(copilot, "run", return_value=(0, out, "")):
+                    start = time.monotonic()
+                    with self.assertRaises(ValueError):  # main shows its fixed "Couldn't read"
+                        copilot.read({})
+                    self.assertLess(time.monotonic() - start, 1.0)
+
+    def test_claude_keychain_item_with_too_long_an_integer_fails_like_one_that_is_not_json(self):
+        item = '{"claudeAiOauth": {"accessToken": "demo-token", "expiresAt": 4102444800000, "demoCount": %s}}'
+        calls = []
+
+        def fake_https(url, headers, **kwargs):
+            calls.append(url)
+            return {"limits": [{"kind": "session", "percent": 5}]}
+        with mock.patch.object(claude, "https_json", fake_https):
+            with mock.patch.object(claude, "run", return_value=(0, item % 7, "")):
+                self.assertEqual(claude.read({})["rows"][0]["percent"], 5.0)
+            self.assertEqual(len(calls), 1)
+            calls.clear()
+            for what, out in [("not JSON", "{not json")] + [(f"{len(d)} digits", item % d) for d in long_ints()]:
+                with self.subTest(what), mock.patch.object(claude, "run", return_value=(0, out, "")):
+                    start = time.monotonic()
+                    with self.assertRaises(ValueError):  # main shows its fixed "Couldn't read"
+                        claude.read({})
+                    self.assertLess(time.monotonic() - start, 1.0)
+        self.assertEqual(calls, [])  # the token never went out
+
+    def test_claude_stats_file_with_too_long_an_integer_is_ignored_like_one_that_is_not_json(self):
+        stats = '{"dailyModelTokens": [{"date": "%s", "tokensByModel": {"claude-demo": 1200}}], "demoCount": %s}'
+        expired = '{"claudeAiOauth": {"accessToken": "demo-token", "expiresAt": 1000}}'
+        real_open = open
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "stats-cache.json")
+
+            def fake_open(file, *args, **kwargs):
+                """claude._fallback's file, redirected: ~/.claude is never opened."""
+                if not str(file).endswith(os.path.join(".claude", "stats-cache.json")):
+                    raise AssertionError(f"unexpected open in claude: {file}")
+                return real_open(path, *args, **kwargs)
+            with mock.patch.object(claude, "open", fake_open, create=True), \
+                    mock.patch.object(claude, "run", return_value=(0, expired, "")):
+                today = datetime.now().strftime("%Y-%m-%d")  # claude uses the local date too
+                bad = [("not JSON", "{not json")] + [(f"{len(x)} digits", stats % (today, x)) for x in long_ints()]
+                for what, text in [("valid", stats % (today, 7))] + bad:
+                    with self.subTest(what):
+                        with real_open(path, "w", encoding="utf-8") as f:
+                            f.write(text)
+                        start = time.monotonic()
+                        r = claude.read({})
+                        self.assertLess(time.monotonic() - start, 1.0)
+                        self.assertEqual((r["status"], r["note"]),
+                                         ("expired", "Session expired: open Claude Code once"))
+                        self.assertEqual(r["details"], ["Today demo: 1.2K tokens"] if what == "valid"
+                                         else ["No local record for today"])
+
+    def test_gemini_hub_file_with_too_long_an_integer_is_skipped_like_one_that_is_not_json(self):
+        hub = '{"pid": %d, "httpPort": %d, "csrfToken": "abcdefgh12", "demoCount": %s}'
+        digits = "7" * (common.MAX_INT_DIGITS + 1)  # only the first 64 KB are read
+        bad = {"not JSON": (hub % (os.getpid(), 2222, 7))[:-1],
+               f"{len(digits)} digits": hub % (os.getpid(), 2222, digits),
+               "nested too deep": "[" * 30000 + "]" * 30000}
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(gemini, "HUB", os.path.join(d, "hub_*.json")):
+            older, newest = os.path.join(d, "hub_1111.json"), os.path.join(d, "hub_2222.json")
+            for path, text, when in ((older, hub % (os.getpid(), 1111, 7), NOW - 60),
+                                     (newest, hub % (os.getpid(), 2222, 7), NOW)):
+                with open(path, "w") as f:
+                    f.write(text)
+                os.chmod(path, 0o600)
+                os.utime(path, (when, when))
+            self.assertEqual(gemini.hub(), (2222, "abcdefgh12"))
+            for what, text in bad.items():
+                with self.subTest(what):
+                    with open(newest, "w") as f:
+                        f.write(text)
+                    os.utime(newest, (NOW, NOW))
+                    self.assertEqual(gemini.hub(), (1111, "abcdefgh12"))  # the newest file is skipped
+
+    def test_gemini_cli_credentials_with_too_long_an_integer_are_ignored_like_ones_that_are_not_json(self):
+        creds = '{"access_token": "demo-token", "expiry_date": 4102444800000, "demoCount": %s}'
+        calls = []
+
+        def fake_https(url, headers, timeout=10, body=None):
+            calls.append(url)
+            return {"buckets": [{"modelId": "gemini-demo", "remainingFraction": 0.5}]}
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "oauth_creds.json")
+            with mock.patch.object(gemini, "CLI_CREDENTIALS", path), \
+                    mock.patch.object(gemini, "https_json", fake_https):
+                with open(path, "w") as f:
+                    f.write(creds % 7)
+                self.assertEqual([x["label"] for x in gemini._gemini_cli()], ["demo"])
+                self.assertEqual(len(calls), 2)
+                calls.clear()
+                for what, text in [("not JSON", "{not json")] + [(f"{len(x)} digits", creds % x) for x in long_ints()]:
+                    with self.subTest(what):
+                        with open(path, "w") as f:
+                            f.write(text)
+                        start = time.monotonic()
+                        self.assertIsNone(gemini._gemini_cli())
+                        self.assertLess(time.monotonic() - start, 1.0)
+        self.assertEqual(calls, [])  # the token never went out
+
+
+def gemini_summary():
+    """RetrieveUserQuotaSummary as observed on one Google AI Pro account with every limit untouched (Nov 2026): the
+    same keys, value types and order (weekly before 5h; remainingFraction the int 1; resetTime on the Gemini buckets
+    only: the 3p windows had not started yet). The texts of the descriptions and the times are made up. After light
+    use the same account answered as in gemini_summary_used()."""
+    return {"response": {"groups": [
+        {"displayName": "Gemini Models", "description": "Example group description.", "buckets": [
+            {"bucketId": "gemini-weekly", "displayName": "Weekly Limit Remaining", "window": "weekly",
+             "remainingFraction": 1, "resetTime": "2031-05-30T08:00:00Z"},
+            {"bucketId": "gemini-5h", "displayName": "Five Hour Limit Remaining", "window": "5h",
+             "remainingFraction": 1, "resetTime": "2031-05-26T13:00:00Z"}]},
+        {"displayName": "Claude and GPT models", "description": "Example group description.", "buckets": [
+            {"bucketId": "3p-weekly", "displayName": "Weekly Limit Remaining", "window": "weekly",
+             "remainingFraction": 1},
+            {"bucketId": "3p-5h", "displayName": "Five Hour Limit Remaining", "window": "5h",
+             "remainingFraction": 1}]}],
+        "description": "Example summary description."}}
+
+
+def gemini_summary_used():
+    """RetrieveUserQuotaSummary as observed on the same account after one short message to a Gemini model and one to
+    a Claude model (Nov 2026): every bucket has a float remainingFraction below 1, a resetTime and its own
+    `description`. The fractions are of the observed kind (0.9894 and 0.9566 were seen); the texts and times are made
+    up."""
+    def bucket(bucket_id, window, fraction, reset):
+        return {"bucketId": bucket_id, "displayName": "Weekly Limit Remaining" if window == "weekly"
+                else "Five Hour Limit Remaining", "description": "Example bucket description.", "window": window,
+                "remainingFraction": fraction, "resetTime": reset}
+    return {"response": {"groups": [
+        {"displayName": "Gemini Models", "description": "Example group description.", "buckets": [
+            bucket("gemini-weekly", "weekly", 0.9894, "2031-05-30T08:00:00Z"),
+            bucket("gemini-5h", "5h", 0.9566, "2031-05-26T13:00:00Z")]},
+        {"displayName": "Claude and GPT models", "description": "Example group description.", "buckets": [
+            bucket("3p-weekly", "weekly", 0.9917, "2031-05-30T09:30:00Z"),
+            bucket("3p-5h", "5h", 0.9701, "2031-05-26T14:30:00Z")]}],
+        "description": "Example summary description."}}
+
+
+def gemini_status():
+    """GetUserStatus in the shape the per-model rows have always read (made-up values)."""
+    return {"userStatus": {"userTier": {"id": "demo-tier", "name": "Example Plan"},
+                           "cascadeModelConfigData": {"clientModelConfigs": [
+                               {"label": "Gemini Demo Pro", "quotaInfo": {"remainingFraction": 0.35,
+                                                                          "resetTime": "2031-05-28T00:00:00Z"}},
+                               {"label": "Example Model (Thinking)",
+                                "quotaInfo": {"remainingFraction": 1, "resetTime": "2031-06-01T10:00:00Z"}}]}}}
+
+
+SUMMARY_LABELS = ["Gemini 5-hour", "Gemini Weekly", "Claude GPT 5-hour", "Claude GPT Weekly"]
+
+
+class GeminiQuotaSummary(unittest.TestCase):
+    """Antigravity's quota summary (two groups with a 5-hour and a weekly window) and the fallback to the per-model
+    rows. Tests whose shape was not observed on a real account say so ("assumed shape")."""
+
+    def read(self, summary=None, status=None):
+        """antigravity() against a fake local server: `summary` and `status` are the answers to the two requests
+        (an exception instance is raised instead). Returns (rows, details, calls)."""
+        calls = []
+
+        def fake(port, path, headers, body, timeout=8):
+            calls.append((path, headers, body))
+            answer = summary if path == gemini.SUMMARY_PATH else status if path == gemini.STATUS_PATH else None
+            if answer is None:
+                raise AssertionError(f"unexpected request {path}")
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        with mock.patch.object(gemini, "localhost_json", fake):
+            rows, details = gemini.antigravity(1234, "demo-csrf-token")
+        return rows, details, calls
+
+    def summary_with(self, *buckets, display="Gemini Models"):
+        return {"response": {"groups": [{"displayName": display, "buckets": list(buckets)}]}}
+
+    def test_observed_summary_gives_four_rows(self):
+        rows, details, calls = self.read(gemini_summary(), gemini_status())
+        self.assertEqual([x["label"] for x in rows], SUMMARY_LABELS)  # per group 5-hour first, though sent second
+        self.assertEqual([x["percent"] for x in rows], [0.0] * 4)
+        self.assertEqual(rows[0]["resets"], common.to_epoch("2031-05-26T13:00:00Z"))
+        self.assertEqual(rows[1]["resets"], common.to_epoch("2031-05-30T08:00:00Z"))
+        self.assertEqual([rows[2]["resets"], rows[3]["resets"]], [None, None])  # 3p windows had not started yet
+        self.assertEqual([(x["group"], x["window"]) for x in rows],
+                         [("gemini", "5h"), ("gemini", "weekly"), ("3p", "5h"), ("3p", "weekly")])
+        self.assertEqual(details, ["Plan: Example Plan"])  # GetUserStatus adds only the plan line, no model rows
+        for label in SUMMARY_LABELS:
+            self.assertTrue(render.CHOICE_LABEL.fullmatch(label), label)
+        self.assertEqual(gemini.KIND.pattern, render.KIND.pattern)  # else normalize would drop the machine fields
+
+    def test_summary_request_comes_first_with_an_empty_body(self):
+        _, _, calls = self.read(gemini_summary(), gemini_status())
+        self.assertEqual([c[0] for c in calls], [gemini.SUMMARY_PATH, gemini.STATUS_PATH])
+        self.assertEqual(calls[0][2], {})  # never forceRefresh
+        self.assertEqual(calls[1][2], {"metadata": gemini.META})
+        for _, headers, _ in calls:
+            self.assertEqual(headers, {"Connect-Protocol-Version": "1", "X-Codeium-Csrf-Token": "demo-csrf-token"})
+        self.assertTrue(gemini.SUMMARY_PATH.startswith("/exa.language_server_pb.LanguageServerService/"))
+
+    def test_observed_partly_used_summary(self):
+        """Observed shape, not assumed (second probe, after light use): float fractions below 1, a resetTime on all
+        four buckets including 3p, and a `description` on each bucket, which is ignored."""
+        rows, details, _ = self.read(gemini_summary_used(), gemini_status())
+        self.assertEqual([x["label"] for x in rows], SUMMARY_LABELS)
+        for x, fraction in zip(rows, (0.9566, 0.9894, 0.9701, 0.9917)):
+            self.assertAlmostEqual(x["percent"], (1 - fraction) * 100)
+        self.assertEqual([x["resets"] for x in rows],
+                         [common.to_epoch(t) for t in ("2031-05-26T13:00:00Z", "2031-05-30T08:00:00Z",
+                                                       "2031-05-26T14:30:00Z", "2031-05-30T09:30:00Z")])
+        self.assertEqual([(x["group"], x["window"]) for x in rows],
+                         [("gemini", "5h"), ("gemini", "weekly"), ("3p", "5h"), ("3p", "weekly")])
+        self.assertEqual(details, ["Plan: Example Plan"])  # no description text reaches the menu
+        r = render.normalize(gemini.result("GEMINI", rows=rows, details=details))
+        lines = menu_lines(render.menu([("gemini", r)], NOW))
+        for label, shown in zip(SUMMARY_LABELS, ("4%", "1%", "3%", "1%")):
+            line = next(x for x in lines if x.startswith(label + " "))
+            self.assertRegex(line.split(" | ")[0], rf" +{shown}$")
+            self.assertIn("↻", lines[lines.index(line) + 1])  # every window has a reset line now
+        self.assertNotIn("Example bucket description", "\n".join(lines))
+
+    def test_exhausted_and_out_of_range_limits_assumed_shape(self):
+        """Assumed shape, not observed: an explicit 0 (exhausted) and values outside 0..1. A fraction below 1 is
+        observed (test_observed_partly_used_summary); 0.35 here only checks the arithmetic."""
+        rows, _, _ = self.read(self.summary_with(
+            {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0, "resetTime": "2031-05-26T13:00:00Z"},
+            {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.35}), gemini_status())
+        self.assertEqual([x["label"] for x in rows], ["Gemini 5-hour", "Gemini Weekly"])
+        self.assertAlmostEqual(rows[0]["percent"], 100.0)
+        self.assertAlmostEqual(rows[1]["percent"], 65.0)
+        rows, _, _ = self.read(self.summary_with({"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 1.7},
+                                                 {"bucketId": "gemini-weekly", "window": "weekly",
+                                                  "remainingFraction": -0.5}), gemini_status())
+        self.assertEqual([x["percent"] for x in rows], [0.0, 100.0])  # clamped
+
+    def test_limit_without_a_value_is_a_detail_line_not_zero_assumed_shape(self):
+        """Assumed shape, not observed: only remainingAmount, no remaining value at all, or disabled."""
+        rows, details, _ = self.read(self.summary_with(
+            {"bucketId": "gemini-5h", "window": "5h", "remainingAmount": "40"},
+            {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.5},
+            display="Gemini Models"), gemini_status())
+        self.assertEqual([x["label"] for x in rows], ["Gemini Weekly"])
+        self.assertEqual(details, ["Gemini 5-hour: no value reported", "Plan: Example Plan"])
+        summary = gemini_summary()
+        groups = summary["response"]["groups"]
+        del groups[1]["buckets"][0]["remainingFraction"]  # 3p-weekly: no value at all
+        groups[1]["buckets"][1]["disabled"] = True  # 3p-5h: off
+        groups[1]["buckets"][1]["remainingFraction"] = "0.5"  # text, not a number
+        rows, details, _ = self.read(summary, gemini_status())
+        self.assertEqual([x["label"] for x in rows], ["Gemini 5-hour", "Gemini Weekly"])
+        self.assertEqual(details, ["Claude GPT 5-hour: no value reported", "Claude GPT Weekly: no value reported",
+                                   "Plan: Example Plan"])
+        for bad in (True, None, float("nan"), float("inf"), [0.5], {"v": 1}):
+            rows, details, _ = self.read(self.summary_with(
+                {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": bad},
+                {"bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 1}), gemini_status())
+            self.assertEqual([x["label"] for x in rows], ["Gemini Weekly"], repr(bad))
+            self.assertIn("Gemini 5-hour: no value reported", details, repr(bad))
+
+    def test_unknown_prefix_and_window_get_safe_labels_assumed_shape(self):
+        """Assumed shape, not observed: group and window names the code does not know."""
+        cases = [
+            ({"bucketId": "img-daily", "window": "daily"}, "Image tools", "Image tools Daily"),
+            ({"bucketId": "img-daily", "window": "daily"}, "Image Models", "Image Daily"),
+            ({"bucketId": "x-5h", "window": "5h"}, "Ünïcode | bash=/bin/sh \"q\" (beta) $x",
+             "Unicode bash bin sh q b 5-hour"),
+            ({"bucketId": "gemini-monthly", "window": "monthly"}, "ignored", "Gemini Monthly"),
+            ({"bucketId": "3p-5h"}, "ignored", "Claude GPT 5-hour"),  # no window: the bucketId's last part
+            ({"bucketId": "odd", "window": "w" * 40}, "", "Odd " + "W" + "w" * 11),
+            ({"window": "5h"}, None, "Group 1 5-hour"),
+            ({"bucketId": "--", "window": "..."}, "-- . --", "Group 1 Limit"),
+            ({"bucketId": "z-5h", "window": "5h"}, "A" * 40, "A" * 23 + " 5-hour"),
+        ]
+        for bucket, display, label in cases:
+            group = {"buckets": [dict(bucket, remainingFraction=0.5)]}
+            if display is not None:
+                group["displayName"] = display
+            rows, _, _ = self.read({"response": {"groups": [group]}}, gemini_status())
+            self.assertEqual([x["label"] for x in rows], [label], (bucket, display))
+            self.assertTrue(render.CHOICE_LABEL.fullmatch(rows[0]["label"]), rows[0]["label"])
+            self.assertIsNotNone(render.choice_param("gemini", rows[0]["label"]))
+            self.assertLessEqual(len(rows[0]["label"]), 30)
+
+    def test_same_label_twice_is_numbered_assumed_shape(self):
+        """Assumed shape, not observed: two groups that would get the same label."""
+        summary = {"response": {"groups": [
+            {"displayName": "Extra", "buckets": [{"bucketId": "a-5h", "window": "5h", "remainingFraction": 1}]},
+            {"displayName": "Extra models", "buckets": [{"bucketId": "b-5h", "window": "5h",
+                                                          "remainingFraction": 0.5}]}]}}
+        rows, _, _ = self.read(summary, gemini_status())
+        self.assertEqual([x["label"] for x in rows], ["Extra 5-hour", "Extra 5-hour 2"])
+        self.assertEqual([x["group"] for x in rows], ["a", "b"])
+        self.assertTrue(all(render.CHOICE_LABEL.fullmatch(x["label"]) for x in rows))
+        many = {"response": {"groups": [{"displayName": "B" * 40, "buckets": [
+            {"bucketId": f"g{i}-5h", "window": "5h", "remainingFraction": 1}]} for i in range(12)]}}
+        rows, _, _ = self.read(many, gemini_status())
+        labels = [x["label"] for x in rows]
+        self.assertEqual(len(set(labels)), 12)  # numbered up to "... 12", still within 30 characters
+        self.assertTrue(all(render.CHOICE_LABEL.fullmatch(x) for x in labels), labels)
+
+    def test_machine_fields_only_take_short_lowercase_ids_assumed_shape(self):
+        """Assumed shape, not observed: ids that are not short lowercase tokens give no machine field."""
+        rows, _, _ = self.read(self.summary_with(
+            {"bucketId": "Gemini Pro-5H", "window": "5H", "remainingFraction": 1},
+            {"bucketId": "x" * 20 + "-weekly", "window": "weekly", "remainingFraction": 1}), gemini_status())
+        self.assertEqual([(x["label"], x["group"], x["window"]) for x in rows],
+                         [("Gemini Weekly", None, "weekly"), ("Gemini 5H", None, None)])  # known windows first
+        rows, _, _ = self.read(self.summary_with({"bucketId": "3p-5h", "remainingFraction": 1}), gemini_status())
+        self.assertEqual([(x["label"], x["group"], x["window"]) for x in rows], [("Claude GPT 5-hour", "3p", "5h")])
+
+    def assert_well_formed(self, rows, details):
+        """What any summary must give, however large the answer: few rows and lines, and unique labels the menu
+        accepts."""
+        self.assertLessEqual(len(rows) + len(details), gemini.MAX_GROUPS * gemini.MAX_BUCKETS)
+        labels = [x["label"] for x in rows]
+        self.assertEqual(len(set(labels)), len(labels), labels)
+        for x in rows:
+            self.assertTrue(render.CHOICE_LABEL.fullmatch(x["label"]), x["label"])
+            for field in ("window", "group"):
+                self.assertTrue(x[field] is None or render.KIND.fullmatch(x[field]), x[field])
+        for line in details:
+            self.assertLessEqual(len(line), 50)  # a label of at most 30 characters and ": no value reported"
+
+    def test_thousands_of_buckets_give_only_the_first_rows_assumed_shape(self):
+        """Assumed shape, not observed: one group with far more buckets than a real answer (which has two). Only its
+        first MAX_BUCKETS buckets are looked at; the cut comes before the sorting."""
+        same = {"bucketId": "x-5h", "window": "5h", "remainingFraction": 0.5}
+        weekly = {"bucketId": "x-weekly", "window": "weekly", "remainingFraction": 0.25}
+        numbered = ["Extra 5-hour"] + [f"Extra 5-hour {n}" for n in range(2, gemini.MAX_BUCKETS + 1)]
+        rows, details = gemini.summary_rows(self.summary_with(*[dict(same) for _ in range(4000)], display="Extra"))
+        self.assertEqual(([x["label"] for x in rows], details), (numbered, []))
+        self.assert_well_formed(rows, details)
+        buckets = [dict(weekly) for _ in range(gemini.MAX_BUCKETS)] + [dict(same) for _ in range(4000)]
+        rows, details = gemini.summary_rows(self.summary_with(*buckets, display="Extra"))
+        self.assertEqual([x["window"] for x in rows], ["weekly"] * gemini.MAX_BUCKETS)  # 5-hour ones: after the cut
+        self.assert_well_formed(rows, details)
+        buckets = [dict(same)] + [{"bucketId": "x-5h", "window": "5h"} for _ in range(4000)]  # no value: a line each
+        rows, details = gemini.summary_rows(self.summary_with(*buckets, display="Extra"))
+        self.assertEqual(([x["label"] for x in rows], details),
+                         (["Extra 5-hour"], ["Extra 5-hour: no value reported"] * (gemini.MAX_BUCKETS - 1)))
+        self.assert_well_formed(rows, details)
+        buckets = [None, 5, "x", []] * 1000 + [dict(weekly), dict(same)]  # only dictionaries count as buckets
+        rows, details = gemini.summary_rows(self.summary_with(*buckets, display="Extra"))
+        self.assertEqual(([x["label"] for x in rows], details), (["Extra 5-hour", "Extra Weekly"], []))
+        # The largest answer common.localhost_json lets through (about 1 MB of JSON). Numbering 16,000 equal labels
+        # one by one took about 20 seconds, longer than the provider's whole time limit.
+        summary = self.summary_with(*[dict(same) for _ in range(16000)], display="Extra")
+        start = time.monotonic()
+        rows, details = gemini.summary_rows(summary)
+        self.assertLess(time.monotonic() - start, 2.0)
+        self.assertEqual(([x["label"] for x in rows], details), (numbered, []))
+        with mock.patch.object(gemini, "hub", return_value=(1234, "demo-csrf-token")), \
+                mock.patch.object(gemini, "localhost_json", lambda port, path, *a, **k: summary
+                                  if path == gemini.SUMMARY_PATH else gemini_status()):
+            r = render.normalize(gemini.read({}))
+        self.assertEqual([x["label"] for x in r["rows"]], numbered[:8])
+        self.assertEqual(r["details"], ["Plan: Example Plan", "Source: Antigravity"])
+
+    def test_hundreds_of_groups_give_only_the_first_rows_assumed_shape(self):
+        """Assumed shape, not observed: far more groups than a real answer (which has two). Only the first MAX_GROUPS
+        items of the list are looked at, whatever they are."""
+        def group(i):
+            return {"displayName": f"Pool {i} models", "buckets": [
+                {"bucketId": f"p{i}-weekly", "window": "weekly", "remainingFraction": 1},
+                {"bucketId": f"p{i}-5h", "window": "5h", "remainingFraction": 0.5}]}
+
+        groups = [group(i) for i in range(500)]
+        rows, details = gemini.summary_rows({"response": {"groups": groups}})
+        self.assertEqual([(x["label"], x["group"], x["window"]) for x in rows],
+                         [(f"Pool {i} {name}", f"p{i}", window) for i in range(gemini.MAX_GROUPS)
+                          for name, window in (("5-hour", "5h"), ("Weekly", "weekly"))])
+        self.assertEqual(details, [])
+        self.assert_well_formed(rows, details)
+        odd = ([None, 5, "x", [], {}, {"buckets": "x"}] * gemini.MAX_GROUPS)[:gemini.MAX_GROUPS]  # these count too
+        self.assertIsNone(gemini.summary_rows({"response": {"groups": odd + groups}}))  # per-model rows instead
+        rows, details = gemini.summary_rows({"response": {"groups": odd[1:] + groups}})
+        self.assertEqual([x["label"] for x in rows], ["Pool 0 5-hour", "Pool 0 Weekly"])
+        # Many groups with many buckets that all get the same label: every kept row has its own number.
+        same = {"bucketId": "x-5h", "window": "5h", "remainingFraction": 0.5}
+        groups = [{"displayName": "Extra", "buckets": [dict(same) for _ in range(40)]} for _ in range(40)]
+        rows, details = gemini.summary_rows({"response": {"groups": groups}})
+        count = gemini.MAX_GROUPS * gemini.MAX_BUCKETS
+        self.assertEqual([x["label"] for x in rows],
+                         ["Extra 5-hour"] + [f"Extra 5-hour {n}" for n in range(2, count + 1)])
+        self.assert_well_formed(rows, details)
+
+    def test_huge_texts_are_cut_before_any_work_assumed_shape(self):
+        """Assumed shape, not observed: a name or id of hundreds of thousands of characters, or a list, dictionary
+        or number where a name belongs. Only the first TEXT_MAX characters of a text are looked at, and a value
+        that is not text is no name at all. `gemini.unicodedata` is replaced by a recording stand-in for each call."""
+        huge = 300_000
+
+        def folded(summary):
+            """summary_rows(summary) and the lengths of the texts it handed to unicodedata.normalize."""
+            stand_in = mock.Mock(wraps=unicodedata)
+            with mock.patch.object(gemini, "unicodedata", stand_in):
+                rows, details = gemini.summary_rows(summary)
+            return rows, details, [len(c.args[1]) for c in stand_in.normalize.call_args_list]
+
+        daily = {"bucketId": "img-daily", "window": "daily"}
+        cases = [
+            ({"bucketId": "z-5h", "window": "5h"}, "N" * huge, ("N" * 23 + " 5-hour", "z", "5h")),
+            ({"bucketId": "z-5h", "window": "5h"}, "é" * huge, ("e" * 23 + " 5-hour", "z", "5h")),
+            ({"bucketId": "b" * huge + "-5h", "window": "5h"}, "", ("B" + "b" * 19 + " 5-hour", None, "5h")),
+            # An id is cut like any text: the window at the end of an overlong bucketId is not seen.
+            ({"bucketId": "b" * huge + "-5h"}, "Extra", ("Extra Limit", None, None)),
+            ({"bucketId": "odd", "window": "w" * huge}, "", ("Odd W" + "w" * 11, "odd", None)),
+            ({"bucketId": "-" * huge, "window": "." * huge}, " " * huge, ("Group 1 Limit", None, None)),
+            (daily, ["Image tools"], ("Img Daily", "img", "daily")),
+            (daily, [["Image tools"] * 1000] * 300, ("Img Daily", "img", "daily")),
+            (daily, {"name": {"text": ["Image tools"] * huge}}, ("Img Daily", "img", "daily")),
+            (daily, 12345, ("Img Daily", "img", "daily")),
+        ]
+        for bucket, display, expected in cases:
+            summary = {"response": {"groups": [{"displayName": display,
+                                                "buckets": [dict(bucket, remainingFraction=0.5)]}]}}
+            rows, details, lengths = folded(summary)
+            self.assertEqual([(x["label"], x["group"], x["window"]) for x in rows], [expected], repr(display)[:40])
+            self.assert_well_formed(rows, details)
+            self.assertTrue(lengths)  # the stand-in was asked
+            self.assertLessEqual(max(lengths), gemini.TEXT_MAX, repr(display)[:40])
+        # Many buckets under one huge name: the work per bucket does not grow with the name.
+        buckets = [{"bucketId": f"z{i}-w{i}", "window": f"w{i}", "remainingFraction": 0.5} for i in range(200)]
+        rows, details, lengths = folded(self.summary_with(*buckets, display="N" * huge))
+        self.assertEqual([x["label"] for x in rows], ["N" * 27 + f" W{i}" for i in range(gemini.MAX_BUCKETS)])
+        self.assert_well_formed(rows, details)
+        self.assertLessEqual(sum(lengths), gemini.MAX_BUCKETS * 3 * gemini.TEXT_MAX)
+        self.assertIs(gemini.unicodedata, unicodedata)  # no stand-in is left behind
+
+    def test_huge_reset_time_is_cut_assumed_shape(self):
+        """Assumed shape, not observed: a resetTime that is a huge text, a list or a dictionary. to_epoch gets a
+        number as it is, the first TEXT_MAX characters of a text and nothing else."""
+        resets = ["2" * 300_000, [["2031-05-26T13:00:00Z"] * 1000] * 300, {"time": "2031-05-26T13:00:00Z"},
+                  1_900_000_000, "2031-05-26T13:00:00Z"]
+        seen = []
+        with mock.patch.object(gemini, "to_epoch", wraps=common.to_epoch) as to_epoch:
+            for reset in resets:
+                rows, _ = gemini.summary_rows(self.summary_with(
+                    {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.5, "resetTime": reset}))
+                seen.append(rows[0]["resets"])
+        self.assertEqual([c.args[0] for c in to_epoch.call_args_list],
+                         ["2" * gemini.TEXT_MAX, None, None, 1_900_000_000, "2031-05-26T13:00:00Z"])
+        self.assertEqual(seen, [None, None, None, 1_900_000_000.0, common.to_epoch("2031-05-26T13:00:00Z")])
+
+    def test_long_group_labels_are_shown_whole(self):
+        r = render.normalize(self.summary_result())
+        lines = menu_lines(render.menu([("gemini", r), ("claude", res("CLAUDE", [row("5-hour", 12.0)]))], NOW))
+        bars = {}
+        for label in SUMMARY_LABELS + ["5-hour"]:
+            line = next(x for x in lines if x.startswith(label + " "))
+            bars[label] = min(i for i, c in enumerate(line) if c in "█░")
+        self.assertEqual(len(set(bars.values())), 1, bars)  # one bar column, after the longest label
+        self.assertEqual(bars["5-hour"], len("Claude GPT Weekly") + 2)
+        long_label = "Weekly " + "x" * 20  # longer than the column: cut, and the bar still lines up
+        lines = menu_lines(render.menu([("claude", res("CLAUDE", [row(long_label, 5.0), row("5-hour", 9.0)]))], NOW))
+        cut = next(x for x in lines if x.startswith("Weekly x"))
+        self.assertTrue(cut.startswith(long_label[:render.LABEL_MAX] + "  █") or
+                        cut.startswith(long_label[:render.LABEL_MAX] + "  ░"), cut)
+
+    def test_fallback_to_per_model_rows_assumed_shape(self):
+        """Assumed shapes, not observed: an empty, missing or odd summary, or one without any usable value. The
+        per-model rows from GetUserStatus come back exactly as before, with the plan line."""
+        with mock.patch.object(gemini, "localhost_json", lambda *a, **k: gemini_status()):
+            expected = gemini.model_rows(gemini_status()["userStatus"])
+        self.assertEqual([x["label"] for x in expected[0]], ["Demo Pro", "Example Model"])
+        no_value = self.summary_with({"bucketId": "gemini-5h", "window": "5h", "remainingAmount": "3"})
+        only_disabled = self.summary_with({"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 1,
+                                           "disabled": True})
+        for summary in ({}, {"response": {}}, {"response": {"groups": []}}, {"response": {"groups": "x"}},
+                        {"response": {"groups": [None, 5, "x"]}}, {"response": {"groups": [{"buckets": "x"}]}},
+                        {"response": {"groups": [{"buckets": [None, 1]}]}}, [], "text", None, no_value,
+                        only_disabled, {"response": []}, {"groups": gemini_summary()["response"]["groups"]}):
+            rows, details, _ = self.read({"unexpected": True} if summary is None else summary, gemini_status())
+            self.assertEqual((rows, details), expected, repr(summary)[:60])
+            self.assertIn("Plan: Example Plan", details)
+            self.assertEqual([(x["group"], x["window"]) for x in rows], [(None, None)] * 2)
+
+    def test_summary_failure_keeps_the_per_model_rows_assumed_shape(self):
+        """Assumed shape, not observed: what an older server or an account without a summary answers is unknown,
+        so any failure of the summary request falls back."""
+        expected = gemini.model_rows(gemini_status()["userStatus"])
+        for error in (common.NotConfigured("HTTP 404"), common.SessionExpired("HTTP 401"), RuntimeError("HTTP 500"),
+                      RuntimeError("request failed"), ValueError("x")):
+            rows, details, calls = self.read(error, gemini_status())
+            self.assertEqual((rows, details), expected, repr(error))
+            self.assertEqual(len(calls), 2)
+
+    def test_status_failure_costs_only_the_plan_line_assumed_shape(self):
+        """Assumed shape, not observed: the summary answers but GetUserStatus fails."""
+        for error in (RuntimeError("request failed"), common.SessionExpired("HTTP 401")):
+            rows, details, _ = self.read(gemini_summary(), error)
+            self.assertEqual([x["label"] for x in rows], SUMMARY_LABELS)
+            self.assertEqual(details, [])
+        rows, details, _ = self.read(gemini_summary(), {"userStatus": "odd"})
+        self.assertEqual(([x["label"] for x in rows], details), (SUMMARY_LABELS, []))
+
+    def test_both_requests_failing_falls_back_to_the_gemini_cli(self):
+        """Assumed shape, not observed: both local requests fail; read() then tries the Gemini CLI, as before."""
+        cli_rows = [row("demo-pro", percent=31.0)]
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("request failed")
+
+        with mock.patch.object(gemini, "hub", return_value=(1234, "demo-csrf-token")), \
+                mock.patch.object(gemini, "localhost_json", fail), \
+                mock.patch.object(gemini, "_gemini_cli", return_value=cli_rows):
+            r = gemini.read({})
+        self.assertEqual((r["rows"], r["details"]), (cli_rows, ["Source: Gemini CLI"]))
+
+    def test_read_returns_the_summary_rows(self):
+        def fake(port, path, headers, body, timeout=8):
+            return gemini_summary() if path == gemini.SUMMARY_PATH else gemini_status()
+
+        with mock.patch.object(gemini, "hub", return_value=(1234, "demo-csrf-token")), \
+                mock.patch.object(gemini, "localhost_json", fake):
+            r = gemini.read({})
+        self.assertEqual([x["label"] for x in r["rows"]], SUMMARY_LABELS)
+        self.assertEqual(r["details"], ["Plan: Example Plan", "Source: Antigravity"])
+
+    def summary_result(self):
+        rows, details, _ = self.read(gemini_summary(), gemini_status())
+        with mock.patch.object(time, "time", return_value=NOW):
+            return gemini.result("GEMINI", rows=rows, details=details + ["Source: Antigravity"])
+
+    def test_row_without_reset_time_renders_and_survives_the_cache(self):
+        r = render.normalize(self.summary_result())
+        text = render.menu([("gemini", r)], NOW)
+        lines = menu_lines(text)
+        line = next(x for x in lines if x.startswith("Claude GPT 5-hour"))
+        self.assertRegex(line, r"^Claude GPT 5-hour +░{10} +0% \|")
+        following = lines[lines.index(line) + 1]
+        self.assertTrue(following.startswith("Claude GPT Weekly"), following)  # no reset line in between
+        gemini_line = next(x for x in lines if x.startswith("Gemini 5-hour"))
+        self.assertIn("↻", lines[lines.index(gemini_line) + 1])  # the Gemini rows do have one
+        self.assertEqual(render.current_percent(r["rows"][2], NOW), 0.0)  # current, not stale
+        main = load_main()
+        with tempfile.TemporaryDirectory() as d:
+            main.cache_write(d, "gemini", r)
+            cached = main.cache_read(d, "gemini")
+        self.assertEqual(cached["rows"], r["rows"])
+        self.assertEqual([(x["group"], x["window"], x["resets"] is None) for x in cached["rows"]],
+                         [("gemini", "5h", False), ("gemini", "weekly", False), ("3p", "5h", True),
+                          ("3p", "weekly", True)])
+
+    def test_old_cache_entries_without_the_machine_fields_still_work(self):
+        old = {"title": "GEMINI", "status": "ok", "details": [], "note": None, "time": NOW - 60,
+               "rows": [{"label": "All models", "percent": 0.0, "value": None, "resets": NOW + 3600}]}
+        main = load_main()
+        with tempfile.TemporaryDirectory() as d:
+            common.write_private_json(d, "gemini.json", old)
+            cached = main.cache_read(d, "gemini")
+        self.assertEqual(cached["rows"], [{"label": "All models", "percent": 0.0, "value": None, "resets": NOW + 3600,
+                                           "window": None, "group": None}])
+        self.assertIn("All models", render.menu([("gemini", cached)], NOW))
+
+    def test_menu_bar_shows_lists_and_selects_the_four_rows(self):
+        r = render.normalize(self.summary_result())
+        launcher = "/Users/demo/ai-limits-bar/plugin/ai-limits.5m.sh"
+        state = [(n, True) for n in NAMES]
+        for limit in SUMMARY_LABELS:
+            text = render.menu([("gemini", r)], NOW, True, "/Users/demo/config.json", False, state, launcher, None,
+                               {"provider": "gemini", "limit": limit})
+            lines = menu_lines(text)
+            self.assertEqual(lines[0].split(" | ")[0], "0%")
+            self.assertTrue(swiftbar_params(lines[0])["tooltip"].startswith(f"Showing Gemini {limit} 0%"))
+            start = lines.index(render.CHOOSER_ITEM) + 1
+            entries = lines[start:start + 5]
+            self.assertEqual([x.split(" | ")[0] for x in entries],
+                             ["--Highest of all"] + [f"--Gemini · {x}" for x in SUMMARY_LABELS])
+            for entry, label in zip(entries[1:], SUMMARY_LABELS):
+                params = swiftbar_params(entry)
+                self.assertEqual(params["param2"], f"gemini:{label}")
+                self.assertEqual(params.get("checked") == "true", label == limit)
+            self.assertEqual(load_main().parse_choice(f"gemini:{limit}"), {"provider": "gemini", "limit": limit})
+
+    def test_old_pinned_gemini_line_is_not_available(self):
+        """Documented behaviour: a line pinned before (e.g. All models) no longer matches; no migration."""
+        r = render.normalize(self.summary_result())
+        text = render.menu([("gemini", r)], NOW, True, "/Users/demo/config.json", False, [(n, True) for n in NAMES],
+                           "/Users/demo/ai-limits-bar/plugin/ai-limits.5m.sh", None,
+                           {"provider": "gemini", "limit": "All models"})
+        self.assertEqual(menu_lines(text)[0].split(" | ")[0], "–")
+        self.assertIn("--Gemini · All models (not available) | checked=true", menu_lines(text))
+
+
+class WindowFields(unittest.TestCase):
+    """The machine-readable `window` and `group` of a row: set where the provider says which window a row is."""
+
+    def test_claude_rows(self):
+        limits = [{"kind": "session", "percent": 27}, {"kind": "weekly_all", "percent": 53},
+                  {"kind": "weekly_scoped", "percent": 68, "scope": {"model": {"display_name": "Opus"}}},
+                  {"kind": "new_kind", "percent": 5}]
+        self.assertEqual([(x["window"], x["group"]) for x in claude.rows_from_limits(limits)],
+                         [("5h", None), ("weekly", None), (None, None), (None, None)])
+        legacy = claude._legacy_rows({"five_hour": {"utilization": 3}, "seven_day": {"utilization": 4},
+                                      "seven_day_opus": {"utilization": 5}})
+        self.assertEqual([(x["label"], x["window"]) for x in legacy],
+                         [("5-hour", "5h"), ("Weekly", "weekly"), ("Weekly Opus", None)])
+
+    def test_codex_rows(self):
+        rows, _ = codex.parse({"rateLimits": {"primary": {"usedPercent": 23, "windowDurationMins": 300},
+                                              "secondary": {"usedPercent": 62, "windowDurationMins": 10080}}})
+        self.assertEqual([(x["window"], x["group"]) for x in rows], [("5h", None), ("weekly", None)])
+        self.assertEqual([codex.window_kind(m) for m in (300, 10080, 1440, None, 0)],
+                         ["5h", "weekly", None, None, None])
+
+    def test_normalize_keeps_only_short_lowercase_ids(self):
+        good = render.normalize({"rows": [{"label": "a", "percent": 1, "window": "5h", "group": "3p"}]})["rows"][0]
+        self.assertEqual((good["window"], good["group"]), ("5h", "3p"))
+        for bad in ("5H", "a b", "x" * 17, "-x", "../x", "", 5, True, None, ["5h"], "5h\n", "é"):
+            x = render.normalize({"rows": [{"label": "a", "window": bad, "group": bad}]})["rows"][0]
+            self.assertEqual((x["window"], x["group"]), (None, None), repr(bad))
+
+    def test_row_helper_defaults(self):
+        self.assertEqual(common.row("a", 1.0), {"label": "a", "percent": 1.0, "value": None, "resets": None,
+                                                "window": None, "group": None})
+
+
+# ---- menu bar rings -------------------------------------------------------------------------------------------
+
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+PNG_BUILT = 32 * 1024 * 1024  # make_png builds the scanlines of a picture up to this many bytes of them
+
+
+def png_chunk(kind, body=b"", crc=None):
+    """One PNG chunk: length, type, body and checksum (`crc` puts another number in its place)."""
+    crc = zlib.crc32(kind + body) if crc is None else crc
+    return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", crc)
+
+
+def png_header(width, height=44, colour_type=6, methods=(0, 0, 0)):
+    """The IHDR chunk: 8 bits per sample; methods: compression, filter, interlace."""
+    return png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, colour_type, *methods))
+
+
+def png_pixels(width, height=44, samples=4):
+    """The zlib stream of a picture with every sample 0 (transparent): per row a filter byte 0, then the samples."""
+    return zlib.compress(bytes(height * (1 + samples * width)))
+
+
+def make_png(width, height=44, colour_type=6, end=True, body=None):
+    """A complete PNG (made here, nothing drawn): IHDR with these values, one IDAT with every sample 0, IEND; `body`
+    replaces the IDAT chunk with other chunks. Only a picture too large to build (the logo tests' header checks, over
+    PNG_BUILT bytes of scanlines) gets a single byte in its IDAT instead."""
+    if body is None:
+        samples = 3 if colour_type == 2 else 4
+        built = height * (1 + samples * width) <= PNG_BUILT
+        body = png_chunk(b"IDAT", png_pixels(width, height, samples) if built else zlib.compress(b"\x00"))
+    data = PNG_SIGNATURE + png_header(width, height, colour_type) + body
+    return data + png_chunk(b"IEND") if end else data
+
+
+def flipped(data, at):
+    """`data` with one bit of its byte at `at` changed."""
+    at %= len(data)
+    return data[:at] + bytes([data[at] ^ 1]) + data[at + 1:]
+
+
+def b64(data):
+    import base64
+    return base64.b64encode(data).decode("ascii")
+
+
+def ring_results(gemini_group_rows=True):
+    """Shown providers in menu order, as main passes them (normalized), with made-up values."""
+    future = NOW + 3600
+    rows = {
+        "claude": [common.row("5-hour", 31.0, resets=future, window="5h"),
+                   common.row("Weekly", 57.0, resets=future, window="weekly"),
+                   common.row("Weekly Opus", 88.0, resets=future)],
+        "codex": [common.row("5-hour", 82.0, resets=future, window="5h"),
+                  common.row("Weekly", 40.0, resets=future, window="weekly")],
+        "gemini": [common.row("Gemini 5-hour", 12.0, resets=future, window="5h", group="gemini"),
+                   common.row("Gemini Weekly", 94.0, resets=future, window="weekly", group="gemini"),
+                   common.row("Claude GPT 5-hour", 3.0, window="5h", group="3p"),
+                   common.row("Claude GPT Weekly", 1.0, window="weekly", group="3p")]
+        if gemini_group_rows else [common.row("All models", 0.0, resets=future)],
+        "copilot": [common.row("AI credits", 26.0, value="1,560 / 6,000", resets=future)],
+        "foundry": [common.row("This month", value="$3.40")],
+    }
+    return [(k, render.normalize(res(k.upper(), v))) for k, v in rows.items()]
+
+
+class RingSpecs(unittest.TestCase):
+    """Which values the rings show: picked by the rows' window and group, never by label."""
+
+    def specs(self, results=None, chosen=None):
+        return ring.specs(ring_results() if results is None else results,
+                          ring.groups(None) if chosen is None else chosen, NOW)
+
+    def test_claude_and_codex_arcs_come_from_their_windows(self):
+        by_key = {x["key"]: x for x in self.specs()}
+        self.assertEqual((by_key["claude"]["right"], by_key["claude"]["left"]), (31.0, 57.0))  # not Weekly Opus 88
+        self.assertEqual((by_key["codex"]["right"], by_key["codex"]["left"]), (82.0, 40.0))
+        relabelled = [("claude", render.normalize(res("CLAUDE", [common.row("x", 9.0, window="weekly"),
+                                                                  common.row("5-hour", 70.0)])))]
+        self.assertEqual([(x["right"], x["left"]) for x in self.specs(relabelled)], [(None, 9.0)])  # labels ignored
+
+    def test_copilot_fills_both_arcs_with_its_one_limit(self):
+        copilot = next(x for x in self.specs() if x["key"] == "copilot")
+        self.assertEqual((copilot["right"], copilot["left"], copilot["single"]), (26.0, 26.0, True))
+
+    def test_foundry_and_hidden_providers_get_no_ring_and_order_follows_the_menu(self):
+        self.assertEqual([x["key"] for x in self.specs()], ["claude", "codex", "gemini", "copilot"])
+        shown = [r for r in ring_results() if r[0] in ("copilot", "claude")][::-1]  # hidden ones are not in results
+        self.assertEqual([x["key"] for x in self.specs(shown)], ["copilot", "claude"])
+        self.assertEqual(self.specs([]), [])
+
+    def test_gemini_follows_the_chosen_group(self):
+        gemini = next(x for x in self.specs() if x["key"] == "gemini")
+        self.assertEqual((gemini["right"], gemini["left"], gemini["name"]), (12.0, 94.0, "Gemini"))
+        gemini = next(x for x in self.specs(chosen={"gemini": "3p"}) if x["key"] == "gemini")
+        self.assertEqual((gemini["right"], gemini["left"], gemini["name"]), (3.0, 1.0, "Gemini (Claude GPT)"))
+        fallback = next(x for x in self.specs(ring_results(gemini_group_rows=False)) if x["key"] == "gemini")
+        self.assertEqual((fallback["right"], fallback["left"]), (None, None))  # per-model rows: track only
+
+    def test_stale_missing_or_unreadable_values_give_no_value(self):
+        stale = [("codex", render.normalize(res("CODEX", [common.row("5-hour", 44.0, resets=NOW - 60, window="5h"),
+                                                         common.row("Weekly", None, window="weekly")])))]
+        self.assertEqual([(x["right"], x["left"]) for x in self.specs(stale)], [(None, None)])
+        failed = [("claude", render.normalize({"title": "CLAUDE", "status": "unknown", "note": "Couldn't read"}))]
+        self.assertEqual([(x["key"], x["right"], x["left"]) for x in self.specs(failed)], [("claude", None, None)])
+
+    def test_groups_setting_falls_back_to_the_default(self):
+        self.assertEqual(ring.groups({"gemini": "3p"}), {"gemini": "3p"})
+        for value in (None, [], "3p", {"gemini": "evil"}, {"gemini": ["3p"]}, {"other": "3p"}):
+            self.assertEqual(ring.groups(value), {"gemini": "gemini"}, repr(value))
+
+
+class RingDrawing(unittest.TestCase):
+    """The drawing's argument list, its strict output check and the cache. ring.run is faked: no osascript."""
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.cache = os.path.join(folder.name, "cache")
+        self.specs = ring.specs(ring_results(), ring.groups(None), NOW)
+        self.pair = (b64(make_png(296)), b64(make_png(296)))
+        self.calls = []  # the user's logo folder is the empty guard folder: every ring shows its initials
+
+    def fake_run(self, answer=None):
+        def fake(argv, timeout):
+            self.calls.append((argv, timeout))
+            return answer if answer is not None else (0, f"{self.pair[0]}\n{self.pair[1]}\n", "")
+        return mock.patch.object(ring, "run", fake)
+
+    def test_inputs_round_and_classify_the_values(self):
+        values = ring.inputs((True, 94.4), self.specs)
+        self.assertEqual(values["gauge"], [True, render.icon(94.4), "94%", "r"])
+        self.assertEqual(values["rings"][0], ["2", "Cl", None, None, "31", "n", "57", "n"])
+        self.assertEqual(values["rings"][1][4:], ["82", "o", "40", "n"])  # orange from 75%
+        self.assertEqual(values["rings"][2][4:], ["12", "n", "94", "r"])  # red from 90%
+        self.assertEqual(values["rings"][3], ["1", "Cp", None, None, "26", "n", "26", "n"])  # one limit: one arc
+        self.assertEqual(ring.inputs((False, None), [dict(self.specs[0], right=None, left=150.0)]),
+                         {"gauge": [False, render.icon(None), "–", "n"],
+                          "rings": [["2", "Cl", None, None, "", "n", "100", "r"]]})
+
+    def test_script_is_fixed_and_values_are_arguments(self):
+        argv = ring.arguments(ring.inputs((True, 94.0), self.specs))
+        self.assertEqual(argv[:5], ["/usr/bin/osascript", "-l", "JavaScript", "-e", ring.SCRIPT])
+        self.assertEqual(argv[5:11], ["strip", "1", render.icon(94.0), "94%", "r", "4"])
+        self.assertEqual(argv[11:19], ["2", "Cl", "", "", "31", "n", "57", "n"])
+        self.assertEqual(argv[-8:], ["1", "Cp", "", "", "26", "n", "26", "n"])
+        self.assertEqual(len(argv), 11 + 4 * 8)
+        self.assertNotIn("argv[", ring.SCRIPT.split("function run(argv)")[0])  # no code before run()
+        good = ring.inputs((True, 50.0), self.specs[:1])
+        bad_values = [("gauge", [True, "evil.symbol", "50%", "n"]), ("gauge", [True, render.icon(50), "50%'", "n"]),
+                      ("gauge", [True, render.icon(50), "50%", "x"]),
+                      ("rings", [["2", "Zz", None, None, "1", "n", "2", "n"]]),
+                      ("rings", [["3", "Cl", None, None, "1", "n", "2", "n"]]),
+                      ("rings", [["2", "Cl", ("/tmp/claude.svg", 1, 1), None, "1", "n", "2", "n"]]),
+                      ("rings", [["2", "Cl", None, (ring.LOGO_DIR + "x/claude.pdf", 1, 1), "1", "n", "2", "n"]]),
+                      ("rings", [["2", "Cl", None, None, "101", "n", "2", "n"]]),
+                      ("rings", [["2", "Cl", None, None, "5.5", "n", "2", "n"]]),
+                      ("rings", [["2", "Cl", None, None, "1", "n", "-2", "n"]]),
+                      ("rings", [["2", "Cl", None, None, "1", "x", "2", "n"]]),
+                      ("rings", [["2", "Cl", None, None, "1", "n", "2", "n"]] * (ring.MAX_RINGS + 1))]
+        for key, value in bad_values:
+            with self.assertRaises(ValueError, msg=repr(value)):
+                ring.arguments(dict(good, **{key: value}))
+
+    def test_output_is_checked_strictly(self):
+        a, b = self.pair
+        self.assertEqual(ring.parse(0, f"{a}\n{b}\n"), (a, b))
+        self.assertEqual(ring.parse(0, f"{a}\n{b}"), (a, b))
+        wide = b64(make_png(ring.MAX_WIDTH * ring.SCALE + 1))
+        for code, out in [(1, f"{a}\n{b}\n"), (0, a), (0, f"{a}\n{b}\n{a}\n"), (0, ""), (0, None), (-9, ""),
+                          (0, f"{a}!\n{b}\n"), (0, f"{a} \n{b}\n"), (0, f"{a}\n{b}\n\n"),
+                          (0, f"{a}\n{b64(make_png(300))}\n"),                     # widths differ
+                          (0, f"{b64(make_png(296, height=22))}\n{b}\n"),          # not 44 pixels high
+                          (0, f"{wide}\n{wide}\n"),                                # too wide
+                          (0, f"{b64(make_png(296, colour_type=2))}\n{b}\n"),      # not RGBA
+                          (0, f"{b64(make_png(296, end=False))}\n{b}\n"),          # no IEND
+                          (0, f"{b64(b'GIF89a' + bytes(60))}\n{b}\n"), (0, "QUJD\nQUJD\n"), (0, "QQ=\nQQ=\n")]:
+            self.assertIsNone(ring.parse(code, out), repr((code, out))[:80])
+        with mock.patch.object(ring, "MAX_PNG_BYTES", 40):
+            self.assertIsNone(ring.parse(0, f"{a}\n{b}\n"))  # over the byte cap
+
+    def refused(self, cases):
+        """Every image of {what: bytes} is within the byte cap, and check_png and parse (on either line) refuse it."""
+        good = self.pair[0]
+        self.assertEqual([what for what, data in cases.items() if len(data) > ring.MAX_PNG_BYTES], [])
+        self.assertEqual([what for what, data in cases.items() if ring.check_png(data) is not None
+                          or ring.parse(0, f"{b64(data)}\n{good}\n") or ring.parse(0, f"{good}\n{b64(data)}\n")], [])
+
+    def test_png_needs_more_than_a_header_and_a_trailer(self):
+        good = make_png(296)
+        self.assertEqual(ring.check_png(good), 296)
+        idat, end = png_chunk(b"IDAT", png_pixels(296)), png_chunk(b"IEND")
+        other = bytes(range(256)) * 352  # 90 KB
+        longer = png_chunk(b"IHDR", struct.pack(">IIBBBBBB", 296, 44, 8, 6, 0, 0, 0, 0))
+        cases = {"no IDAT": make_png(296, body=b""),
+                 "an IHDR length of 999999": good[:8] + struct.pack(">I", 999999) + good[12:],
+                 "an IHDR of 14 bytes": PNG_SIGNATURE + longer + idat + end,
+                 "90 KB of other bytes for a body": make_png(296, body=other),
+                 "90 KB of other bytes after the pixels": make_png(296, body=idat + other)}
+        for methods in ((9, 9, 9), (1, 0, 0), (0, 1, 0), (0, 0, 1)):  # compression, filter, interlace: only 0, 0, 0
+            cases[f"methods {methods}"] = PNG_SIGNATURE + png_header(296, methods=methods) + idat + end
+        self.assertEqual(len(cases["no IDAT"]), 45)
+        self.refused(cases)
+
+    def test_png_chunk_checksums_are_checked(self):
+        parts = {"IHDR": png_header(296), "pHYs": png_chunk(b"pHYs", struct.pack(">IIB", 5669, 5669, 1)),
+                 "IDAT": png_chunk(b"IDAT", png_pixels(296)), "IEND": png_chunk(b"IEND")}
+        good = PNG_SIGNATURE + b"".join(parts.values())
+        self.assertEqual(ring.check_png(good), 296)
+        cases = {}
+        for kind, part in parts.items():
+            changes = {"another checksum": flipped(part, -1), "a checksum of 0": part[:-4] + bytes(4)}
+            if kind != "IEND":
+                changes["a changed body under the old checksum"] = flipped(part, -5)
+            for what, changed in changes.items():
+                cases[f"{kind}: {what}"] = PNG_SIGNATURE + b"".join(dict(parts, **{kind: changed}).values())
+        cases["pHYs: a changed type under the old checksum"] = good.replace(b"pHYs", b"pHYt")
+        self.refused(cases)
+        for at in range(len(good)):  # a damaged file: whichever byte it is
+            self.assertIsNone(ring.check_png(flipped(good, at)), at)
+
+    def test_png_pixel_data_must_unpack_to_exactly_its_size(self):
+        row = 1 + 4 * 296
+        size = 44 * row
+        good = png_pixels(296)
+        self.assertEqual(zlib.decompress(good), bytes(size))
+
+        def png(stream):
+            return make_png(296, body=png_chunk(b"IDAT", stream))
+        mixed = b"".join(bytes([y % 5]) + bytes((x + y) % 256 for x in range(row - 1)) for y in range(44))
+        for what, stream in {"every sample 0": good, "every filter type, other samples": zlib.compress(mixed),
+                             "stored, not compressed": zlib.compress(mixed, 0)}.items():
+            self.assertEqual(ring.check_png(png(stream)), 296, what)
+        self.refused({what: png(stream) for what, stream in {
+            "one row too few": png_pixels(296, 43),
+            "one row too many": png_pixels(296, 45),
+            "one byte too few": zlib.compress(bytes(size - 1)),
+            "one byte too many": zlib.compress(bytes(size + 1)),
+            "a zlib stream of nothing": zlib.compress(b""),
+            "an empty IDAT": b"",
+            "a zlib stream without its last byte": good[:-1],
+            "half a zlib stream": good[:len(good) // 2],
+            "a byte after the zlib stream": good + b"\x00",
+            "a second zlib stream": good + good,
+            "not a zlib stream": b"made up, not compressed",
+            "no zlib header and trailer": good[2:-4],
+            "another checksum in the zlib stream": flipped(good, -1),
+            "filter type 5 in the first row": zlib.compress(b"\x05" + bytes(size - 1)),
+            "filter type 5 in the last row": zlib.compress(bytes(size - row) + b"\x05" + bytes(row - 1)),
+            "filter type 255": zlib.compress(bytes(row) + b"\xff" + bytes(size - row - 1)),
+        }.items()})
+
+    def test_png_pixel_data_is_never_unpacked_past_its_size(self):
+        bomb = make_png(296, body=png_chunk(b"IDAT", zlib.compress(bytes(32 * 1024 * 1024))))  # 32 MB from 32 KB
+        self.refused({"32 MB of pixel data": bomb})
+        text = b64(bomb)
+        tracemalloc.start()
+        try:
+            self.assertIsNone(ring.check_png(bomb))
+            self.assertIsNone(ring.parse(0, f"{self.pair[0]}\n{text}\n"))
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 4 * 1024 * 1024)  # refused at the expected size: the 32 MB were never unpacked
+
+    def test_png_chunks_must_be_in_their_places(self):
+        head, end, text = png_header(296), png_chunk(b"IEND"), png_chunk(b"tEXt", b"made up")
+        stream = png_pixels(296)
+        idat = png_chunk(b"IDAT", stream)
+
+        def png(*chunks):
+            return PNG_SIGNATURE + b"".join(chunks)
+        good = png(head, idat, end)
+        self.assertEqual(ring.check_png(good), 296)
+        self.refused({
+            "another critical chunk": png(head, png_chunk(b"PLTE", bytes(3)), idat, end),
+            "an unknown critical chunk after the pixels": png(head, idat, png_chunk(b"MADE", b"up"), end),
+            "a second IHDR": png(head, head, idat, end),
+            "a second IHDR after the pixels": png(head, idat, head, end),
+            "IDAT chunks apart": png(head, png_chunk(b"IDAT", stream[:20]), text, png_chunk(b"IDAT", stream[20:]),
+                                     end),
+            "an empty IDAT after another chunk": png(head, idat, text, png_chunk(b"IDAT"), end),
+            "a digit in a chunk type": png(head, png_chunk(b"tEX1", b"made up"), idat, end),
+            "a space in a chunk type": png(head, idat, png_chunk(b"tE t", b"made up"), end),
+            "a letter outside ASCII in a chunk type": png(head, png_chunk(b"t\xc9Xt", b"made up"), idat, end),
+            "a chunk longer than the rest": png(head, idat, struct.pack(">I", 500) + text[4:], end),
+            "a chunk length of 4 GB": png(head, struct.pack(">I", 2 ** 32 - 1) + text[4:], idat, end),
+            "bytes after IEND": good + bytes(3),
+            "a chunk after IEND": good + text,
+            "a second IEND": good + end,
+            "IEND with a body": png(head, idat, png_chunk(b"IEND", b"x")),
+            "no IEND": png(head, idat),
+            "no IEND, another chunk last": png(head, idat, text),
+            "a chunk before IHDR": png(text, head, idat, end),
+            "IDAT before IHDR": png(idat, head, end),
+            "no IHDR": png(idat, end),
+            "no chunk": PNG_SIGNATURE,
+            "no signature": good[8:],
+        })
+
+    def test_png_cut_short_is_refused_without_an_error(self):
+        end = png_chunk(b"IEND")
+        good = make_png(296, body=png_chunk(b"pHYs", struct.pack(">IIB", 5669, 5669, 1))
+                        + png_chunk(b"IDAT", png_pixels(296)))
+        self.assertEqual(ring.check_png(good), 296)
+        for length in range(len(good)):
+            self.assertIsNone(ring.check_png(good[:length]), length)
+            if length != len(good) - len(end):
+                self.assertIsNone(ring.check_png(good[:length] + end), length)  # ... and with the trailer put back
+        for other in (None, "text", 5, bytearray(good), [good]):
+            self.assertIsNone(ring.check_png(other), type(other))
+
+    def test_png_may_have_other_ancillary_chunks_and_several_idat_chunks(self):
+        stream = png_pixels(296)
+        whole = png_chunk(b"IDAT", stream)
+        cuts = (0, 1, 20, 20, len(stream) - 1, len(stream))  # one of the pieces is empty
+        pieces = b"".join(png_chunk(b"IDAT", stream[a:b]) for a, b in zip(cuts, cuts[1:]))
+        single = b"".join(png_chunk(b"IDAT", stream[n:n + 1]) for n in range(len(stream)))
+        before = b"".join([png_chunk(b"sRGB", b"\x00"), png_chunk(b"eXIf", b"MM\x00*\x00\x00\x00\x08\x00\x00"),
+                           png_chunk(b"pHYs", struct.pack(">IIB", 5669, 5669, 1)),
+                           png_chunk(b"zzZz", bytes(range(256)))])
+        after = b"".join([png_chunk(b"tEXt", b"Comment\x00made up"), png_chunk(b"zzZz"), png_chunk(b"abcd", b"\xff")])
+        for what, body in {"chunks before": before + whole, "chunks after": whole + after,
+                           "chunks before and after": before + whole + after, "several IDAT": pieces,
+                           "an IDAT per byte": single, "both": before + pieces + after}.items():
+            data = make_png(296, body=body)
+            text = b64(data)
+            self.assertEqual(ring.check_png(data), 296, what)
+            self.assertEqual(ring.check_png(data, 296), 296, what)
+            self.assertIsNone(ring.check_png(data, 298), what)
+            self.assertEqual(ring.parse(0, f"{text}\n{self.pair[1]}\n"), (text, self.pair[1]), what)
+        for width in (1, ring.MAX_WIDTH * ring.SCALE):  # the narrowest and the widest
+            self.assertEqual(ring.check_png(make_png(width)), width)
+
+    def test_draw_runs_osascript_with_a_timeout_and_no_shell(self):
+        values = ring.inputs((True, 94.0), self.specs)
+        with self.fake_run():
+            self.assertEqual(ring.draw(values), self.pair)
+        self.assertEqual(self.calls, [(ring.arguments(values), ring.TIMEOUT)])
+        for failure in (subprocess.TimeoutExpired("osascript", 5), OSError("missing")):
+            with mock.patch.object(ring, "run", side_effect=failure):
+                self.assertIsNone(ring.draw(values))
+        for answer in ((1, "", "error"), (0, "garbage", "")):
+            with self.fake_run(answer):
+                self.assertIsNone(ring.draw(values))
+        self.calls.clear()
+        with self.fake_run():
+            self.assertIsNone(ring.draw(dict(values, gauge=[True, "evil", "1%", "n"])))
+        self.assertEqual(self.calls, [])  # refused before any process
+
+    def test_logo_paths_must_be_the_fixed_file_names(self):
+        good = ring.inputs((True, 50.0), self.specs[:1])
+
+        def values(path, initials="Cl", dark=False):
+            logo = (path, 1, 1)
+            return dict(good, rings=[["2", initials, None if dark else logo, logo if dark else None,
+                                      "1", "n", "2", "n"]])
+        other_names = ("evil.png", "claude.png.bak", "claude-big.png", "cursor.pdf", "foundry.png", "claude.gif",
+                       "claude", ".png", "-light.svg", "claude-.png", "claude-light-dark.svg", "xclaude.png",
+                       "claude.png\n", "claude.pngx", "claude svg", "claudexpng")
+        bad_paths = [os.path.join(ring.LOGO_DIR, name) for name in other_names]
+        # the fixed names outside the logo folder: next to it, below it, relative, and in a logos folder in the project
+        package = os.path.join(ROOT, "ai_limits", "logos")
+        bad_paths += [ring.LOGO_DIR + "x/claude.svg", os.path.join(ring.LOGO_DIR, "sub", "claude.svg"),
+                      os.path.dirname(ring.LOGO_DIR) + "/claude.svg", "claude.svg",
+                      os.path.join(package, "claude.pdf"), os.path.join(package, "codex-light.pdf")]
+        for path in bad_paths:
+            for dark in (False, True):
+                bad = values(path, dark=dark)
+                with self.assertRaisesRegex(ValueError, "bad logo path", msg=path):
+                    ring.arguments(bad)
+                with self.fake_run():
+                    self.assertIsNone(ring.draw(bad), path)
+        self.assertEqual(self.calls, [])  # refused before any process
+        for provider, initials in ring.INITIALS.items():  # every name ring.logos() can return
+            for variant in ("",) + tuple(f"-{v}" for v in ring.VARIANTS):
+                for ext in ring.LOGO_TYPES:
+                    path = os.path.join(ring.LOGO_DIR, f"{provider}{variant}.{ext}")
+                    self.assertEqual(ring.arguments(values(path, initials))[13:15], [path, ""])
+                    self.assertEqual(ring.arguments(values(path, initials, dark=True))[13:15], ["", path])
+
+    def test_strip_is_cached_by_its_inputs(self):
+        with self.fake_run():
+            self.assertEqual(ring.strip(self.specs, (True, 94.0), self.cache), self.pair)
+            self.assertEqual(ring.strip(self.specs, (True, 94.0), self.cache), self.pair)
+            self.assertEqual(len(self.calls), 1)  # the second run starts no process
+            ring.strip(self.specs, (True, 94.4), self.cache)  # rounds to the same 94%
+            self.assertEqual(len(self.calls), 1)
+            ring.strip([dict(self.specs[0], right=32.0)] + self.specs[1:], (True, 94.0), self.cache)
+            self.assertEqual(len(self.calls), 2)
+            path = os.path.join(self.cache, ring.CACHE_FILE)
+            with open(path) as f:
+                data = json.load(f)
+            common.write_private_json(self.cache, ring.CACHE_FILE, dict(data, light="QUJD"))  # not a PNG
+            ring.strip([dict(self.specs[0], right=32.0)] + self.specs[1:], (True, 94.0), self.cache)
+            self.assertEqual(len(self.calls), 3)  # checked again, drawn again
+            self.assertIsNone(ring.strip([], (True, 94.0), self.cache))
+            self.assertEqual(len(self.calls), 3)  # no ring: nothing drawn, the text title is used
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(os.stat(self.cache).st_mode), 0o700)
+        with self.fake_run((1, "", "")):
+            self.assertIsNone(ring.strip(self.specs, (False, None), self.cache))  # failure: no strip
+
+    def test_cached_image_with_a_broken_body_is_not_used(self):
+        good = make_png(296)
+        broken = {"a changed byte in the pixel data": flipped(good, -20),
+                  "other bytes between header and trailer": make_png(296, body=bytes(range(100))),
+                  "no pixel data": make_png(296, body=b"")}
+        path = os.path.join(self.cache, ring.CACHE_FILE)
+        with self.fake_run():
+            self.assertEqual(ring.strip(self.specs, (True, 94.0), self.cache), self.pair)
+            with open(path) as f:
+                data = json.load(f)
+            self.assertEqual((data["light"], data["dark"]), self.pair)
+            for what, image in broken.items():
+                self.assertEqual((image[:33], image[-12:]), (good[:33], good[-12:]), what)  # header and trailer
+                for variant in ring.VARIANTS:
+                    common.write_private_json(self.cache, ring.CACHE_FILE, dict(data, **{variant: b64(image)}))
+                    drawn = len(self.calls)
+                    self.assertEqual(ring.strip(self.specs, (True, 94.0), self.cache), self.pair, what)
+                    self.assertEqual(len(self.calls), drawn + 1, what)  # the same key, but drawn again
+                    with open(path) as f:
+                        self.assertEqual(json.load(f), data, what)  # ... and the cache is whole again
+                    self.assertEqual(ring.strip(self.specs, (True, 94.0), self.cache), self.pair, what)
+                    self.assertEqual(len(self.calls), drawn + 1, what)
+
+
+class RingLogos(unittest.TestCase):
+    """The middle of a ring: the user's own logo files, by fixed names and strict file checks; without a usable one,
+    the provider's initials. The project itself ships no logo files."""
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.dir = os.path.join(folder.name, "logos")
+        os.mkdir(self.dir, 0o700)
+        self.none = os.path.join(folder.name, "no-logos")
+        patch = mock.patch.object(ring, "LOGO_DIR", self.dir)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def put(self, name, data=None, mode=0o600):
+        """Writes a logo file; without `data`, a small one that is usable under that name."""
+        if data is None:
+            data = make_png(32, 32) if name.endswith(".png") else b"<svg/>"
+        path = os.path.join(self.dir, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        os.chmod(path, mode)
+        return path
+
+    @staticmethod
+    def paths(provider):
+        return tuple(x[0] if x else None for x in ring.logos(provider))
+
+    def test_without_user_files_every_ring_shows_its_initials(self):
+        specs = ring.specs(ring_results(), ring.groups(None), NOW)
+        self.assertEqual([x["key"] for x in specs], list(ring.INITIALS))
+        for folder in (self.dir, self.none):  # an empty logo folder, and none at all
+            with mock.patch.object(ring, "LOGO_DIR", folder):
+                for provider in ring.INITIALS:
+                    self.assertEqual(ring.logos(provider), (None, None), (folder, provider))
+                values = ring.inputs((True, 50.0), specs)
+                self.assertEqual([x[1:4] for x in values["rings"]],
+                                 [[initials, None, None] for initials in ring.INITIALS.values()])
+                argv = ring.arguments(values)
+                for n, initials in enumerate(ring.INITIALS.values()):  # two empty logo paths: the script draws text
+                    self.assertEqual(argv[12 + 8 * n:15 + 8 * n], [initials, "", ""], (folder, n))
+        for name in ("foundry.svg", "cursor.svg", "claude.svg"):
+            self.put(name)
+        self.assertEqual(ring.logos("foundry"), (None, None))  # no ring, no logo
+        self.assertEqual(ring.logos("cursor"), (None, None))  # not a provider: no logo
+        self.assertEqual(ring.logos("../claude"), (None, None))
+
+    def test_the_project_ships_no_logo_files(self):
+        package = os.path.join(ROOT, "ai_limits")
+        self.assertFalse(os.path.lexists(os.path.join(package, "logos")))
+        images = [os.path.join(top, name) for top, _, names in os.walk(package) for name in names
+                  if os.path.splitext(name)[1].lower() in (".svg", ".pdf", ".png")]
+        self.assertEqual(images, [])
+
+    def test_variant_files_win_over_the_plain_one(self):
+        svg = self.put("claude.svg")
+        self.assertEqual(self.paths("claude"), (svg, svg))
+        dark = self.put("claude-dark.png")
+        self.assertEqual(self.paths("claude"), (svg, dark))
+        png = self.put("codex.png")
+        self.assertEqual(self.paths("codex"), (png, png))  # one file for both menu bars
+        light = self.put("codex-light.pdf")
+        self.assertEqual(self.paths("codex"), (light, png))
+        self.put("gemini.svg.bak")
+        self.assertEqual(self.paths("gemini"), (None, None))  # not a fixed name: initials
+
+    def test_type_order_and_files_that_fail_a_check(self):
+        self.put("claude.pdf")
+        target = self.put("elsewhere.svg")
+        os.symlink(target, os.path.join(self.dir, "claude.svg"))
+        self.assertEqual(self.paths("claude"), (os.path.join(self.dir, "claude.pdf"),) * 2)  # the link is skipped
+        self.put("codex.svg", mode=0o620)
+        self.assertEqual(self.paths("codex"), (None, None))  # group-writable
+        codex = self.put("codex.pdf")
+        self.assertEqual(self.paths("codex"), (codex, codex))  # ... the next type is tried
+        self.put("gemini.svg", mode=0o602)
+        self.put("copilot.svg", data=b"")
+        self.assertEqual(self.paths("gemini"), (None, None))  # writable by others
+        self.assertEqual(self.paths("copilot"), (None, None))  # empty
+        os.remove(os.path.join(self.dir, "copilot.svg"))
+        self.put("copilot.svg", data=b"x" * 11)
+        with mock.patch.object(ring, "LOGO_MAX_BYTES", 10):
+            self.assertEqual(ring.logos("copilot"), (None, None))  # over the size cap
+        os.mkfifo(os.path.join(self.dir, "copilot-dark.svg"), 0o600)
+        self.assertEqual(self.paths("copilot"), (os.path.join(self.dir, "copilot.svg"),) * 2)  # FIFO skipped
+        with mock.patch("os.getuid", return_value=os.getuid() + 1):
+            self.assertEqual(ring.logos("copilot"), (None, None))  # owned by someone else
+
+    def test_png_name_needs_a_png_header(self):
+        good = make_png(32, 32)
+        others = {"JPEG": b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01" + bytes(40),
+                  "GIF": b"GIF89a" + bytes(40),
+                  "TIFF": b"II*\x00" + bytes(40),
+                  "text": b"not an image, only some text\n" * 2,
+                  "shorter than the header": good[:20],
+                  "signature only": good[:8],
+                  "signature without IHDR": good[:12] + b"IDAT" + good[16:],
+                  "IHDR of another length": good[:8] + b"\x00\x00\x00\x0e" + good[12:],
+                  "signature not at the start": b"\n" + good}
+        for what, data in others.items():
+            self.put("claude.png", data)
+            self.assertEqual(ring.logos("claude"), (None, None), what)
+        path = self.put("claude.png", good)
+        self.assertEqual(self.paths("claude"), (path, path))
+        self.put("codex-light.png", others["JPEG"])
+        plain = self.put("codex.png")
+        self.assertEqual(self.paths("codex"), (plain, plain))  # skipped like any failed check: the next name
+        self.put("gemini.png", others["GIF"])
+        self.assertEqual(self.paths("gemini"), (None, None))  # ... else the initials
+
+    def test_png_pixel_size_is_capped(self):
+        top = ring.LOGO_MAX_PIXELS
+        self.assertEqual(top, 2048)
+        for width, height in ((0, 32), (32, 0), (0, 0), (top + 1, 32), (32, top + 1), (top + 1, top + 1),
+                              (30000, 30000), (2 ** 32 - 1, 1), (1, 2 ** 31)):
+            self.put("claude.png", make_png(width, height))  # a small file: only its header says the size
+            self.assertEqual(ring.logos("claude"), (None, None), (width, height))
+        for width, height in ((top, top), (top, 1), (1, top), (1, 1)):
+            path = self.put("claude.png", make_png(width, height))
+            self.assertEqual(self.paths("claude"), (path, path), (width, height))
+
+    def test_svg_and_pdf_names_get_no_content_check(self):
+        for name in ("claude.svg", "codex.pdf", "gemini-light.svg", "copilot-dark.pdf"):
+            for data in (b"<svg/>", b"%PDF-1.4", b"\xff\xd8\xff\xe0 made up", b"x", make_png(30000, 30000)):
+                path = self.put(name, data)
+                self.assertIn(path, self.paths(name.split(".")[0].split("-")[0]), (name, data[:8]))
+
+    def test_checks_are_made_on_the_opened_file(self):
+        target = self.put("elsewhere.png")
+        os.symlink(target, os.path.join(self.dir, "claude.png"))
+        os.symlink(self.put("elsewhere.pdf"), os.path.join(self.dir, "claude-light.pdf"))
+        self.assertEqual(ring.logos("claude"), (None, None))  # a link is not followed
+        os.mkfifo(os.path.join(self.dir, "codex.png"), 0o600)
+        os.mkfifo(os.path.join(self.dir, "codex-dark.svg"), 0o600)
+        self.assertEqual(ring.logos("codex"), (None, None))  # a FIFO (which must not block)
+        os.mkdir(os.path.join(self.dir, "gemini.png"), 0o700)
+        self.assertEqual(ring.logos("gemini"), (None, None))  # a folder
+        if not IS_ROOT:
+            self.put("copilot.svg", mode=0o000)
+            self.put("copilot-dark.png", mode=0o000)
+            self.assertEqual(ring.logos("copilot"), (None, None))  # can't be opened
+            os.chmod(os.path.join(self.dir, "copilot.svg"), 0o400)
+        else:
+            self.put("copilot.svg", mode=0o400)
+        path = os.path.join(self.dir, "copilot.svg")
+        self.assertEqual(self.paths("copilot"), (path, path))
+        st = os.stat(path)
+        self.assertEqual(ring.logos("copilot")[0], (path, st.st_mtime_ns, st.st_size))
+        with mock.patch("os.fstat", side_effect=OSError("made up")):
+            self.assertEqual(ring.logos("copilot"), (None, None))  # the opened file is what is checked
+        png = self.put("copilot.png")
+        os.remove(path)
+        self.assertEqual(self.paths("copilot"), (png, png))
+        with mock.patch("os.read", side_effect=OSError("made up")):
+            self.assertEqual(ring.logos("copilot"), (None, None))  # the header is read from the opened file
+
+    def test_no_descriptor_is_left_open(self):
+        self.put("claude.png")
+        self.put("claude-dark.png", b"GIF89a" + bytes(40))
+        self.put("claude-light.png", make_png(ring.LOGO_MAX_PIXELS + 1, 32))
+        self.put("codex.svg", mode=0o620)
+        self.put("codex.pdf", b"")
+        os.symlink(self.put("elsewhere.png"), os.path.join(self.dir, "codex.png"))
+        os.mkfifo(os.path.join(self.dir, "gemini.png"), 0o600)
+        os.mkdir(os.path.join(self.dir, "gemini.svg"), 0o700)
+        self.put("copilot.svg")
+        self.put("copilot-light.png")
+
+        def many():
+            for _ in range(40):
+                for provider in ring.INITIALS:
+                    ring.logos(provider)
+        before = len(os.listdir("/dev/fd"))
+        many()
+        with mock.patch("os.fstat", side_effect=OSError("made up")):
+            many()
+        with mock.patch("os.read", side_effect=OSError("made up")):
+            many()
+        with mock.patch("os.getuid", return_value=os.getuid() + 1):
+            many()
+        self.assertEqual(len(os.listdir("/dev/fd")), before)
+
+    def test_folders_must_be_private(self):
+        self.put("claude.svg")
+        path = os.path.join(self.dir, "claude.svg")
+        self.assertEqual(self.paths("claude"), (path, path))
+        for mode in (0o777, 0o770, 0o702):  # writable by group or others
+            os.chmod(self.dir, mode)
+            self.assertEqual(self.paths("claude"), (None, None), oct(mode))
+        os.chmod(self.dir, 0o700)
+        link = self.dir + "-link"
+        os.symlink(self.dir, link)
+        with mock.patch.object(ring, "LOGO_DIR", link):
+            self.assertEqual(self.paths("claude"), (None, None))  # a linked folder
+        with mock.patch.object(ring, "LOGO_DIR", path):
+            self.assertEqual(ring.logos("claude"), (None, None))  # not a folder
+        with mock.patch.object(ring, "LOGO_DIR", self.none):
+            self.assertEqual(ring.logos("claude"), (None, None))  # no folder
+
+    def test_logo_paths_reach_the_script_and_the_cache_key(self):
+        path = self.put("claude.svg")
+        specs = ring.specs(ring_results(), ring.groups(None), NOW)
+        values = ring.inputs((True, 50.0), specs)
+        argv = ring.arguments(values)
+        self.assertEqual(argv[11:15], ["2", "Cl", path, path])
+        self.assertEqual(argv[19:23], ["2", "Cx", "", ""])  # no file of its own: initials
+        before = ring._key(values)
+        os.utime(path, ns=(1, 1))
+        self.assertNotEqual(ring._key(ring.inputs((True, 50.0), specs)), before)  # a changed file is drawn again
+
+
+class RingMenu(unittest.TestCase):
+    """render.menu with the strip: the image line, its tooltip, and the text title whenever there is no strip."""
+
+    PAIR = ("QUJDRA==", "RUZHSA==")
+
+    def setUp(self):
+        self.results = ring_results()
+        self.specs = ring.specs(self.results, ring.groups(None), NOW)
+
+    def first(self, **kwargs):
+        line = menu_lines(render.menu(self.results, NOW, rings=self.specs, **kwargs))[0]
+        return line, swiftbar_params(line)
+
+    def test_strip_is_the_whole_item_with_a_tooltip(self):
+        line, params = self.first(strip=self.PAIR)
+        self.assertTrue(line.startswith("| image=QUJDRA==,RUZHSA== tooltip="), line[:60])
+        self.assertEqual(set(params), {"image", "tooltip"})  # no title text, no sfimage, no colour
+        self.assertEqual(params["image"], "QUJDRA==,RUZHSA==")
+        self.assertEqual(params["tooltip"],
+                         "Highest: Gemini Gemini Weekly 94% · Claude 5-hour 31%, weekly 57% · "
+                         "Codex 5-hour 82%, weekly 40% · Gemini 5-hour 12%, weekly 94% · Copilot 26% · "
+                         "Foundry $3.40")
+
+    def test_tooltip_names_the_group_and_says_when_there_is_no_value(self):
+        specs = ring.specs(self.results, {"gemini": "3p"}, NOW)
+        specs[0] = dict(specs[0], left=None)
+        tooltip = swiftbar_params(menu_lines(render.menu(self.results, NOW, rings=specs, strip=self.PAIR))[0])
+        self.assertIn("Claude 5-hour 31%, weekly – ·", tooltip["tooltip"])
+        self.assertIn("Gemini (Claude GPT) 5-hour 3%, weekly 1%", tooltip["tooltip"])
+
+    def test_anything_but_base64_falls_back_to_the_text_title(self):
+        for strip in (("QUJD!", "RUZH"), ("QUJD", None), ("QU JD", "RUZH"), ("QUJD,RUZH", "RUZH"), "QUJD",
+                      ("QUJD",), ("QUJD", "RUZH", "SUpL"), ("QUJD\n--x | bash=/bin/sh", "RUZH"), None, ("", "")):
+            line, params = self.first(strip=strip)
+            self.assertTrue(line.startswith("94% | "), repr(strip))
+            self.assertEqual(params["sfimage"], render.icon(94.0))
+            self.assertNotIn("image", params)
+            self.assertEqual(len(menu_lines(render.menu(self.results, NOW, rings=self.specs, strip=strip))[1:2]), 1)
+
+    def test_text_title_when_drawing_failed_keeps_the_gauge(self):
+        line, params = self.first(strip=None, gauge=False)  # rings exist: the fallback still shows the number
+        self.assertTrue(line.startswith("94% | "))
+        self.assertTrue(params["tooltip"].startswith("Highest: Gemini Gemini Weekly 94% · Claude 5-hour 31%"))
+
+    def test_gauge_off_without_rings_shows_a_dash(self):
+        foundry_only = [r for r in self.results if r[0] == "foundry"]
+        line = menu_lines(render.menu(foundry_only, NOW, rings=[], gauge=False))[0]
+        self.assertTrue(line.startswith("– | "), line)
+        self.assertEqual(swiftbar_params(line)["sfimage"], render.icon(None))
+        self.assertTrue(menu_lines(render.menu(foundry_only, NOW, rings=[], gauge=True))[0].startswith("– | "))
+        self.assertTrue(menu_lines(render.menu([], NOW, gauge=False))[0].startswith("– | "))
+
+
+class RingSettings(unittest.TestCase):
+    """--gauge and --ring on temporary config files only: every call passes --config and --cache."""
+
+    def setUp(self):
+        self.main = load_main()
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.dir = os.path.join(folder.name, "settings")
+        os.mkdir(self.dir)
+        self.cache = os.path.join(folder.name, "cache")
+        self.config = os.path.join(self.dir, "config.json")
+        self.text = '{"providers": [{"name": "gemini", "enabled": true}], "menu_bar": "highest"}'
+        with open(self.config, "w") as f:
+            f.write(self.text)
+
+    def run_main(self, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.main.main([*args, "--config", self.config, "--cache", self.cache])
+        self.assertEqual(out.getvalue(), "")  # prints nothing
+        with open(self.config) as f:
+            return f.read()
+
+    def test_gauge_switch(self):
+        self.assertEqual(self.run_main("--gauge", "on"), self.text)  # shown is the default: nothing written
+        data = json.loads(self.run_main("--gauge", "off"))
+        self.assertIs(data["menu_bar_gauge"], False)
+        self.assertEqual(list(data), ["providers", "menu_bar", "menu_bar_gauge"])
+        self.assertTrue(os.path.exists(os.path.join(self.cache, self.main.KEEP_FILE)))  # no re-read after it
+        self.assertIs(json.loads(self.run_main("--gauge", "on"))["menu_bar_gauge"], True)
+
+    def test_ring_switch(self):
+        self.assertEqual(self.run_main("--ring", "gemini:gemini"), self.text)  # the default: nothing written
+        self.assertEqual(json.loads(self.run_main("--ring", "gemini:3p"))["ring_group"], {"gemini": "3p"})
+        self.assertEqual(json.loads(self.run_main("--ring", "gemini:gemini"))["ring_group"], {"gemini": "gemini"})
+        with open(self.config, "w") as f:
+            f.write('{"ring_group": "odd", "providers": []}')
+        self.assertEqual(json.loads(self.run_main("--ring", "gemini:3p"))["ring_group"], {"gemini": "3p"})
+
+    def test_panel_choices_match_the_ring_groups(self):
+        for group in ring.GROUPS["gemini"]:
+            self.assertTrue(panel._RING_LINE.fullmatch(f"ring_gemini={group}"), group)
+            self.assertEqual(panel.arguments([], groups={"gemini": group})[7], group)
+        self.assertEqual(set(ring.GROUP_LABELS["gemini"]), set(ring.GROUPS["gemini"]))
+        self.assertIn("'Gemini models'", panel.SCRIPT)
+        self.assertIn("'Claude and GPT models'", panel.SCRIPT)
+
+    def test_bad_values_are_refused_before_the_config_is_opened(self):
+        for args in (("--gauge", "maybe"), ("--gauge", ""), ("--gauge", "ON"), ("--ring", "gemini"),
+                     ("--ring", "gemini:evil"), ("--ring", "claude:3p"), ("--ring", ":3p"), ("--ring", ""),
+                     ("--ring", "gemini:3p:x"), ("--ring", "gemini:3p\n")):
+            with mock.patch.object(self.main, "load_config", side_effect=AssertionError("opened")):
+                with self.assertRaises(self.main.ArgumentError, msg=args):
+                    self.main.main([*args, "--config", self.config, "--cache", self.cache])
+        with open(self.config) as f:
+            self.assertEqual(f.read(), self.text)
+        self.assertEqual(self.main.parse_ring("gemini:3p"), ("gemini", "3p"))
+        self.assertEqual((self.main.parse_gauge("on"), self.main.parse_gauge("off")), (True, False))
+
+
+class RingMain(unittest.TestCase):
+    """main.main() hands the rings and the strip to the menu; menu_bar_strip and call are fakes (no osascript)."""
+
+    def setUp(self):
+        self.main = load_main()
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.cache = os.path.join(folder.name, "cache")
+        self.config = os.path.join(folder.name, "config.json")
+        self.write({})
+        self.strips = []
+        data = dict(ring_results())
+        self.main.call = lambda name, settings, forced: dict(data[name], time=time.time())
+
+    def write(self, extra):
+        providers = [{"name": n, "enabled": n in ("claude", "copilot", "foundry")} for n in NAMES]
+        with open(self.config, "w") as f:
+            json.dump(dict({"providers": providers}, **extra), f)
+
+    def run_main(self, *args, strip=("QUJDRA==", "RUZHSA==")):
+        def fake(rings, gauge, cache):
+            self.strips.append(([x["key"] for x in rings], gauge, cache))
+            if isinstance(strip, Exception):
+                raise strip
+            return strip
+        self.main.menu_bar_strip = fake
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(time, "time", return_value=NOW):
+            self.main.main(["--config", self.config, "--cache", self.cache, *args])
+        return menu_lines(out.getvalue())
+
+    def test_rings_and_strip_reach_the_menu(self):
+        lines = self.run_main()
+        self.assertEqual(self.strips, [(["claude", "copilot"], (True, 88.0), self.cache)])  # Foundry: no ring
+        self.assertEqual(swiftbar_params(lines[0])["image"], "QUJDRA==,RUZHSA==")
+        self.assertIn("Claude 5-hour 31%, weekly 57% · Copilot 26% · Foundry $3.40",
+                      swiftbar_params(lines[0])["tooltip"])
+        self.write({"menu_bar_gauge": False, "menu_bar": {"provider": "copilot", "limit": "AI credits"}})
+        self.run_main()
+        self.assertEqual(self.strips[-1][1], (False, 26.0))  # gauge off; its value follows "Menu bar shows"
+
+    def test_no_image_and_failures_keep_the_text_title(self):
+        lines = self.run_main("--no-image")
+        self.assertEqual(self.strips, [])  # not even asked
+        self.assertTrue(lines[0].startswith("88% | sfimage="))  # the highest: Weekly Opus
+        for strip in (None, RuntimeError("drawing broke")):
+            lines = self.run_main(strip=strip)
+            self.assertTrue(lines[0].startswith("88% | sfimage="), strip)
+            self.assertIn("Copilot 26%", swiftbar_params(lines[0])["tooltip"])
+        self.assertTrue(any(x.startswith("Claude") for x in lines))  # the rest of the menu is intact
+
 
 class CodexChannel(unittest.TestCase):
     """The app-server reader and writer on plain pipes: codex is never started."""
@@ -1114,6 +2701,21 @@ class CodexChannel(unittest.TestCase):
         self.assertEqual([(m.get("id"), m["method"]) for m in sent],
                          [(1, "initialize"), (None, "initialized"), (2, "account/rateLimits/read")])
         self.assertNotIn("id", sent[1])
+
+    def test_a_line_with_too_long_an_integer_is_skipped_like_one_that_is_not_json(self):
+        digits = b"7" * (common.MAX_INT_DIGITS + 1)  # small enough for the pipe's buffer, like the deep nesting
+        good = b'{"id": 1, "result": {"ok": true}}\n'
+        for what, bad in (("valid", b'{"id": 1, "result": {"n": 7}}'), ("not JSON", b'{"id": 1, "result": {"n": 7'),
+                          ("digits", b'{"id": 1, "result": {"n": ' + digits + b"}}"),
+                          ("nested too deep", b"[" * 5000 + b"]" * 5000)):
+            with self.subTest(what):
+                ch, to_us, _ = self.channel()
+                os.write(to_us, bad + b"\n" + good)
+                start = time.monotonic()
+                found = ch.wait(1)
+                self.assertLess(time.monotonic() - start, 1.0)
+                self.assertTrue(found == ({"id": 1, "result": {"n": 7}} if what == "valid" else
+                                          {"id": 1, "result": {"ok": True}}), what)
 
 
 FAKE_CODEX = """#!{python} -I
@@ -1441,6 +3043,21 @@ class FoundrySpend(unittest.TestCase):
             merged = common.read_json(os.path.join(d, foundry.HISTORY_FILE))["tokens"]
         self.assertEqual(merged, {"my-deployment": {"2031-04": {"OutputTokens": 7}, "2031-08": {"OutputTokens": 9}}})
 
+    def test_az_output_with_too_long_an_integer_fails_like_output_that_is_not_json(self):
+        answer = '{"id": "/subscriptions/demo", "demoCount": %s}'
+        with mock.patch.object(foundry, "run", return_value=(0, answer % 7, "")):
+            self.assertEqual(foundry._az("/opt/demo/az", ["account", "show"]),
+                             {"id": "/subscriptions/demo", "demoCount": 7})
+        with mock.patch.object(foundry, "find_tool", return_value="/opt/demo/az"):
+            for what, out in [("not JSON", "{not json")] + [(f"{len(d)} digits", answer % d) for d in long_ints()]:
+                with self.subTest(what), mock.patch.object(foundry, "run", return_value=(0, out, "")):
+                    start = time.monotonic()
+                    with self.assertRaises(ValueError):  # the history and token reads catch it as any failure
+                        foundry._az("/opt/demo/az", ["account", "show"])
+                    with self.assertRaises(ValueError):  # main shows its fixed "Couldn't read"
+                        foundry.read({"resource_group": "demo-rg"})
+                    self.assertLess(time.monotonic() - start, 1.0)
+
     def test_saved_time_stamps(self):
         for bad in ("yesterday", None, True, float("nan"), float("inf"), 1e30, -5):
             self.assertEqual(foundry._epoch_seconds(bad), 0.0)
@@ -1708,6 +3325,7 @@ def load_main():
         os.environ.clear()
         os.environ.update(saved)
     module.call = provider_guard("main.call")
+    module.menu_bar_strip = lambda *args, **kwargs: None  # no drawing; a test that wants the strip sets its own
     defaults = tempfile.mkdtemp(dir=_GUARD_HOME.name)
     module.CACHE = os.path.join(defaults, "cache")
     module.CONFIG = os.path.join(defaults, "config.json")
@@ -2397,12 +4015,13 @@ class Choose(unittest.TestCase):
                      '{"name": "copilot", "enabled": true}], "debug_shapes": false}')
         with open(self.config, "w") as f:
             f.write(self.text)
-        self.shown = []
+        self.shown, self.settings = [], []
 
     def choose(self, answer=None, side_effect=None):
         """Runs --choose; the fake panel records its rows and answers (code, stdout, stderr)."""
-        def fake(rows, mode="panel", timeout=None):
+        def fake(rows, mode="panel", timeout=None, gauge=True, groups=None):
             self.shown.append(rows)
+            self.settings.append((gauge, groups))
             if side_effect:
                 side_effect()
             return answer if answer is not None else (0, "cancel\n", "")
@@ -2415,8 +4034,9 @@ class Choose(unittest.TestCase):
             return f.read()
 
     @staticmethod
-    def answer(**states):
-        return 0, "".join(f"{n}={'on' if states.get(n) else 'off'}\n" for n in NAMES), ""
+    def answer(gauge="on", ring_group="gemini", **states):
+        lines = "".join(f"{n}={'on' if states.get(n) else 'off'}\n" for n in NAMES)
+        return 0, f"{lines}gauge={gauge}\nring_gemini={ring_group}\n", ""
 
     def test_save_applies_everything_in_one_write(self):
         with mock.patch.object(self.main, "_write_atomic", wraps=self.main._write_atomic) as writes:
@@ -2428,6 +4048,31 @@ class Choose(unittest.TestCase):
                           ("foundry", True)])
         self.assertEqual(data["providers"][0]["x"], 1)
         self.assertEqual(list(data), ["providers", "debug_shapes"])
+
+    def test_panel_shows_the_current_gauge_and_ring_group(self):
+        self.choose()
+        self.assertEqual(self.settings, [(True, {"gemini": "gemini"})])  # defaults
+        data = json.loads(self.text)
+        data.update(menu_bar_gauge=False, ring_group={"gemini": "3p"})
+        with open(self.config, "w") as f:
+            json.dump(data, f)
+        self.choose()
+        self.assertEqual(self.settings[1], (False, {"gemini": "3p"}))
+
+    def test_save_writes_gauge_and_ring_group_in_the_same_write(self):
+        unchanged = dict(claude=True, codex=True, copilot=True)
+        with mock.patch.object(self.main, "_write_atomic", wraps=self.main._write_atomic) as writes:
+            self.assertEqual(self.choose(self.answer(**unchanged)), self.text)  # nothing changed: no write
+            text = self.choose(self.answer(gauge="off", ring_group="3p", **unchanged))
+            self.assertEqual(writes.call_count, 1)
+            data = json.loads(text)
+            self.assertEqual((data["menu_bar_gauge"], data["ring_group"]), (False, {"gemini": "3p"}))
+            self.assertEqual([p["enabled"] for p in data["providers"]], [True, True, False, True])
+            text = self.choose(self.answer(gauge="on", ring_group="gemini", claude=False, codex=True, copilot=True))
+            self.assertEqual(writes.call_count, 2)  # providers and settings together, once
+        data = json.loads(text)
+        self.assertEqual((data["menu_bar_gauge"], data["ring_group"], data["providers"][0]["enabled"]),
+                         (True, {"gemini": "gemini"}, False))
 
     def test_panel_rows_and_notes(self):
         common.write_private_json(self.cache, self.main.STATE_FILE,
@@ -2496,6 +4141,87 @@ class Choose(unittest.TestCase):
         self.assertEqual([p["enabled"] for p in json.loads(text)["providers"]], [True, True, False, True, False])
         self.assertEqual(stat.S_IMODE(os.stat(self.config).st_mode), 0o600)
         self.assertEqual(self.shown[0][2][2], True)  # the panel showed the example's state
+
+
+class ChooseRefresh(unittest.TestCase):
+    """The refresh SwiftBar runs right after Providers… Save or Cancel: it shows the values already read and reads
+    only a provider that has none. The panel and the providers are fakes; temp --config and --cache only."""
+
+    def setUp(self):
+        self.main = load_main()
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.dir = os.path.join(folder.name, "settings")
+        os.mkdir(self.dir)
+        self.cache = os.path.join(folder.name, "cache")
+        self.config = os.path.join(self.dir, "config.json")
+        with open(self.config, "w") as f:
+            json.dump({"providers": [{"name": n, "enabled": n in ("claude", "codex")} for n in NAMES]}, f)
+        for name in ("claude", "codex", "copilot"):  # read an hour ago; Gemini was never read
+            common.write_private_json(self.cache, f"{name}.json", dict(
+                res(name.upper(), [common.row("5-hour", 21.0, window="5h")]), time=time.time() - 3600))
+        self.reads = []
+
+        def call(name, settings, forced):
+            self.reads.append((name, settings["force"]))
+            return dict(res(name.upper(), [common.row("5-hour", 63.0, window="5h")]), time=time.time())
+        self.main.call = call
+
+    def save_then_refresh(self, answer):
+        """--choose with the fake panel's answer, then the --refresh SwiftBar runs after the click; its menu."""
+        out = io.StringIO()
+        with mock.patch.object(panel, "show", return_value=answer), contextlib.redirect_stdout(out):
+            self.main.main(["--choose", "--config", self.config, "--cache", self.cache])
+            self.main.main(["--refresh", "--config", self.config, "--cache", self.cache])
+        return out.getvalue()
+
+    @staticmethod
+    def answer(on, gauge="on", group="gemini"):
+        lines = "".join(f"{n}={'on' if n in on else 'off'}\n" for n in NAMES)
+        return 0, f"{lines}gauge={gauge}\nring_gemini={group}\n", ""
+
+    def config_data(self):
+        with open(self.config) as f:
+            return json.load(f)
+
+    def test_changing_only_the_settings_reads_nothing(self):
+        menu = self.save_then_refresh(self.answer({"claude", "codex"}, gauge="off", group="3p"))
+        self.assertEqual(self.reads, [])
+        self.assertEqual((self.config_data()["menu_bar_gauge"], self.config_data()["ring_group"]),
+                         (False, {"gemini": "3p"}))
+        self.assertIn("21%", menu)  # the values already read, an hour old
+        self.assertNotIn("63%", menu)
+
+    def test_switching_a_provider_off_reads_nothing_and_removes_it(self):
+        menu = self.save_then_refresh(self.answer({"claude"}))
+        self.assertEqual(self.reads, [])
+        sections = [x.split(" | ")[0] for x in top_level(menu)]
+        self.assertIn("Claude", sections)
+        self.assertNotIn("Codex (GPT)", sections)  # gone at once
+
+    def test_switching_on_a_never_read_provider_reads_only_that_one(self):
+        menu = self.save_then_refresh(self.answer({"claude", "codex", "gemini"}))
+        self.assertEqual(self.reads, [("gemini", False)])  # not forced; the others come from the cache
+        self.assertIn("Gemini", [x.split(" | ")[0] for x in top_level(menu)])
+
+    def test_switching_on_a_provider_with_old_values_shows_them_at_once(self):
+        menu = self.save_then_refresh(self.answer({"claude", "codex", "copilot"}))
+        self.assertEqual(self.reads, [])  # its last values until its next scheduled read
+        self.assertIn("GitHub Copilot", [x.split(" | ")[0] for x in top_level(menu)])
+
+    def test_cancel_or_a_failed_panel_reads_nothing(self):
+        before = self.config_data()
+        for answer in ((0, "cancel\n", ""), (1, "", ""), (0, "garbage", "")):
+            self.reads.clear()
+            self.save_then_refresh(answer)
+            self.assertEqual(self.reads, [], answer)
+            self.assertEqual(self.config_data(), before)
+
+    def test_without_the_marker_a_refresh_still_reads_everything(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.main.main(["--refresh", "--config", self.config, "--cache", self.cache])
+        self.assertEqual(sorted(self.reads), [("claude", True), ("codex", True)])  # Refresh now: forced, as before
 
 
 class SetPrice(unittest.TestCase):
@@ -2825,6 +4551,31 @@ class PricesRefresh(unittest.TestCase):
             self.assertEqual(sorted(self.calls), [("claude", True), ("foundry", True)], read)
 
 
+@unittest.skipUnless("--gui" in sys.argv, "draws with osascript: run with --gui")
+class RingOnScreen(unittest.TestCase):
+    """Opt-in (python3 -I tests/test_ai_limits.py --gui): the real drawing script draws a five-ring strip; no window
+    opens and no provider is read (made-up values)."""
+
+    def test_real_drawing(self):
+        specs = ring.specs(ring_results(), ring.groups(None), NOW)
+        specs.append(dict(specs[0], key="copilot", right=None, left=None, single=True))
+        values = ring.inputs((True, 94.0), specs)
+        with mock.patch.object(ring, "run", common.run):  # the suite-wide guard is lifted here only
+            start = time.monotonic()
+            pair = ring.draw(values)
+            seconds = time.monotonic() - start
+        self.assertIsNotNone(pair)
+        self.assertLess(seconds, ring.TIMEOUT)
+        import base64
+        import struct
+        for image in pair:
+            data = base64.b64decode(image)
+            self.assertGreater(ring.check_png(data), 5 * 2 * 18)  # five rings at 2x, plus the gauge
+            at = data.find(b"pHYs")
+            self.assertGreater(at, 0)
+            self.assertEqual(struct.unpack(">IIB", data[at + 4:at + 13]), (5669, 5669, 1))  # 144 dpi: Retina size
+
+
 @unittest.skipUnless("--gui" in sys.argv, "opens a window: run with --gui")
 class PanelOnScreen(unittest.TestCase):
     """Opt-in (python3 -I tests/test_ai_limits.py --gui): the real windows, which close themselves after a second."""
@@ -2865,8 +4616,9 @@ class PanelOnScreen(unittest.TestCase):
             self.assertEqual([x for x in lines if x.startswith("#")], ["#active=true", "#key=true", "#visible=true"])
             states = panel.parse(0, "\n".join(x for x in lines if not x.startswith("#")), NAMES)
             # the self-test clicks the first checkbox (Claude: on -> off) and then Save
-            self.assertEqual(states, {"claude": False, "codex": False, "gemini": True, "copilot": True,
-                                      "foundry": False})
+            self.assertEqual(states, {"providers": {"claude": False, "codex": False, "gemini": True, "copilot": True,
+                                                    "foundry": False},
+                                      "gauge": True, "groups": {"gemini": "gemini"}})  # the settings unchanged
             code, out, err = panel.show(self.ROWS, "selftest-cancel", timeout=30)
             self.assertEqual((code, err), (0, ""))
             self.assertEqual(out.splitlines()[0], "cancel")
