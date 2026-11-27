@@ -11,16 +11,16 @@ checksums and their order are checked, and its pixel data must unpack to exactly
 percentage as text instead (render.menu). The images are cached in the cache folder by their input values: a run
 with the same values starts no process; a cached image is checked the same way whenever it is read back.
 
-Logos: the middle of a ring is a mark from two folders, by fixed file names (never from provider data or config):
-the user's own files in LOGO_DIR (`claude.svg`, `codex-light.png` ...) win over the project's own drawings shipped in
-SHIPPED_DIR (`claude.pdf`, `codex-light.pdf` ...). For each menu bar variant (light, dark) the names tried are
-`<provider>-<variant>.*`, then `<provider>.*`. A file must be a regular file (not a link) in a folder that is not a link,
-owned by the user (a shipped one also by root), not writable by group or others, of 1 byte to LOGO_MAX_BYTES; the file
-is opened (no link is followed) and checked through its descriptor. A `.png` must also start with a PNG header whose
-width and height are 1 to LOGO_MAX_PIXELS: AppKit decodes whatever bitmap format such a file holds, at whatever
-picture size (an `.svg` or `.pdf` name is drawn only as that type, so those get no content check). Anything else is
-skipped; the provider's initials are the last fallback. The script opens the file again by its path (`arguments`
-passes only the fixed names in the two folders), so the checks hold as long as nobody else can write to the folder.
+Logos: the project ships none. The middle of a ring is the user's own logo file in LOGO_DIR, by fixed file names
+(never from provider data or config): for each menu bar variant (light, dark) the names tried are
+`<provider>-<variant>.*`, then `<provider>.*` (`claude.svg`, `codex-light.png` ...). A file must be a regular file (not
+a link) in a folder that is not a link, both owned by the user and not writable by group or others, of 1 byte to
+LOGO_MAX_BYTES; the file is opened (no link is followed) and checked through its descriptor. A `.png` must also start
+with a PNG header whose width and height are 1 to LOGO_MAX_PIXELS: AppKit decodes whatever bitmap format such a file
+holds, at whatever picture size (an `.svg` or `.pdf` name is drawn only as that type, so those get no content check).
+Anything else is skipped; without a usable file the ring shows the provider's fixed initials. The script opens the
+file again by its path (`arguments` passes only the fixed names in LOGO_DIR), so the checks hold as long as nobody
+else can write to the folder.
 """
 import base64
 import binascii
@@ -41,11 +41,6 @@ TIMEOUT = 5  # seconds; a drawing takes about 0.15 s
 CACHE_FILE = "menu-bar-image.json"
 LOGO_DIR = os.path.join(HOME, "Library", "Application Support", "ai-limits-bar", "logos")
 LOGO_TYPES = ("svg", "pdf", "png")
-# The project's own drawings of the marks, as vector PDFs (NSImage reads PDF on every macOS; their SVG sources and the
-# converter are in logos/source/). Drawn for a dark menu bar; `-light` files are the light-bar versions of marks that
-# would vanish there (white or light grey).
-SHIPPED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logos")
-SHIPPED_TYPES = ("pdf",)
 VARIANTS = ("light", "dark")
 LOGO_MAX_BYTES = 512 * 1024
 LOGO_MAX_PIXELS = 2048  # width and height of a .png logo: a small file can say a picture that takes gigabytes to decode
@@ -246,8 +241,8 @@ def specs(results, chosen, now):
     return out[:MAX_RINGS]
 
 
-def _private(st, owners):
-    return st.st_uid in owners and not st.st_mode & 0o022
+def _private(st):
+    return st.st_uid == os.getuid() and not st.st_mode & 0o022
 
 
 def _png_header(fd):
@@ -259,26 +254,26 @@ def _png_header(fd):
     return 1 <= width <= LOGO_MAX_PIXELS and 1 <= height <= LOGO_MAX_PIXELS
 
 
-def _logo(folder, name, types, owners):
-    """(path, mtime_ns, size) of folder/<name>.<type> (the first type that exists and passes), or None: the folder
-    and the file must not be symlinks, must be owned by one of `owners` and not writable by group or others, and the
-    file must be a regular file of 1 byte to LOGO_MAX_BYTES, a `.png` with a PNG header (_png_header). The file is
+def _logo(name):
+    """(path, mtime_ns, size) of LOGO_DIR/<name>.<type> (the first of LOGO_TYPES that exists and passes), or None:
+    the folder and the file must not be symlinks, must be owned by the user and not writable by group or others, and
+    the file must be a regular file of 1 byte to LOGO_MAX_BYTES, a `.png` with a PNG header (_png_header). The file is
     opened first and checked through its descriptor (no symlink is followed, a FIFO can't block)."""
     try:
-        st = os.lstat(folder)
+        st = os.lstat(LOGO_DIR)
     except OSError:
         return None
-    if not stat.S_ISDIR(st.st_mode) or not _private(st, owners):
+    if not stat.S_ISDIR(st.st_mode) or not _private(st):
         return None
-    for ext in types:
-        path = os.path.join(folder, f"{name}.{ext}")
+    for ext in LOGO_TYPES:
+        path = os.path.join(LOGO_DIR, f"{name}.{ext}")
         try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except OSError:
             continue
         try:
             st = os.fstat(fd)
-            if (stat.S_ISREG(st.st_mode) and _private(st, owners) and 0 < st.st_size <= LOGO_MAX_BYTES
+            if (stat.S_ISREG(st.st_mode) and _private(st) and 0 < st.st_size <= LOGO_MAX_BYTES
                     and (ext != "png" or _png_header(fd))):
                 return path, st.st_mtime_ns, st.st_size
         except OSError:
@@ -289,17 +284,11 @@ def _logo(folder, name, types, owners):
 
 
 def logos(provider):
-    """(light, dark): the logo file for each menu bar variant, (path, mtime_ns, size) or None (initials). Tried in
-    order: the user's `<provider>-<variant>.*` and `<provider>.*`, then the shipped ones."""
+    """(light, dark): the user's logo file in LOGO_DIR for each menu bar variant, (path, mtime_ns, size) or None
+    (initials). Tried in order: `<provider>-<variant>.*`, then `<provider>.*`."""
     if provider not in INITIALS:
         return None, None
-    user, shipped = {os.getuid()}, {os.getuid(), 0}
-    out = []
-    for variant in VARIANTS:
-        out.append(_logo(LOGO_DIR, f"{provider}-{variant}", LOGO_TYPES, user)
-                   or _logo(LOGO_DIR, provider, LOGO_TYPES, user)
-                   or _logo(SHIPPED_DIR, f"{provider}-{variant}", SHIPPED_TYPES, shipped)
-                   or _logo(SHIPPED_DIR, provider, SHIPPED_TYPES, shipped))
+    out = [_logo(f"{provider}-{variant}") or _logo(provider) for variant in VARIANTS]
     return out[0], out[1]
 
 
@@ -340,7 +329,7 @@ def arguments(values):
         if shape not in ("1", "2") or initials not in INITIALS.values():
             raise ValueError("bad ring")
         for logo in (light, dark):
-            if logo is not None and (os.path.dirname(logo[0]) not in (LOGO_DIR, SHIPPED_DIR)
+            if logo is not None and (os.path.dirname(logo[0]) != LOGO_DIR
                                      or not _LOGO_NAME.fullmatch(os.path.basename(logo[0]))):
                 raise ValueError("bad logo path")
         for value, lvl in ((right, right_level), (left, left_level)):

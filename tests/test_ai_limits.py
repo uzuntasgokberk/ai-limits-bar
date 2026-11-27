@@ -27,7 +27,6 @@ import os
 import pwd
 import re
 import select
-import shutil
 import stat
 import struct
 import subprocess
@@ -1947,10 +1946,7 @@ class RingDrawing(unittest.TestCase):
         self.cache = os.path.join(folder.name, "cache")
         self.specs = ring.specs(ring_results(), ring.groups(None), NOW)
         self.pair = (b64(make_png(296)), b64(make_png(296)))
-        self.calls = []
-        patch = mock.patch.object(ring, "SHIPPED_DIR", os.path.join(folder.name, "no-shipped-logos"))
-        patch.start()  # the shipped marks are tested in RingLogos; here every ring shows its initials
-        self.addCleanup(patch.stop)
+        self.calls = []  # the user's logo folder is the empty guard folder: every ring shows its initials
 
     def fake_run(self, answer=None):
         def fake(argv, timeout):
@@ -1983,7 +1979,7 @@ class RingDrawing(unittest.TestCase):
                       ("rings", [["2", "Zz", None, None, "1", "n", "2", "n"]]),
                       ("rings", [["3", "Cl", None, None, "1", "n", "2", "n"]]),
                       ("rings", [["2", "Cl", ("/tmp/claude.svg", 1, 1), None, "1", "n", "2", "n"]]),
-                      ("rings", [["2", "Cl", None, (ring.SHIPPED_DIR + "x/claude.pdf", 1, 1), "1", "n", "2", "n"]]),
+                      ("rings", [["2", "Cl", None, (ring.LOGO_DIR + "x/claude.pdf", 1, 1), "1", "n", "2", "n"]]),
                       ("rings", [["2", "Cl", None, None, "101", "n", "2", "n"]]),
                       ("rings", [["2", "Cl", None, None, "5.5", "n", "2", "n"]]),
                       ("rings", [["2", "Cl", None, None, "1", "n", "-2", "n"]]),
@@ -2189,22 +2185,26 @@ class RingDrawing(unittest.TestCase):
         other_names = ("evil.png", "claude.png.bak", "claude-big.png", "cursor.pdf", "foundry.png", "claude.gif",
                        "claude", ".png", "-light.svg", "claude-.png", "claude-light-dark.svg", "xclaude.png",
                        "claude.png\n", "claude.pngx", "claude svg", "claudexpng")
-        for folder in (ring.LOGO_DIR, ring.SHIPPED_DIR):
-            for name in other_names:
-                for dark in (False, True):
-                    bad = values(os.path.join(folder, name), dark=dark)
-                    with self.assertRaisesRegex(ValueError, "bad logo path", msg=(folder, name)):
-                        ring.arguments(bad)
-                    with self.fake_run():
-                        self.assertIsNone(ring.draw(bad), (folder, name))
+        bad_paths = [os.path.join(ring.LOGO_DIR, name) for name in other_names]
+        # the fixed names outside the logo folder: next to it, below it, relative, and in a logos folder in the project
+        package = os.path.join(ROOT, "ai_limits", "logos")
+        bad_paths += [ring.LOGO_DIR + "x/claude.svg", os.path.join(ring.LOGO_DIR, "sub", "claude.svg"),
+                      os.path.dirname(ring.LOGO_DIR) + "/claude.svg", "claude.svg",
+                      os.path.join(package, "claude.pdf"), os.path.join(package, "codex-light.pdf")]
+        for path in bad_paths:
+            for dark in (False, True):
+                bad = values(path, dark=dark)
+                with self.assertRaisesRegex(ValueError, "bad logo path", msg=path):
+                    ring.arguments(bad)
+                with self.fake_run():
+                    self.assertIsNone(ring.draw(bad), path)
         self.assertEqual(self.calls, [])  # refused before any process
-        for folder, types in ((ring.LOGO_DIR, ring.LOGO_TYPES), (ring.SHIPPED_DIR, ring.SHIPPED_TYPES)):
-            for provider, initials in ring.INITIALS.items():  # every name ring.logos() can return
-                for variant in ("",) + tuple(f"-{v}" for v in ring.VARIANTS):
-                    for ext in types:
-                        path = os.path.join(folder, f"{provider}{variant}.{ext}")
-                        self.assertEqual(ring.arguments(values(path, initials))[13:15], [path, ""])
-                        self.assertEqual(ring.arguments(values(path, initials, dark=True))[13:15], ["", path])
+        for provider, initials in ring.INITIALS.items():  # every name ring.logos() can return
+            for variant in ("",) + tuple(f"-{v}" for v in ring.VARIANTS):
+                for ext in ring.LOGO_TYPES:
+                    path = os.path.join(ring.LOGO_DIR, f"{provider}{variant}.{ext}")
+                    self.assertEqual(ring.arguments(values(path, initials))[13:15], [path, ""])
+                    self.assertEqual(ring.arguments(values(path, initials, dark=True))[13:15], ["", path])
 
     def test_strip_is_cached_by_its_inputs(self):
         with self.fake_run():
@@ -2252,19 +2252,16 @@ class RingDrawing(unittest.TestCase):
                     self.assertEqual(len(self.calls), drawn + 1, what)
 
 
-SHIPPED =os.path.join(ROOT, "ai_limits", "logos")
-
-
 class RingLogos(unittest.TestCase):
-    """The marks in the middle of a ring: the user's own files win over the shipped drawings, by fixed names and
-    strict file checks; initials are the last fallback."""
+    """The middle of a ring: the user's own logo files, by fixed names and strict file checks; without a usable one,
+    the provider's initials. The project itself ships no logo files."""
 
     def setUp(self):
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         self.dir = os.path.join(folder.name, "logos")
         os.mkdir(self.dir, 0o700)
-        self.none = os.path.join(folder.name, "no-shipped-logos")
+        self.none = os.path.join(folder.name, "no-logos")
         patch = mock.patch.object(ring, "LOGO_DIR", self.dir)
         patch.start()
         self.addCleanup(patch.stop)
@@ -2283,47 +2280,43 @@ class RingLogos(unittest.TestCase):
     def paths(provider):
         return tuple(x[0] if x else None for x in ring.logos(provider))
 
-    def test_shipped_marks_and_their_light_versions(self):
-        self.assertEqual(ring.SHIPPED_DIR, SHIPPED)
-        self.assertEqual(self.paths("claude"), (f"{SHIPPED}/claude.pdf", f"{SHIPPED}/claude.pdf"))  # coloured: both
-        self.assertEqual(self.paths("gemini"), (f"{SHIPPED}/gemini.pdf", f"{SHIPPED}/gemini.pdf"))
-        for name in ("codex", "copilot"):  # white or light grey on a dark bar: a dark version for a light bar
-            self.assertEqual(self.paths(name), (f"{SHIPPED}/{name}-light.pdf", f"{SHIPPED}/{name}.pdf"))
-        self.assertEqual(ring.logos("foundry"), (None, None))  # no ring, no mark
-        self.assertEqual(ring.logos("cursor"), (None, None))  # shipped for later, but not a provider yet
+    def test_without_user_files_every_ring_shows_its_initials(self):
+        specs = ring.specs(ring_results(), ring.groups(None), NOW)
+        self.assertEqual([x["key"] for x in specs], list(ring.INITIALS))
+        for folder in (self.dir, self.none):  # an empty logo folder, and none at all
+            with mock.patch.object(ring, "LOGO_DIR", folder):
+                for provider in ring.INITIALS:
+                    self.assertEqual(ring.logos(provider), (None, None), (folder, provider))
+                values = ring.inputs((True, 50.0), specs)
+                self.assertEqual([x[1:4] for x in values["rings"]],
+                                 [[initials, None, None] for initials in ring.INITIALS.values()])
+                argv = ring.arguments(values)
+                for n, initials in enumerate(ring.INITIALS.values()):  # two empty logo paths: the script draws text
+                    self.assertEqual(argv[12 + 8 * n:15 + 8 * n], [initials, "", ""], (folder, n))
+        for name in ("foundry.svg", "cursor.svg", "claude.svg"):
+            self.put(name)
+        self.assertEqual(ring.logos("foundry"), (None, None))  # no ring, no logo
+        self.assertEqual(ring.logos("cursor"), (None, None))  # not a provider: no logo
         self.assertEqual(ring.logos("../claude"), (None, None))
-        with mock.patch.object(ring, "SHIPPED_DIR", self.none):
-            self.assertEqual(ring.logos("claude"), (None, None))  # nothing anywhere: initials
 
-    def test_shipped_files_are_plain_vector_drawings(self):
-        names = {f"{n}{v}" for n in ("claude", "codex", "gemini", "copilot", "cursor") for v in ("", "-light")}
-        names -= {"claude-light", "gemini-light"}
-        self.assertEqual({f[:-4] for f in os.listdir(SHIPPED) if f.endswith(".pdf")}, names)
-        source = os.path.join(SHIPPED, "source")
-        self.assertEqual({f[:-4] for f in os.listdir(source) if f.endswith(".svg")}, names)
-        for name in names:
-            with open(os.path.join(SHIPPED, f"{name}.pdf"), "rb") as f:
-                pdf = f.read()
-            self.assertTrue(pdf.startswith(b"%PDF-"), name)
-            self.assertLess(len(pdf), 16 * 1024, name)
-            self.assertNotRegex(pdf, rb"/Subtype\s*/Image|/JavaScript|/JS\b|/URI|/Launch|/EmbeddedFile|/AA\b", name)
-            with open(os.path.join(source, f"{name}.svg"), encoding="utf-8") as f:
-                svg = f.read()
-            self.assertEqual(set(re.findall(r"<([A-Za-z][\w:-]*)", svg)), {"svg", "g", "path"}, name)
-            self.assertNotRegex(svg, r"(?i)script|href|url\(|style|data:|<image|foreignObject|\bon\w+=", name)
-            self.assertLess(len(svg), 4096, name)
+    def test_the_project_ships_no_logo_files(self):
+        package = os.path.join(ROOT, "ai_limits")
+        self.assertFalse(os.path.lexists(os.path.join(package, "logos")))
+        images = [os.path.join(top, name) for top, _, names in os.walk(package) for name in names
+                  if os.path.splitext(name)[1].lower() in (".svg", ".pdf", ".png")]
+        self.assertEqual(images, [])
 
-    def test_user_files_win_over_the_shipped_ones(self):
+    def test_variant_files_win_over_the_plain_one(self):
         svg = self.put("claude.svg")
         self.assertEqual(self.paths("claude"), (svg, svg))
         dark = self.put("claude-dark.png")
         self.assertEqual(self.paths("claude"), (svg, dark))
         png = self.put("codex.png")
-        self.assertEqual(self.paths("codex"), (png, png))  # the user's one file wins over the shipped light version
+        self.assertEqual(self.paths("codex"), (png, png))  # one file for both menu bars
         light = self.put("codex-light.pdf")
         self.assertEqual(self.paths("codex"), (light, png))
         self.put("gemini.svg.bak")
-        self.assertEqual(self.paths("gemini"), (f"{SHIPPED}/gemini.pdf",) * 2)
+        self.assertEqual(self.paths("gemini"), (None, None))  # not a fixed name: initials
 
     def test_type_order_and_files_that_fail_a_check(self):
         self.put("claude.pdf")
@@ -2331,20 +2324,21 @@ class RingLogos(unittest.TestCase):
         os.symlink(target, os.path.join(self.dir, "claude.svg"))
         self.assertEqual(self.paths("claude"), (os.path.join(self.dir, "claude.pdf"),) * 2)  # the link is skipped
         self.put("codex.svg", mode=0o620)
-        self.assertEqual(self.paths("codex"), (f"{SHIPPED}/codex-light.pdf", f"{SHIPPED}/codex.pdf"))  # group-writable
+        self.assertEqual(self.paths("codex"), (None, None))  # group-writable
+        codex = self.put("codex.pdf")
+        self.assertEqual(self.paths("codex"), (codex, codex))  # ... the next type is tried
         self.put("gemini.svg", mode=0o602)
         self.put("copilot.svg", data=b"")
-        self.assertEqual(self.paths("gemini"), (f"{SHIPPED}/gemini.pdf",) * 2)  # writable by others: shipped one
-        self.assertEqual(self.paths("copilot")[1], f"{SHIPPED}/copilot.pdf")  # empty
+        self.assertEqual(self.paths("gemini"), (None, None))  # writable by others
+        self.assertEqual(self.paths("copilot"), (None, None))  # empty
         os.remove(os.path.join(self.dir, "copilot.svg"))
         self.put("copilot.svg", data=b"x" * 11)
-        with mock.patch.object(ring, "LOGO_MAX_BYTES", 10), mock.patch.object(ring, "SHIPPED_DIR", self.none):
+        with mock.patch.object(ring, "LOGO_MAX_BYTES", 10):
             self.assertEqual(ring.logos("copilot"), (None, None))  # over the size cap
         os.mkfifo(os.path.join(self.dir, "copilot-dark.svg"), 0o600)
-        with mock.patch.object(ring, "SHIPPED_DIR", self.none):
-            self.assertEqual(self.paths("copilot"), (os.path.join(self.dir, "copilot.svg"),) * 2)  # FIFO skipped
-            with mock.patch("os.getuid", return_value=os.getuid() + 1):
-                self.assertEqual(ring.logos("copilot"), (None, None))  # owned by someone else
+        self.assertEqual(self.paths("copilot"), (os.path.join(self.dir, "copilot.svg"),) * 2)  # FIFO skipped
+        with mock.patch("os.getuid", return_value=os.getuid() + 1):
+            self.assertEqual(ring.logos("copilot"), (None, None))  # owned by someone else
 
     def test_png_name_needs_a_png_header(self):
         good = make_png(32, 32)
@@ -2357,29 +2351,27 @@ class RingLogos(unittest.TestCase):
                   "signature without IHDR": good[:12] + b"IDAT" + good[16:],
                   "IHDR of another length": good[:8] + b"\x00\x00\x00\x0e" + good[12:],
                   "signature not at the start": b"\n" + good}
-        with mock.patch.object(ring, "SHIPPED_DIR", self.none):
-            for what, data in others.items():
-                self.put("claude.png", data)
-                self.assertEqual(ring.logos("claude"), (None, None), what)
-            path = self.put("claude.png", good)
-            self.assertEqual(self.paths("claude"), (path, path))
+        for what, data in others.items():
+            self.put("claude.png", data)
+            self.assertEqual(ring.logos("claude"), (None, None), what)
+        path = self.put("claude.png", good)
+        self.assertEqual(self.paths("claude"), (path, path))
         self.put("codex-light.png", others["JPEG"])
         plain = self.put("codex.png")
         self.assertEqual(self.paths("codex"), (plain, plain))  # skipped like any failed check: the next name
         self.put("gemini.png", others["GIF"])
-        self.assertEqual(self.paths("gemini"), (f"{SHIPPED}/gemini.pdf",) * 2)  # ... then the shipped mark
+        self.assertEqual(self.paths("gemini"), (None, None))  # ... else the initials
 
     def test_png_pixel_size_is_capped(self):
         top = ring.LOGO_MAX_PIXELS
         self.assertEqual(top, 2048)
-        with mock.patch.object(ring, "SHIPPED_DIR", self.none):
-            for width, height in ((0, 32), (32, 0), (0, 0), (top + 1, 32), (32, top + 1), (top + 1, top + 1),
-                                  (30000, 30000), (2 ** 32 - 1, 1), (1, 2 ** 31)):
-                self.put("claude.png", make_png(width, height))  # a small file: only its header says the size
-                self.assertEqual(ring.logos("claude"), (None, None), (width, height))
-            for width, height in ((top, top), (top, 1), (1, top), (1, 1)):
-                path = self.put("claude.png", make_png(width, height))
-                self.assertEqual(self.paths("claude"), (path, path), (width, height))
+        for width, height in ((0, 32), (32, 0), (0, 0), (top + 1, 32), (32, top + 1), (top + 1, top + 1),
+                              (30000, 30000), (2 ** 32 - 1, 1), (1, 2 ** 31)):
+            self.put("claude.png", make_png(width, height))  # a small file: only its header says the size
+            self.assertEqual(ring.logos("claude"), (None, None), (width, height))
+        for width, height in ((top, top), (top, 1), (1, top), (1, 1)):
+            path = self.put("claude.png", make_png(width, height))
+            self.assertEqual(self.paths("claude"), (path, path), (width, height))
 
     def test_svg_and_pdf_names_get_no_content_check(self):
         for name in ("claude.svg", "codex.pdf", "gemini-light.svg", "copilot-dark.pdf"):
@@ -2388,34 +2380,33 @@ class RingLogos(unittest.TestCase):
                 self.assertIn(path, self.paths(name.split(".")[0].split("-")[0]), (name, data[:8]))
 
     def test_checks_are_made_on_the_opened_file(self):
-        with mock.patch.object(ring, "SHIPPED_DIR", self.none):
-            target = self.put("elsewhere.png")
-            os.symlink(target, os.path.join(self.dir, "claude.png"))
-            os.symlink(self.put("elsewhere.pdf"), os.path.join(self.dir, "claude-light.pdf"))
-            self.assertEqual(ring.logos("claude"), (None, None))  # a link is not followed
-            os.mkfifo(os.path.join(self.dir, "codex.png"), 0o600)
-            os.mkfifo(os.path.join(self.dir, "codex-dark.svg"), 0o600)
-            self.assertEqual(ring.logos("codex"), (None, None))  # a FIFO (which must not block)
-            os.mkdir(os.path.join(self.dir, "gemini.png"), 0o700)
-            self.assertEqual(ring.logos("gemini"), (None, None))  # a folder
-            if not IS_ROOT:
-                self.put("copilot.svg", mode=0o000)
-                self.put("copilot-dark.png", mode=0o000)
-                self.assertEqual(ring.logos("copilot"), (None, None))  # can't be opened
-                os.chmod(os.path.join(self.dir, "copilot.svg"), 0o400)
-            else:
-                self.put("copilot.svg", mode=0o400)
-            path = os.path.join(self.dir, "copilot.svg")
-            self.assertEqual(self.paths("copilot"), (path, path))
-            st = os.stat(path)
-            self.assertEqual(ring.logos("copilot")[0], (path, st.st_mtime_ns, st.st_size))
-            with mock.patch("os.fstat", side_effect=OSError("made up")):
-                self.assertEqual(ring.logos("copilot"), (None, None))  # the opened file is what is checked
-            png = self.put("copilot.png")
-            os.remove(path)
-            self.assertEqual(self.paths("copilot"), (png, png))
-            with mock.patch("os.read", side_effect=OSError("made up")):
-                self.assertEqual(ring.logos("copilot"), (None, None))  # the header is read from the opened file
+        target = self.put("elsewhere.png")
+        os.symlink(target, os.path.join(self.dir, "claude.png"))
+        os.symlink(self.put("elsewhere.pdf"), os.path.join(self.dir, "claude-light.pdf"))
+        self.assertEqual(ring.logos("claude"), (None, None))  # a link is not followed
+        os.mkfifo(os.path.join(self.dir, "codex.png"), 0o600)
+        os.mkfifo(os.path.join(self.dir, "codex-dark.svg"), 0o600)
+        self.assertEqual(ring.logos("codex"), (None, None))  # a FIFO (which must not block)
+        os.mkdir(os.path.join(self.dir, "gemini.png"), 0o700)
+        self.assertEqual(ring.logos("gemini"), (None, None))  # a folder
+        if not IS_ROOT:
+            self.put("copilot.svg", mode=0o000)
+            self.put("copilot-dark.png", mode=0o000)
+            self.assertEqual(ring.logos("copilot"), (None, None))  # can't be opened
+            os.chmod(os.path.join(self.dir, "copilot.svg"), 0o400)
+        else:
+            self.put("copilot.svg", mode=0o400)
+        path = os.path.join(self.dir, "copilot.svg")
+        self.assertEqual(self.paths("copilot"), (path, path))
+        st = os.stat(path)
+        self.assertEqual(ring.logos("copilot")[0], (path, st.st_mtime_ns, st.st_size))
+        with mock.patch("os.fstat", side_effect=OSError("made up")):
+            self.assertEqual(ring.logos("copilot"), (None, None))  # the opened file is what is checked
+        png = self.put("copilot.png")
+        os.remove(path)
+        self.assertEqual(self.paths("copilot"), (png, png))
+        with mock.patch("os.read", side_effect=OSError("made up")):
+            self.assertEqual(ring.logos("copilot"), (None, None))  # the header is read from the opened file
 
     def test_no_descriptor_is_left_open(self):
         self.put("claude.png")
@@ -2439,24 +2430,26 @@ class RingLogos(unittest.TestCase):
             many()
         with mock.patch("os.read", side_effect=OSError("made up")):
             many()
-        with mock.patch.object(ring, "SHIPPED_DIR", self.none), mock.patch("os.getuid", return_value=os.getuid() + 1):
+        with mock.patch("os.getuid", return_value=os.getuid() + 1):
             many()
         self.assertEqual(len(os.listdir("/dev/fd")), before)
 
     def test_folders_must_be_private(self):
         self.put("claude.svg")
-        os.chmod(self.dir, 0o777)
-        self.assertEqual(self.paths("claude"), (f"{SHIPPED}/claude.pdf",) * 2)
+        path = os.path.join(self.dir, "claude.svg")
+        self.assertEqual(self.paths("claude"), (path, path))
+        for mode in (0o777, 0o770, 0o702):  # writable by group or others
+            os.chmod(self.dir, mode)
+            self.assertEqual(self.paths("claude"), (None, None), oct(mode))
         os.chmod(self.dir, 0o700)
         link = self.dir + "-link"
         os.symlink(self.dir, link)
         with mock.patch.object(ring, "LOGO_DIR", link):
-            self.assertEqual(self.paths("claude"), (f"{SHIPPED}/claude.pdf",) * 2)
-        copy = os.path.join(os.path.dirname(self.dir), "shipped-copy")
-        shutil.copytree(SHIPPED, copy)
-        os.chmod(copy, 0o777)
-        with mock.patch.object(ring, "SHIPPED_DIR", copy), mock.patch.object(ring, "LOGO_DIR", self.none):
-            self.assertEqual(ring.logos("claude"), (None, None))  # a shipped folder others can write: not used
+            self.assertEqual(self.paths("claude"), (None, None))  # a linked folder
+        with mock.patch.object(ring, "LOGO_DIR", path):
+            self.assertEqual(ring.logos("claude"), (None, None))  # not a folder
+        with mock.patch.object(ring, "LOGO_DIR", self.none):
+            self.assertEqual(ring.logos("claude"), (None, None))  # no folder
 
     def test_logo_paths_reach_the_script_and_the_cache_key(self):
         path = self.put("claude.svg")
@@ -2464,7 +2457,7 @@ class RingLogos(unittest.TestCase):
         values = ring.inputs((True, 50.0), specs)
         argv = ring.arguments(values)
         self.assertEqual(argv[11:15], ["2", "Cl", path, path])
-        self.assertEqual(argv[19:23], ["2", "Cx", f"{SHIPPED}/codex-light.pdf", f"{SHIPPED}/codex.pdf"])
+        self.assertEqual(argv[19:23], ["2", "Cx", "", ""])  # no file of its own: initials
         before = ring._key(values)
         os.utime(path, ns=(1, 1))
         self.assertNotEqual(ring._key(ring.inputs((True, 50.0), specs)), before)  # a changed file is drawn again
